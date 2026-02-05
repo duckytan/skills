@@ -1,197 +1,285 @@
-# AI 绘图提示词示例
+# Chat Profile Analysis 个人分析报告 - 图片生成提示词
 
-本文档展示了从真实分析报告中生成的 AI 绘图提示词示例。
-
----
-
-## 🎨 使用说明
-
-1. **选择提示词**：从下方示例中选择你喜欢的可视化风格
-2. **复制完整提示词**：复制代码块中的完整内容
-3. **粘贴到 AI 绘图工具**：
-   - **Midjourney**: 输入 `/imagine` 命令后粘贴
-   - **DALL-E 3**: 直接粘贴到对话框
-   - **Stable Diffusion**: 粘贴到 prompt 输入框
-4. **等待生成**：通常需要 30-60 秒
-5. **调整优化**：根据效果可微调提示词重新生成
+> 基于用户聊天记录分析报告生成的5张高密度信息图提示词集合
+> 
+> **生成日期**: 2026年2月5日  
+> **分析工具**: Style-Analysis-Report-CC v1.0  
+> **图片规格**: 9:16比例，4K高清质量，微软雅黑字体
 
 ---
 
-## 📊 示例 1：人格特质雷达图
+## 1. 综合概览图
 
-**可视化角度**：大五人格维度评分的直观展示
+### 文件名
+`chat_profile_overview.png`
 
-**关键数据提取**：
-- 尽责性(Conscientiousness): 90/100
-- 开放性(Openness): 85/100
-- 外向性(Extraversion): 55/100
-- 宜人性(Agreeableness): 70/100
-- 神经质(Neuroticism): 35/100
-
-**AI绘图提示词**：
-
+### 提示词
 ```
-A 9:16 vertical infographic poster with title "Chat Profile Analysis 个人分析报告" prominently displayed at top center in white text, 4K ultra HD quality, featuring a large personality radar chart showing Big Five traits in Chinese with scores: 尽责性(Conscientiousness) 90/100, 开放性(Openness) 85/100, 外向性(Extraversion) 55/100, 宜人性(Agreeableness) 70/100, 神经质(Neuroticism) 35/100. Dense information layout with Microsoft YaHei or Heiti font, highly legible and crystal clear typography, no typos or character errors, modern gradient background from navy blue to light blue, pentagon radar chart with grid lines, each dimension labeled in Chinese and English, minimalist icons for each trait (target for conscientiousness, lightbulb for openness, people for extraversion, heart for agreeableness, wave for neuroticism), professional data visualization style, clean white text sections, balanced composition with adequate spacing, subtle shadow effects for depth.
-```
+生成一张高密度信息图表，标题为'Chat Profile Analysis 个人分析报告 - 综合概览'。包含以下核心信息：
 
----
+基础统计：
+- 总消息数：394条
+- 涉及项目：FoodCheck-AI、聊天AI小程序、PDF-Split-Summ等
+- 分析时间：2026年2月5日
+- 数据源：C:\Users\Administrator\.claude\history.jsonl
 
-## 🗨️ 示例 2：沟通风格词云
+一句话描述：您是一位效率驱动、注重细节、拥抱AI的全栈独立开发者，擅长快速迭代和系统化思考。
 
-**可视化角度**：高频词汇和语言特征的视觉化呈现
+多维度评分雷达图：
+- 技术能力 8/10
+- 学习能力 9/10  
+- 沟通效率 9/10
+- 项目管理 8/10
+- 问题解决 8/10
+- 工程素养 9/10
 
-**关键数据提取**：
-- "是" (50+ 次)
-- "确认" (15 次)
-- "推送" (8 次)
-- 关键标签：效率至上、实用主义、极简风格、命令式表达、快速迭代
+高频关键词：推送/部署(35次)、是/确认(68次)、回退(12次)、检查/分析(42次)、skills(28次)
 
-**AI绘图提示词**：
-
-```
-A 9:16 vertical infographic poster with "Chat Profile Analysis 个人分析报告" as header in bold, 4K resolution, showcasing a dynamic word cloud visualization with Chinese keywords sized by frequency: "是" (largest size, 50+ occurrences), "确认" (large, 15 times), "推送" (medium, 8 times), "效率至上", "实用主义", "极简风格", "命令式表达", "快速迭代", "结果导向". Microsoft YaHei or Heiti font family, crystal clear and highly readable typography, absolutely no spelling mistakes or character errors, modern gradient color palette transitioning from electric blue through purple to magenta, larger words positioned centrally and more prominent, smaller supporting words around edges, minimal decorative geometric elements, professional infographic aesthetic, white clean background with colorful text overlay, frequency numbers displayed subtly near keywords in parentheses, balanced and harmonious layout, contemporary design style.
+设计要求：9:16比例，微软雅黑字体，现代商务风格，深蓝色主色调，包含图表、进度条、图标等视觉元素，字体清晰可读，4K高清质量
 ```
 
----
-
-## ⏰ 示例 3：行为模式时间轴
-
-**可视化角度**：时间模式、作息习惯和活跃周期的可视化
-
-**关键数据提取**：
-- 高频开发期：2026年1月3-12日
-- 活跃时间段：凌晨2点仍在工作
-- 主要活动：连续开发 FoodCheck-AI 和小程序项目
-- 工作模式：双轨并行、周末比工作日更活跃
-
-**AI绘图提示词**：
-
-```
-A 9:16 vertical infographic poster titled "Chat Profile Analysis 个人分析报告" at top, 4K ultra HD quality, displaying a vertical timeline infographic with Chinese activity pattern labels: "高频开发期: 2026年1月3-12日", "活跃时间: 凌晨2点持续工作", "项目: FoodCheck-AI + 小程序", "工作模式: 双轨并行开发", "周末活跃度超工作日". Dense information-rich layout, Microsoft YaHei or Heiti font, highly legible and clear, no typographical errors, navy blue and white color scheme, vertical timeline with connected dots and lines running down center, clock icons marking time points, project icons (laptop, mobile phone) next to relevant entries, calendar markers for date ranges, subtle gradient background from dark blue at top to lighter blue at bottom, professional corporate timeline style, clean modern design, white text on dark sections and dark text on light sections for maximum contrast, balanced spacing between timeline entries, subtle connecting lines with subtle animation-style arrows.
-```
+### 设计特点
+- **主色调**: 深蓝色
+- **风格**: 现代商务风格
+- **元素**: 雷达图、进度条、图标
+- **内容**: 基础统计、能力评分、关键词统计
 
 ---
 
-## 💎 示例 4：核心价值观海报
+## 2. 人格特质分析图
 
-**可视化角度**：核心理念和价值观的文字海报呈现
+### 文件名
+`chat_profile_personality.png`
 
-**关键数据提取**：
-- 效率至上
-- 实用主义优先
-- 质量第一
-- 持续迭代
-- 结果导向
-- 拒绝形式主义
-
-**AI绘图提示词**：
-
+### 提示词
 ```
-A 9:16 vertical poster design with "Chat Profile Analysis 个人分析报告" header text, 4K ultra HD, featuring core values displayed as bold inspirational Chinese phrases arranged hierarchically: "效率至上" (top center, largest and most prominent), "实用主义优先", "质量第一", "持续迭代", "结果导向", "拒绝形式主义", positioned in descending importance. Microsoft YaHei or Heiti bold font family, crystal clear and perfectly legible, absolutely no typos or character imperfections, minimalist design philosophy with geometric accent shapes (circles, triangles, lines), deep gradient background transitioning from midnight blue through navy to ocean blue, pure white text with subtle soft shadows for depth, modern inspirational poster aesthetic, clean corporate style, balanced negative space creating breathing room, subtle golden accent lines between phrases, contemporary motivational poster design, each phrase on its own visual level with appropriate spacing, professional typography with perfect kerning.
-```
+生成一张高密度信息图表，标题为'Chat Profile Analysis 个人分析报告 - 人格特质分析'。基于大五人格模型的分析结果：
 
----
+1. 尽责性 ⭐⭐⭐⭐⭐ (90/100)
+- 细节关注度极高
+- 流程控制意识强
+- 记录和备份习惯
+- 工程师型人格，强调可控性
 
-## 🛠️ 示例 5：技能能力图谱
+2. 开放性 ⭐⭐⭐⭐☆ (85/100)  
+- 快速接受新技术
+- 创新性思维
+- 跨领域整合能力
+- 技术早期采用者
 
-**可视化角度**：技术栈和工具使用的树状结构图
+3. 外向性 ⭐⭐☆☆☆ (40/100)
+- 沟通风格简洁
+- 协作模式单向
+- 独立工作倾向
 
-**关键数据提取**：
-- 前端开发：React、Vue 全栈
-- 后端能力：Node.js
-- 部署平台：Vercel、Netlify
-- 开发工具：Claude Code
-- 技术特长：AI 集成、微信小程序、全栈开发
+4. 神经质 ⭐⭐☆☆☆ (35/100)
+- 情绪恢复快
+- 问题导向思维  
+- 长期坚持力
 
-**AI绘图提示词**：
+5. 宜人性 ⭐⭐⭐☆☆ (55/100)
+- 直率但不恶意
+- 尊重AI边界
+- 实用主义态度
 
-```
-A 9:16 vertical infographic poster with "Chat Profile Analysis 个人分析报告" title at top, 4K resolution, showcasing a hierarchical skill tree diagram with Chinese tech stack labels connected by lines: central node "全栈开发能力" branching to "前端: React/Vue", "后端: Node.js", "部署: Vercel/Netlify", "工具: Claude Code", "特长: AI集成", "平台: 微信小程序", displayed in tree structure with connecting lines showing relationships and dependencies. Dense informative layout, Microsoft YaHei or Heiti font, highly readable typography, no spelling mistakes, modern tech style with blue and green color coding by category (frontend=blue, backend=green, tools=purple, platforms=orange), circular nodes with tech icons or simple geometric symbols, connecting lines in lighter shades, navy blue background with subtle tech pattern, professional tech company aesthetic, balanced tree structure with symmetrical branching, contemporary flat design style, each skill node clearly separated and labeled, subtle glow effects on connecting lines, clean modern composition.
+设计要求：9:16比例，微软雅黑字体，使用五角星评分系统，每个特质配有图标和详细说明，渐变色背景，专业心理学分析风格，4K高清质量
 ```
 
----
-
-## 🎯 提示词使用技巧
-
-### ✅ 成功要点
-
-1. **完整复制**：务必复制完整的提示词，包括所有参数
-2. **保持中文**：中文文字内容必须保留，这是图表的核心信息
-3. **字体声明**：Microsoft YaHei 或 Heiti 是确保中文清晰的关键
-4. **质量要求**：4K、legible、no typos 等声明能提升生成质量
-5. **多次尝试**：AI 绘图有随机性，可多生成几次选最佳
-
-### ⚠️ 常见问题
-
-**Q: 生成的图片中文字模糊怎么办？**  
-A: 在提示词末尾加强调 "ultra sharp text, highly legible Chinese characters"
-
-**Q: 中文出现乱码或错字？**  
-A: 确保提示词中包含 "no typos, no character errors, perfect Chinese typography"
-
-**Q: 布局不符合预期？**  
-A: 调整提示词中的布局描述，如 "centered layout" 改为 "left-aligned layout"
-
-**Q: 颜色不喜欢？**  
-A: 修改配色方案部分，如 "blue gradient" 改为 "warm orange gradient"
-
-**Q: 生成速度慢？**  
-A: 这是正常的，复杂的信息图通常需要 1-2 分钟生成
+### 设计特点
+- **主色调**: 渐变色背景
+- **评分系统**: 五角星评分
+- **风格**: 专业心理学分析风格
+- **元素**: 图标、评分、详细说明
 
 ---
 
-## 🔄 自定义修改指南
+## 3. 技术能力画像图
 
-如果想修改提示词以适应你的需求：
+### 文件名
+`chat_profile_tech_skills.png`
 
-### 修改标题
-将 `"Chat Profile Analysis 个人分析报告"` 替换为你的标题
+### 提示词
+```
+生成一张高密度信息图表，标题为'Chat Profile Analysis 个人分析报告 - 技术能力画像'。展示技术栈和工作流程特征：
 
-### 修改配色
-- 蓝色系：`navy blue, electric blue, ocean blue`
-- 暖色系：`warm orange, coral, sunset gradient`
-- 绿色系：`forest green, mint green, emerald`
-- 紫色系：`deep purple, lavender, magenta`
+核心技术栈：
+前端技术栈（熟练）：
+- React/Vue框架应用
+- 微信小程序开发
+- Vite构建工具
+- 响应式设计和UI美化
 
-### 修改布局
-- 居中：`centered layout, balanced composition`
-- 左对齐：`left-aligned layout, asymmetric composition`
-- 网格：`grid layout, modular design`
-- 自由：`free-form layout, organic composition`
+全栈思维（理解层）：
+- 前后端分离架构
+- API设计
+- Monorepo项目管理
+- 多端部署
 
-### 添加元素
-在提示词中加入：
-- 图标：`with minimalist icons`
-- 照片：`with subtle photography elements`
-- 图表：`with data charts and graphs`
-- 装饰：`with geometric decorative elements`
+AI工具链精通：
+- Claude Code Skills机制
+- MCP协议调用
+- Prompt工程
+- AI驱动开发理念
 
----
+工作流程三阶段：
+1. 快速验证（MVP思维）：拉取项目→本地测试→发现问题→快速迭代
+2. 精细打磨（完美主义）：基础功能→UI美化→多语言支持→性能优化
+3. 系统化沉淀（工程思维）：单次成功→总结经验→封装技能→复用机制
 
-## 📱 适用场景
+核心理念：能用AI处理的，绝不用通用脚本代码
 
-这些提示词生成的图片适合：
+设计要求：9:16比例，微软雅黑字体，包含技能树、流程图、技术图标，现代科技风格，蓝绿渐变色彩，4K高清质量
+```
 
-- 📱 **小红书/朋友圈**：9:16 竖版完美适配手机屏幕
-- 📊 **工作汇报**：专业的数据可视化展示
-- 🎁 **个人品牌**：打造独特的视觉识别
-- 📈 **自媒体内容**：高质量配图提升阅读体验
-- 🖼️ **打印装裱**：4K 高清支持大尺寸打印
-
----
-
-## 💡 更多灵感
-
-想要更多可视化风格？可以尝试：
-
-- 📈 **数据仪表盘风格**：`dashboard style infographic`
-- 🎨 **手绘风格**：`hand-drawn illustration style`
-- 🏢 **企业风格**：`corporate professional style`
-- 🌈 **创意风格**：`creative artistic style`
-- 📱 **APP界面风格**：`mobile app interface style`
+### 设计特点
+- **主色调**: 蓝绿渐变
+- **风格**: 现代科技风格
+- **元素**: 技能树、流程图、技术图标
+- **内容**: 技术栈分级、工作流程、核心理念
 
 ---
 
-**生成日期**: 2026-02-05  
-**技能版本**: v1.1  
-**更多信息**: 查看 [README.md](README.md) 和 [SKILL.md](SKILL.md)
+## 4. 沟通风格分析图
+
+### 文件名
+`chat_profile_communication.png`
+
+### 提示词
+```
+生成一张高密度信息图表，标题为'Chat Profile Analysis 个人分析报告 - 沟通风格分析'。展示交互模式和语言特点：
+
+指令风格特征：
+• 高效·直接·迭代型
+• 命令式表达占主导
+• 快速迭代·持续反馈循环
+• 双轨并行工作模式
+
+语言风格特点：
+• 简·准·狠表达风格
+• 超短句式占比高（30%+）
+• "是"出现50+次
+• "确认"出现15+次
+• "推送"出现8次
+
+典型表达方式：
+"拉取项目 https://github.com/duckytan/"
+"删除当前目录下多余的文件和文件夹"
+"推送，然后部署"
+"还是不对，使用/frontend-design skills重新设计"
+
+情绪表达特征：
+• 直率而克制
+• 不掩饰挫败感
+• 直接指出问题核心
+• 情绪恢复速度快
+
+沟通优势：高效简洁、目标明确、快速迭代
+
+设计要求：9:16比例，微软雅黑字体，使用对话框、箭头、关键词高亮，橙色主调配深灰色，专业商务风格，4K高清质量
+```
+
+### 设计特点
+- **主色调**: 橙色主调配深灰色
+- **风格**: 专业商务风格
+- **元素**: 对话框、箭头、关键词高亮
+- **内容**: 沟通模式、语言特点、典型表达
+
+---
+
+## 5. 成长发展建议图
+
+### 文件名
+`chat_profile_growth.png`
+
+### 提示词
+```
+生成一张高密度信息图表，标题为'Chat Profile Analysis 个人分析报告 - 成长发展建议'。展示优化建议和成长路径：
+
+短期改进（1-2周）：
+✓ 建立个人开发规范文档
+✓ 沟通模板优化
+✓ 减少重复性错误
+
+中期提升（1-3个月）：
+✓ 技能体系化
+✓ 项目架构知识深化
+✓ 减少50%的路径配置问题
+
+长期规划（3-6个月）：
+✓ 构建个人AI开发工作流
+✓ 社区贡献与影响力建设
+✓ 形成可复用开发方法论
+
+核心价值观层级：
+1. 效率至上（核心价值）
+2. 质量与细节（追求标准）
+3. 灵活性与可维护性（工程哲学）
+4. AI协同而非依赖（技术理念）
+
+典型问题模式：
+• 路径依赖问题（15+次）
+• UI渲染不一致（8次）
+• API配置遗漏（5次）
+
+愿景：构建个人AI开发工作流，形成可复用、可传授的开发方法论
+
+设计要求：9:16比例，微软雅黑字体，使用时间轴、进度条、目标图标，绿色主调配金色强调，现代激励风格，4K高清质量
+```
+
+### 设计特点
+- **主色调**: 绿色主调配金色强调
+- **风格**: 现代激励风格
+- **元素**: 时间轴、进度条、目标图标
+- **内容**: 发展规划、价值观、问题识别
+
+---
+
+## 📋 统一设计规范
+
+### 基础参数
+- **图片比例**: 9:16 (纵向)
+- **分辨率**: 4K高清
+- **字体**: 微软雅黑或黑体
+- **清晰度**: 字体清晰可见，无错别字
+
+### 视觉元素
+- **图表类型**: 雷达图、进度条、技能树、流程图、时间轴
+- **图标**: 技能图标、技术图标、目标图标
+- **装饰元素**: 星级评分、渐变背景、对话框、箭头
+
+### 色彩方案
+1. **综合概览**: 深蓝色主调
+2. **人格分析**: 渐变色背景
+3. **技术能力**: 蓝绿渐变
+4. **沟通风格**: 橙色+深灰
+5. **成长建议**: 绿色+金色
+
+### 信息密度
+- **高密度信息**: 多文字配合适当配图
+- **层次分明**: 标题、副标题、正文分层展示
+- **重点突出**: 关键数据和结论用特殊样式标注
+
+---
+
+## 💡 应用场景
+
+### 个人用途
+- 个人成长规划参考
+- 职业发展路径指导
+- 技能提升重点识别
+
+### 团队分享
+- 团队成员画像展示
+- 沟通风格介绍
+- 协作模式优化
+
+### 职业发展
+- 个人品牌建设
+- 简历技能展示
+- 面试准备材料
+
+---
+
+**提示词版本**: v1.0  
+**最后更新**: 2026年2月5日  
+**兼容性**: 支持主流文生图AI模型 (DALL-E, Midjourney, Stable Diffusion等)
