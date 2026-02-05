@@ -32,6 +32,8 @@ description: 通过AI分析聊天历史生成个性化用户画像报告。当�
 步骤 4: 生成个性化报告
    ↓
 步骤 5: 保存为Markdown报告
+   ↓
+步骤 6: 生成可视化提示词（用于AI绘图）
 ```
 
 ## 详细工作流程
@@ -305,6 +307,194 @@ AI任务：
 - 关键发现摘要
 - 后续步骤（可选）
 
+### 步骤 6：生成可视化提示词（AI 绘图专用）
+
+**重要功能**：在完成分析报告后，自动生成 3-5 个 AI 绘图提示词，用于在 Midjourney、DALL-E、Stable Diffusion 等工具中生成高质量信息图。
+
+#### 6.1 提示词生成原则
+
+```
+AI任务：
+"基于生成的分析报告，从以下维度提取关键信息并生成文生图提示词：
+
+📐 固定规格要求：
+- 尺寸：9:16 竖版（vertical format）
+- 质量：4K ultra HD
+- 风格：高密度信息图（infographic）
+- 布局：多文字 + 适当配图
+- 字体：Microsoft YaHei 或 Heiti（必须明确指定）
+- 标题：固定显示 'Chat Profile Analysis 个人分析报告'
+- 质量控制：字体清晰、无错别字、无笔画错误
+
+🎨 推荐生成角度（3-5个）：
+1. 人格特质雷达图 - 基于大五人格评分
+2. 沟通风格词云 - 基于高频词汇和语言特征
+3. 行为模式时间轴 - 基于时间模式和作息习惯
+4. 核心价值观海报 - 基于价值观关键词
+5. 技能能力图谱 - 基于技术能力和工具使用
+
+每个提示词必须包含：
+- 详细的视觉描述（英文为主）
+- 嵌入的中文文字内容（从报告中提取）
+- 明确的字体和质量要求
+- 配色方案建议
+"
+```
+
+#### 6.2 提示词生成模板
+
+每个提示词应遵循以下结构：
+
+```
+### 提示词 [编号]：[主题名称]
+
+**可视化角度**：[简要说明这个图表展示什么]
+
+**关键数据提取**：
+- [从报告中提取的具体数据点1]
+- [从报告中提取的具体数据点2]
+- [从报告中提取的具体数据点3]
+
+**AI绘图提示词**：
+```
+[完整的英文提示词，包含：
+- 9:16 vertical format 声明
+- 标题文字 "Chat Profile Analysis 个人分析报告"
+- 具体的中文数据和标签
+- Microsoft YaHei 或 Heiti 字体声明
+- 4K ultra HD 质量声明
+- infographic 风格描述
+- 配色方案
+- 清晰度要求（legible, crystal clear, no typos）
+]
+```
+
+**使用方法**：
+复制上述提示词到 Midjourney/DALL-E/Stable Diffusion，生成可视化图片
+```
+
+#### 6.3 示例提示词参考
+
+**示例 1：人格特质雷达图**
+
+```
+A 9:16 vertical infographic poster with title "Chat Profile Analysis 个人分析报告" at top center, 
+4K ultra HD, featuring a personality radar chart with Big Five traits in Chinese:
+尽责性(Conscientiousness) 90/100, 开放性(Openness) 85/100, 
+外向性(Extraversion) 55/100, 宜人性(Agreeableness) 70/100, 
+神经质(Neuroticism) 35/100.
+Dense text layout, Microsoft YaHei or Heiti font, highly legible and crystal clear,
+no typos or character errors, modern blue gradient background,
+minimalist icons for each dimension, professional data visualization,
+clean white text on dark blue sections, balanced composition.
+```
+
+**示例 2：沟通风格词云**
+
+```
+A 9:16 vertical infographic poster titled "Chat Profile Analysis 个人分析报告",
+4K resolution, dense word cloud visualization with Chinese keywords sized by frequency:
+"是"(largest, 50+), "确认"(large, 15+), "推送"(medium, 8+),
+"效率至上", "实用主义", "极简风格", "命令式表达", "快速迭代".
+Microsoft YaHei or Heiti font, crystal clear typography, no spelling mistakes,
+modern gradient color scheme (blue to purple), larger words more prominent,
+minimal decorative elements, professional infographic style,
+white background with colorful text, centered layout.
+```
+
+**示例 3：行为模式时间轴**
+
+```
+A 9:16 vertical infographic poster with "Chat Profile Analysis 个人分析报告" header,
+4K quality, showing a vertical timeline of activity patterns with Chinese labels:
+"活跃时间：凌晨2点", "高频开发期：2026年1月3-12日", 
+"项目类型：React/Vue全栈", "工作模式：双轨并行".
+Dense information layout, Microsoft YaHei or Heiti font, highly readable,
+no character errors, timeline dots connected by lines,
+navy blue and white color scheme, clock icons for time markers,
+professional corporate style, clean modern design, balanced spacing.
+```
+
+**示例 4：核心价值观海报**
+
+```
+A 9:16 vertical poster design titled "Chat Profile Analysis 个人分析报告",
+4K ultra HD, featuring core values in bold Chinese characters:
+"效率至上" (top, largest), "实用主义优先", "质量第一", 
+"持续迭代", "结果导向", arranged in hierarchical layout.
+Microsoft YaHei or Heiti bold font, crystal clear and legible,
+no typos, minimalist design with geometric shapes,
+gradient background (dark blue to light blue),
+white text with subtle shadows, modern corporate aesthetic,
+balanced negative space, professional infographic style.
+```
+
+**示例 5：技能能力图谱**
+
+```
+A 9:16 vertical infographic poster with "Chat Profile Analysis 个人分析报告" title,
+4K resolution, displaying a skill tree diagram with Chinese tech labels:
+"前端开发：React/Vue", "后端：Node.js", "部署：Vercel/Netlify",
+"工具：Claude Code", "AI集成", connected by lines showing relationships.
+Dense layout, Microsoft YaHei or Heiti font, highly legible typography,
+no spelling errors, tree structure with nodes and connections,
+blue and green color coding by skill category,
+tech icons alongside text, modern flat design,
+professional data visualization style, clean composition.
+```
+
+#### 6.4 生成与追加到报告
+
+将生成的提示词作为新章节追加到 Markdown 报告末尾：
+
+```markdown
+---
+
+## 🎨 AI 绘图提示词生成
+
+> 以下提示词可用于 Midjourney、DALL-E 3、Stable Diffusion 等 AI 绘图工具，生成个性化信息图海报
+
+### 📋 使用说明
+
+1. **选择提示词**：从下方 3-5 个提示词中选择你想要的可视化角度
+2. **复制提示词**：复制完整的提示词文本（在代码块内）
+3. **粘贴到 AI 绘图工具**：
+   - Midjourney: `/imagine` 命令后粘贴
+   - DALL-E 3: 直接粘贴到对话框
+   - Stable Diffusion: 粘贴到 prompt 输入框
+4. **生成图片**：等待 AI 生成，可能需要 30-60 秒
+5. **调整优化**：根据生成效果可微调提示词重新生成
+
+### 🎯 推荐用途
+
+- 📱 小红书/朋友圈分享配图
+- 📊 个人品牌展示素材
+- 📈 工作汇报视觉化呈现
+- 🎁 打印装裱作为纪念
+
+---
+
+[在此处插入 3-5 个生成的具体提示词]
+
+---
+
+💡 **提示**：生成的图片可能与预期有差异，建议多次生成选择最佳效果。如需修改字体或布局，可在提示词中调整相应描述。
+```
+
+#### 6.5 质量检查清单
+
+在生成提示词后，确保：
+
+- [ ] 每个提示词都明确指定了 9:16 竖版格式
+- [ ] 标题 "Chat Profile Analysis 个人分析报告" 已包含
+- [ ] 中文内容来自真实报告数据（非虚构）
+- [ ] 字体明确指定为 Microsoft YaHei 或 Heiti
+- [ ] 包含 4K ultra HD 质量声明
+- [ ] 包含清晰度要求（legible, crystal clear, no typos）
+- [ ] 提供了 3-5 个不同维度的提示词
+- [ ] 每个提示词都有简短的使用说明
+- [ ] 提示词格式易于复制（代码块包裹）
+
 ## 重要提醒
 
 ### ✅ 应该做的
@@ -347,6 +537,14 @@ AI任务：
 - 报告撰写原则
 - 质量检查清单
 
+### references/EXAMPLE_PROMPTS.md
+提供AI绘图提示词示例（用于步骤6）。包含：
+- 5个完整的提示词模板
+- 使用说明和技巧
+- 自定义修改指南
+- 常见问题解答
+- 适用场景建议
+
 **使用说明**：分析前阅读这些参考文档，但将其作为指导而非严格规则。每个用户的报告都应该是独特的。
 
 ## 使用示例
@@ -362,7 +560,8 @@ AI任务：
 3. 对所有维度执行灵活的AI驱动分析
 4. 生成突出用户独特特征的个性化报告
 5. 保存为 `用户聊天记录个人分析报告.md`
-6. 通知用户完成
+6. **【新增】生成 3-5 个 AI 绘图提示词并追加到报告末尾**
+7. 通知用户完成（包括报告位置和提示词使用说明）
 
 ---
 
@@ -373,8 +572,10 @@ AI任务：
 3. **基于证据** - 所有结论都有实际聊天引用支持
 4. **可操作洞察** - 提供具体、可实施的建议
 5. **个性化** - 没有两份报告应该完全相同
+6. **可视化支持** - 生成高质量 AI 绘图提示词，让报告更具传播力
 
 ---
 
-**技能版本**: 1.0  
-**最后更新**: 2026-02-05
+**技能版本**: 1.1  
+**最后更新**: 2026-02-05  
+**更新内容**: 新增 AI 绘图提示词生成功能（步骤 6）
