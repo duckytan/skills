@@ -1,0 +1,174 @@
+name: opencron
+description: |
+  使用自然语言管理定时任务（opencron v2.1 版）
+  - 添加/删除/修改/查询任务
+  - 启用/禁用任务
+  - 查看执行日志和状态
+  - 系统安装/初始化/依赖管理/健康检查
+  - **PM2 集成**：PM2 作为依赖自动安装，后台运行调度器
+  - **精简反馈**：一句话说清楚，少说废话
+  - **Question 工具**：选择题必须用按钮，不让用户打字
+  
+  **安装方式**：
+  ```bash
+  # 方式 1：全局安装（推荐，默认）
+  npm install -g opencron-system
+  
+  # 方式 2：局部安装（权限问题时的备选方案）
+  npm install opencron-system
+  ```
+
+version: 2.1.1
+
+author: 周星星（AI 左脑）
+
+triggers:
+  # 功能触发词
+  - "计划任务"
+  - "定时任务"
+  # 快捷触发词
+  - "@cron"
+  - "/cron"
+  - "计划管理"
+  - "定时管理"
+  - "@crontab"
+  - "@opencron"
+  - "/opencron"
+  - "opencron"
+  - "调度器"
+  - "opencron"
+  - "安装 opencron"
+  - "部署 opencron"
+
+context:
+  - opencron-config.json
+  - src/scheduler.js
+  - bin/opencron.js
+
+commands:
+  # 核心任务管理命令
+  - name: add-task
+    description: 添加新的定时任务
+    usage: "添加一个每天凌晨 2 点备份记忆的任务"
+    script: scripts/add-task.js
+
+  - name: remove-task
+    description: 删除已有任务
+    usage: "删除备份任务"
+    script: scripts/remove-task.js
+  
+  - name: update-task
+    description: 修改任务配置
+    usage: "把备份任务改成每天 3 点执行"
+    script: scripts/update-task.js
+  
+  - name: list-tasks
+    description: 查看所有任务
+    usage: "查看所有任务"
+    script: scripts/list-tasks.js
+  
+  - name: get-task
+    description: 查看任务详情
+    usage: "查看备份任务的详细信息"
+    script: scripts/get-task.js
+  
+  - name: enable-task
+    description: 启用任务
+    usage: "启用清理任务"
+    script: scripts/enable-task.js
+  
+  - name: disable-task
+    description: 禁用任务
+    usage: "禁用日报任务"
+    script: scripts/disable-task.js
+  
+  # 系统管理命令
+  - name: check-logs
+    description: 查看任务日志
+    usage: "查看备份任务的执行日志"
+    script: scripts/check-logs.js
+  
+  - name: check-status
+    description: 查看调度器状态
+    usage: "调度器运行正常吗？"
+    script: scripts/check-status.js
+  
+  - name: start-scheduler
+    description: 启动调度器
+    usage: "启动定时任务调度器"
+    script: scripts/start-scheduler.js
+  
+  - name: stop-scheduler
+    description: 停止调度器
+    usage: "停止定时任务调度器"
+    script: scripts/stop-scheduler.js
+
+  # 系统运维命令
+  - name: init
+    description: 初始化 opencron 系统
+    usage: "初始化 opencron 系统"
+    script: scripts/init.js
+
+  - name: install-deps
+    description: 安装系统依赖
+    usage: "安装系统依赖"
+    script: scripts/install-deps.js
+
+  - name: check-env
+    description: 检测运行环境
+    usage: "检查当前环境"
+    script: scripts/check-env.js
+
+  - name: doctor
+    description: 系统健康检查
+    usage: "系统健康检查"
+    script: scripts/doctor.js
+
+  # 新增：完整系统安装
+  - name: install-system
+    description: 完整安装 opencron 系统（适用于新环境）
+    usage: "在新环境中安装 opencron 系统"
+    script: scripts/install-system.js
+
+examples:
+  - |
+    用户：安装 opencron 系统
+    助手：好的，我来帮您在新环境中安装 opencron 系统...
+    
+    1. 检查环境依赖（Node.js, npm, Git）
+    2. 安装 PM2（进程管理器，用于后台运行）
+    3. 全局安装 opencron-system
+    4. 初始化配置文件和 PM2 配置
+    5. 验证安装是否成功
+    
+    让我开始...
+
+  - |
+    用户：启动调度器
+    助手：好的，正在使用 PM2 启动调度器...
+    
+    ✅ opencron 调度器已启动（PM2 后台运行）
+    📊 进程 ID: 37948
+    📝 状态：online
+    
+    现在即使关闭 OpenCode，定时任务也会继续运行！
+
+  - |
+    用户：添加一个每天凌晨 2 点备份记忆的任务
+    助手：好的，我来为您添加这个任务。
+    
+    1. 首先，让我查看当前的配置...
+    2. 然后编辑 opencron-config.json 添加新任务
+    3. 任务添加完成后会自动生效
+    
+    让我开始...
+
+  - |
+    用户：查看所有任务
+    助手：当前有 4 个任务：
+    1. backup-daily - 每日备份 - 每天 02:00 - ✅ 启用
+    2. cleanup-hourly - 每小时清理 - 每小时 - ✅ 启用  
+    3. daily-report - 每日日报 - 每天 18:00 - ✅ 启用
+    4. xiaohua-5min - 每 5 分钟笑话 - 每 5 分钟 - ✅ 启用
+    
+    需要查看某个任务的详情吗？

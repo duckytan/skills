@@ -1,0 +1,29 @@
+{
+  "name": "opencron",
+  "version": "2.1.1",
+  "description": "使用自然语言管理 opencron 定时任务系统。添加/删除/修改/查询任务，启用/禁用任务，查看执行日志和状态。支持 PM2 后台运行调度器。",
+  "main": "scripts/smart-interface.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "start": "node scripts/smart-interface.js"
+  },
+  "keywords": [
+    "cron",
+    "scheduler",
+    "task",
+    "opencron",
+    "定时任务",
+    "计划任务",
+    "pm2"
+  ],
+  "author": "周星星（AI 左脑）",
+  "license": "MIT",
+  "engines": {
+    "node": ">=14.0.0"
+  },
+  "os": [
+    "win32",
+    "linux",
+    "darwin"
+  ]
+}
