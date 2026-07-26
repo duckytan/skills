@@ -521,6 +521,15 @@ P4 整合报告（= 主流程阶段 4 报告闭环）：
 > 若只缺某一个（如破妄决），只跑对应那一条即可。
 > ⚠️ 不确定本机是否具备该 npx 通道时，优先用方式 A，避免命令不存在报错。
 
+### 本层自身更新（sansi-huishen 怎么升级自己）
+> 三司会审本身也托管在 `duckytan/skills` 仓库，需要更新自己时：
+> - **npx（推荐）**：`npx skills add https://github.com/duckytan/skills/tree/main/sansi-huishen --skill sansi-huishen`
+> - **GitHub 覆盖**：克隆整仓后把 `sansi-huishen/` 目录覆盖到本机 `~/.workbuddy/skills/`
+>   ```bash
+>   git clone https://github.com/duckytan/skills /tmp/skills-duckytan
+>   cp -rf /tmp/skills-duckytan/sansi-huishen ~/.workbuddy/skills/sansi-huishen
+>   ```
+> - 仓库根地址：`https://github.com/duckytan/skills`
 
 > ⚠️ 原包 SKILL.md 曾把五行诀写作 `wu-xing-jue`（带连字符）——WorkBuddy 实际目录与 Skill 名均为 `wuxing-jue`，已修正。
 > **降级方案**：若某次只需轻量审查，主控可只加载 `mingbian-jue` 单司，不必强跑三司。
