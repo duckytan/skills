@@ -480,11 +480,47 @@ P4 整合报告（= 主流程阶段 4 报告闭环）：
 
 > **调用方式（关键适配）**：WorkBuddy 里 skill 之间不是文件路径互调，而是**主控用 `Skill` 工具按 skill 名加载**。主控在阶段 3「派发」时，对每一个参与的司**依次调用 Skill 工具**加载其 SKILL.md，代入人物视角跑完该司审查，得出结论后再加载下一司。三司**串行加载、各自成段**，最后由主控在阶段 4 整合。
 
-| 司 | Skill 名（Skill 工具调用值）| 文件位置 | 触发时机 |
-|----|--------------------------|---------|---------|
-| 明辨决 | `mingbian-jue` | `~/.workbuddy/skills/mingbian-jue/` | 任何审查都跑 |
-| 破妄决 | `powang-jue` | `~/.workbuddy/skills/powang-jue/` | 方案 / 决策 / 共识 |
-| 五行诀 | `wuxing-jue` | `~/.workbuddy/skills/wuxing-jue/` | 战略 / 平衡 / 长期 |
+| 司 | Skill 名（Skill 工具调用值）| 文件位置 | GitHub 仓库地址 | 触发时机 |
+|----|--------------------------|---------|----------------|---------|
+| 明辨决 | `mingbian-jue` | `~/.workbuddy/skills/mingbian-jue/` | https://github.com/duckytan/skills/tree/main/mingbian-jue | 任何审查都跑 |
+| 破妄决 | `powang-jue` | `~/.workbuddy/skills/powang-jue/` | https://github.com/duckytan/skills/tree/main/powang-jue | 方案 / 决策 / 共识 |
+| 五行诀 | `wuxing-jue` | `~/.workbuddy/skills/wuxing-jue/` | https://github.com/duckytan/skills/tree/main/wuxing-jue | 战略 / 平衡 / 长期 |
+| （本层）| `sansi-huishen` | `~/.workbuddy/skills/sansi-huishen/` | https://github.com/duckytan/skills/tree/main/sansi-huishen | 编排入口 |
+
+### 安装前检测 + 缺失引导（每次触发先跑）
+
+> **原则**：三司会审依赖上面三个子诀。**主控在阶段 1 之前，必须先检测本机是否已安装三诀**；缺失则暂停、引导用户安装，绝不在子诀缺失时静默降级或假装跑完。
+
+**检测动作**（用 Glob / Bash 检查，三处都在才算装好）：
+```
+~/.workbuddy/skills/mingbian-jue/SKILL.md
+~/.workbuddy/skills/powang-jue/SKILL.md
+~/.workbuddy/skills/wuxing-jue/SKILL.md
+```
+- 三者齐全 → 正常进入会审流程。
+- 任一缺失 → **立即向用户输出下方「缺失引导」，并暂停等待安装完成**（或用户确认已装好后重试），不要继续跑审查。
+
+**缺失引导话术（向用户输出）**：
+> 三司会审需要「明辨决 / 破妄决 / 五行诀」三个子诀，检测到你的环境缺少 **[列出缺失的诀名]**。请任选一种方式安装，装完重新触发本 skill 即可：
+>
+> **方式 A · 从 GitHub 下载（推荐，一次拿到全部）**
+> 1. 克隆整个仓库：`git clone https://github.com/duckytan/skills ~/.workbuddy/skills-duckytan`
+> 2. 把需要的子诀目录复制/移动到本机 skill 目录：
+>    `cp -r ~/.workbuddy/skills-duckytan/mingbian-jue ~/.workbuddy/skills/`
+>    `cp -r ~/.workbuddy/skills-duckytan/powang-jue ~/.workbuddy/skills/`
+>    `cp -r ~/.workbuddy/skills-duckytan/wuxing-jue ~/.workbuddy/skills/`
+> 或直接下载 zip 解压：https://github.com/duckytan/skills/archive/refs/heads/main.zip ，取其中子目录放进 `~/.workbuddy/skills/`。
+>
+> **方式 B · 用 npx 安装（逐个装，缺哪个装哪个）**
+> 直接指定 GitHub 上子诀目录地址 + `--skill` 名，每条装一个：
+> ```bash
+> npx skills add https://github.com/duckytan/skills/tree/main/mingbian-jue --skill mingbian-jue
+> npx skills add https://github.com/duckytan/skills/tree/main/powang-jue --skill powang-jue
+> npx skills add https://github.com/duckytan/skills/tree/main/wuxing-jue --skill wuxing-jue
+> ```
+> 若只缺某一个（如破妄决），只跑对应那一条即可。
+> ⚠️ 不确定本机是否具备该 npx 通道时，优先用方式 A，避免命令不存在报错。
+
 
 > ⚠️ 原包 SKILL.md 曾把五行诀写作 `wu-xing-jue`（带连字符）——WorkBuddy 实际目录与 Skill 名均为 `wuxing-jue`，已修正。
 > **降级方案**：若某次只需轻量审查，主控可只加载 `mingbian-jue` 单司，不必强跑三司。
