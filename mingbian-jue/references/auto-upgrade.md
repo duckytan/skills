@@ -1,9 +1,7 @@
-# /scrutiny 自升级系统（原 OpenClaw 机制 · WorkBuddy 参考）
+# /scrutiny 自升级系统（v1.0 · 7-4 15:20）
 
-> **⚠️ WorkBuddy 适配说明**：本文原依赖脚本 `catch_incidents.py`（打包时已删，WorkBuddy 不安装脚本）。因此本文中所有 `python3 catch_incidents.py …` / `/home/node/clawd/…` 路径**在 WorkBuddy 下不可执行**，仅作方法论参考。
-> **WorkBuddy 下的替代**：失误捕获 = 审计后手动把教训写入 `.workbuddy/memory/lessons-learned/scrutiny/`；模式识别由 AI 在审查时直接完成，无需外部脚本。以下 `grep memory/lessons-learned` 类命令请把路径替换为 `.workbuddy/memory/lessons-learned`。
->
-> **用途**：执行自升级/自审时参考本文的模式清单（A/B/C/D/E/M/P）
+> **位置**：本文件为 SKILL.md 第 5.1-5.5 节的**完整扩展**
+> **用途**：执行自升级时直接调用本文件的算法
 > **拍板人**：錡哥
 
 ---

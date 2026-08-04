@@ -1,13 +1,11 @@
 ---
 name: wuxing-jue
-description: 五行诀 — 道家内炼 5 维认知心法（太初诀/观复诀/洞观诀/颠倒诀/知几诀）× 5 行（木火土金水）× 8 关系动态平衡。用于 4 大场景：(1) 决策辅助·(2) 方案审查·(3) 复盘分析·(4) 教学引导。Use when the user wants help with (1) choosing between options / making a key decision, (2) reviewing a plan or proposal, (3) post-mortem analysis with a 5-dimension lens, (4) learning the method. Triggers on Chinese phrases like "用五行诀审一下" / "做五维复盘" / "决策方法" / "该投不该投" / "复盘昨天决定" / "教我怎么用" / "五行诀怎么调用" / "5 维打分" / "颠倒诀" / "知几诀", or English like "decision framework" / "structured review" / "5-dimension analysis" / "wuxing-jue". **重要说明**：「五行」= 道家内炼五行（性/情/精/气/神），**非**中医五行·**非**算命·**非**风水——5 维修仙术语（太初/观复/洞观/颠倒/知几）100% 来自老子/易经/道家原文。
+description: 五行诀 v4.1 — 道家内炼 5 维认知心法（太初诀/观复诀/洞观诀/颠倒诀/知几诀）× 5 行（木火土金水）× 8 关系动态平衡。**v4.1 新增 scripts/five-dim-quick.py**（5 维快速打分 + 失衡提示）。用于 4 大场景：决策辅助/方案审查/复盘分析/教学引导。触发词：「五行诀审一下」「做五维复盘」「决策方法」「该投不该投」「5 维打分」「颠倒诀」「知几诀」「decision framework」「wuxing-jue」「5-dimension analysis」。误读挡板见 SKILL.md §1（≠ 中医/算命/风水）。
 ---
 
 # Wuxing Jue (五行诀)
 
-<!-- WorkBuddy 移植说明：本 skill 迁移自 OpenClaw。原包的 versions/ 历史归档(256KB) 与 naming-decision.md / 2026-07-06-learnings.md / 2026-07-07-deep-comparison.md 等对外宣传素材**未随包移植**，日常 5 维决策不需要它们。本 SKILL.md 的 Resources 段与 references/index.md 已按**实际打包的 6 个 reference**重写。-->
-
-> **版本**：五行诀方法 v4.0.4（WorkBuddy 移植版）。核心 = 5 维认知心法，日常决策只需 SKILL.md + `five-dimensions.md` + `eight-relations.md`。
+> **版本**：skill v4.0.5（**10 个 references**）· 内容版 v4.0.4。**两个版本号含义不同**：v4.0.4 = 五行诀方法本身，v4.0.5 = skill 化 + 资料库扩充。
 > 
 > ⚠️ **挡误读（必读）**：「五行」在此 ≠ 中医五行 ≠ 算命/风水。是**道家内炼五行**（性/情/精/气/神）= 5 种**思维方法**。详见 `references/FAQ.md` Q1。
 
@@ -131,22 +129,35 @@ description: 五行诀 — 道家内炼 5 维认知心法（太初诀/观复诀/
 
 > **5 维是种类序**（5 种工具）**不是主框架**。**5 维全跑审 5 维 = 把工具当主框架** = 7-6 v3.0 错误。**五行诀的边界 = 单维自检 OK + 5 维全跑 = 红线**。
 
-## Resources（WorkBuddy 实际打包的 6 个 references）
+## Resources
 
-> 原包的对外宣传素材（naming-decision / 2026-07-06-learnings / 2026-07-07-deep-comparison）与 versions/ 历史归档未随包移植，日常决策不需要。下列为**当前目录真实存在**的文件。
+### 索引
+
+- `index.md` — **8 个 references 导航**（何时读哪个·按场景分类）· **第一次用必读**
 
 ### 核心 references（决策用·P0）
 
-- `index.md` — references 导航（何时读哪个）· 第一次用可读
-- `five-dimensions.md` — 5 维详解（修仙术语 + 挡中医误读 + 哲学纵轴 + 8 关系修仙术语对位）
+- `five-dimensions.md` — 5 维详解（修仙术语 + 挡中医误读 + 5 不是巧合 + 哲学纵轴 + 8 关系修仙术语对位）
 - `eight-relations.md` — 8 关系动态平衡（4 基础 + 4 高级，含详细配对）
+- `evolution.md` — 版本演化历史（v1.0 → v4.0.4）
+
+### 对外宣传 references（**写公众号/简介用**·P2）
+
+- `naming-decision.md` — "五行诀"命名全过程（6 候选方案 + 般若虾反馈 + 錡哥拍板理由）
+- `external-review.md` — 般若虾 2 轮外部审反馈全集（v4.0.1 完善建议 + 修仙术语 100% 经典出处）
+- `cross-cultural-comparison.md` — 跨文化 5 步对比（Dewey/唯识/Cynefin/道家内炼）+ 调研 4 大发现
+- `2026-07-06-learnings.md` — 7-6 反思 5 大教训（"五行诀是怎么炼出来的"对外宣传素材）
+- `2026-07-07-deep-comparison.md` — 7-7 深度比对（/scrutiny(/明辨决) vs 五行诀 8 层对比 + 3 个说不出的问题）
 
 ### 答疑 references（**FAQ**·P1）
 
-- `FAQ.md` — 9 个常见误读 + 预答（"五行 = 中医？" / "五行诀能自审吗？" 可直接复制答复）
+- `FAQ.md` — **9** 个常见误读 + 预答（"五行 = 中医？" / "五行诀能自审吗？" 等可直接复制答复）
 
-### 溯源 references（**了解来历/写介绍时用**·P2）
+### 版本归档（**数字资产**·P2·20 文件 268KB）
 
-- `evolution.md` — 版本演化历史（v1.0 → v4.0.4）
-- `external-review.md` — 2 轮外部审反馈全集（修仙术语经典出处）
-- `cross-cultural-comparison.md` — 跨文化 5 步对比（Dewey/唯识/Cynefin/道家内炼）
+> ⚠️ **本目录 = 大型资产（268KB / 5571 行）**——不是每次都读。**写公众号/做历史研究时才用**。
+
+- `versions/index.md` — **20 个版本文件导航**（演化时间线·按场景分类·加载优先级）
+- `versions/v1.0.md` ~ `v4.0.4.md` — **9 个五镜/五行诀版本**（v1.0 → v4.0.4 完整演化）
+- `versions/thinking-v1.0.md` ~ `v5.0.md` — **5 卷调研**（理论/AI 实战/案例/反例/综合）
+- `versions/push-*.md` — **5 个推送文件**（命名建议/般若虾反馈/跨文化调研/推送版 v3.0/v4.0.1/v4.0.3）
