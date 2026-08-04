@@ -1,11 +1,11 @@
 ---
 name: zhibi-jue
-description: 知彼诀 v1.1 — 兵家「知彼知己，百战不殆」**独立情报收集器**。三阶段工作流（知己/知彼/对标），6 个独立方法（盘点/验证/调研/横向/对标/度量），**不依赖其他诀，不依赖三司会审**。触发词：「调研」「查一下」「别人怎么做」「参考」「竞品」「选型」「盘点现状」「摸底」「情报」「看看外面」。Use when the user asks to research external solutions, survey competitors, benchmark options, or gather intel independently — without needing 三司会审's coordination. 与明辨诀（对内对抗审查）/破妄诀（对内假设穿透）/五行诀（对内平衡判断）互补——知彼诀专门对「内+外」收集情报。
+description: 知彼诀 v1.1 — 兵家「知彼知己，百战不殆」**独立情报收集器**。三阶段工作流（知己/知彼/对标），6 个独立方法（盘点/验证/调研/横向/对标/度量），**不依赖其他诀，不依赖三司会审**。触发词：「调研」「查一下」「别人怎么做」「参考」「竞品」「选型」「盘点现状」「摸底」「情报」「看看外面」。Use when the user asks to research external solutions, survey competitors, benchmark options, or gather intel independently — without needing 三司会审's coordination.与[明辨诀](https://github.com/duckytan/skills/tree/main/mingbian-jue)/[破妄诀](https://github.com/duckytan/skills/tree/main/powang-jue)/[五行诀](https://github.com/duckytan/skills/tree/main/wuxing-jue)协作（4 诀互引），补[三司会审](https://github.com/duckytan/skills/tree/main/sansi-huishen)评审。 与明辨诀（对内对抗审查）/破妄诀（对内假设穿透）/五行诀（对内平衡判断）互补——知彼诀专门对「内+外」收集情报。
 ---
 
 # 知彼诀 (Zhi-Bi Jue)
 
-> **版本**：skill v1.0 · **定位**：三司会审前置情报诀（被调度方）
+> **版本**：skill v1.1 · **定位**：**独立情报收集器**（v1.1 脱神秘）· 三司会审需要时可作为前置情报提供者被调度
 > **拍板**：錡哥 8-3 22:11 · **作者**：科技虾（周星星 🌟）
 > **配套**：references/兵家方法论档案.md（般若虾 v4.1）· references/命名终版报告.md
 > **方案**：future-plans/zhibi-jue/知彼诀方案_v0.3.1_8-3.md（已审）
@@ -20,18 +20,34 @@ description: 知彼诀 v1.1 — 兵家「知彼知己，百战不殆」**独立�
 
 ## 角色定位
 
-### 被三司会审调度（被动）
+### 双模式调用（v1.1 升级）
+
+> **v1.0 原文**：知彼诀是被动被三司会审调度。
+> **v1.1 修正**：知彼诀**同时支持两种调用模式**——独立调用（用户直接走知彼诀）+ 被三司会审调度（编排层调用）。
+
+#### 模式 A · 独立调用（默认 · v1.1 新增）
+
+```
+用户说"调研""查一下""竞品"等 → 路由到知彼诀
+  ├── 1. 加载 SKILL.md（独立）
+  ├── 2. 跑用户需要的方法（知己/知彼/对标）
+  ├── 3. 输出情报包给用户
+  └── 4. 释放 context
+```
+
+#### 模式 B · 被三司会审调度（v3.3 L1.5 协议 · 三司会审阶段 0）
 
 ```
 三司会审主控（调度器 · 核心大脑）
-  ├── 需要外部调研 → 调用【知彼诀·外部调研方法】
+  ├── 审查对象含方案/项目/战略/选型 → **先调知彼诀**（前置情报）
+  ├── 需要外部调研 → 调用【知彼诀·知彼方法】
   ├── 需要盘点内部 → 调用【知彼诀·知己方法】
   ├── 需要对抗审查 → 调用【明辨诀】
   ├── 需要穿透假设 → 调用【破妄诀】
   └── 需要平衡判断 → 调用【五行诀】
 ```
 
-**知彼诀不是主动跑**——是三司会审主控需要时调用其方法。被调用才执行。
+**双模格式要求**：两种模式**输出同一份情报包格式**（知己 + 知彼 + 对标）· 区别在消费方（用户 vs 三司）。
 
 ### 与三诀边界
 

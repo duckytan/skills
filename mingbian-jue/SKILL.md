@@ -1,6 +1,6 @@
 ---
 name: mingbian-jue
-description: 第一性原理全面审查模式（v3.1 · 6+1 步法 + 4 大类 17 子类）。**v3.1 触发词扩充**：「挑刺」「找问题」「挑 bug」「事故复盘」「踩坑了 帮我看看」。当用户要求审计/审查/复盘/review 方案/项目/代码/讨论内容时激活。快速切换为"先审后干"的对抗式思考模式。自动执行 Pre-Mortem → 事实收集 → 否定性对抗 → 追问性对抗 → 根因 → 推荐行动 → **实态核验**，全面验证每一个假设和结论。**唯一有 scripts**（catch_incidents.py 自升级工具）。
+description: 第一性原理全面审查模式（v3.1 · 6+1 步法 + 4 大类 17 子类）。**v3.1 触发词扩充**：「挑刺」「找问题」「挑 bug」「事故复盘」「踩坑了 帮我看看」。当用户要求审计/审查/复盘/review 方案/项目/代码/讨论内容时激活。快速切换为"先审后干"的对抗式思考模式。自动执行 Pre-Mortem → 事实收集 → 否定性对抗 → 追问性对抗 → 根因 → 推荐行动 → **实态核验**，全面验证每一个假设和结论。**唯一有 scripts**（catch_incidents.py 自升级工具）。与[破妄决](https://github.com/duckytan/skills/tree/main/powang-jue)/[五行诀](https://github.com/duckytan/skills/tree/main/wuxing-jue)/[知彼诀](https://github.com/duckytan/skills/tree/main/zhibi-jue)协作（4 诀互引），补[三司会审](https://github.com/duckytan/skills/tree/main/sansi-huishen)评审。
 ---
 
 # 明辨诀 v3.0.2 — 第一性原理审查模式
@@ -296,6 +296,8 @@ ulimit -c                    # 当前 shell
 ## 审查清单（4 大类 17 子类 · v2.0 核心）
 
 > **使用方式**：critical 6 必查；optional 11 按需。**完整 17 子类见 `references/checklist-17.md`**
+
+> **🔗 互引**：如需「知己·内部盘点」→ 调[`zhibi-jue`](https://github.com/duckytan/skills/tree/main/zhibi-jue)的「知己」方法 5 类（资源/历史/优势/痛点/边界）。明辨决不重复造轮子。
 
 ### #1 工程类（7 子类 · 3 critical + 4 optional）
 

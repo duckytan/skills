@@ -1,6 +1,6 @@
 ---
 name: wuxing-jue
-description: 五行诀 v4.1 — 道家内炼 5 维认知心法（太初诀/观复诀/洞观诀/颠倒诀/知几诀）× 5 行（木火土金水）× 8 关系动态平衡。**v4.1 新增 scripts/five-dim-quick.py**（5 维快速打分 + 失衡提示）。用于 4 大场景：决策辅助/方案审查/复盘分析/教学引导。触发词：「五行诀审一下」「做五维复盘」「决策方法」「该投不该投」「5 维打分」「颠倒诀」「知几诀」「decision framework」「wuxing-jue」「5-dimension analysis」。误读挡板见 SKILL.md §1（≠ 中医/算命/风水）。
+description: 五行诀 v4.1 — 道家内炼 5 维认知心法（太初诀/观复诀/洞观诀/颠倒诀/知几诀）× 5 行（木火土金水）× 8 关系动态平衡。**v4.1 新增 scripts/five-dim-quick.py**（5 维快速打分 + 失衡提示）。与[明辨诀](https://github.com/duckytan/skills/tree/main/mingbian-jue)/[破妄诀](https://github.com/duckytan/skills/tree/main/powang-jue)/[知彼诀](https://github.com/duckytan/skills/tree/main/zhibi-jue)协作（4 诀互引），补[三司会审](https://github.com/duckytan/skills/tree/main/sansi-huishen)评审。用于 4 大场景：决策辅助/方案审查/复盘分析/教学引导。触发词：「五行诀审一下」「做五维复盘」「决策方法」「该投不该投」「5 维打分」「颠倒诀」「知几诀」「decision framework」「wuxing-jue」「5-dimension analysis」。误读挡板见 SKILL.md §1（≠ 中医/算命/风水）。
 ---
 
 # Wuxing Jue (五行诀)
@@ -12,6 +12,8 @@ description: 五行诀 v4.1 — 道家内炼 5 维认知心法（太初诀/观�
 ## Overview
 
 5 维内炼心法（太初/观复/洞观/颠倒/知几）× 5 行（木火土金水）× 8 关系动态平衡 = 一个会自转的认知引擎。真实使用 15-20 分钟（关键决策）。
+
+> **🔗 互引**：五行决「对标·知己vs知彼」→ 调[`zhibi-jue`](https://github.com/duckytan/skills/tree/main/zhibi-jue)的「对标」方法。五行决不重复造轮子。
 
 > **道家内炼五行** ≠ 中医五行 ≠ 算命/风水。"五行"在此指性/情/精/气/神五种内炼维度，详见 `references/five-dimensions.md` §0.1 + `references/FAQ.md`。
 
