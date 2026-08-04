@@ -1,6 +1,6 @@
 ---
 name: powang-jue
-description: 破妄诀 v1.5 — 穿透信念前提，揪出自性执。纵轴 3 重妄执（我执/法执/空执）× 横轴 12+1 截面（共识/隐藏/权威/时序/相关/边界/范围/数量/性质/授权/可逆/必走/落地验真）= 39 种法门。**v1.5 新增 scripts/assumption-extractor.py**（12 截面自动扫描）。与明辨诀 / 五行诀协作，用于审查设计方案/代码/配置/事件。触发词：「穿透假设」「看骨头」「揪自性执」「挑刺」「挑毛病」「找茬」「审设计」「代码 review」「scrutiny assumption」，或与三司会审协同时激活。
+description: 破妄诀 v1.5 — 穿透信念前提，揪出自性执。纵轴 3 重妄执（我执/法执/空执）× 横轴 12+1 截面（共识/隐藏/权威/时序/相关/边界/范围/数量/性质/授权/可逆/必走/落地验真）= 39 种法门。**v1.5 新增 scripts/assumption-extractor.py**（12 截面自动扫描）。与[明辨诀](https://github.com/duckytan/skills/tree/main/mingbian-jue)/[五行诀](https://github.com/duckytan/skills/tree/main/wuxing-jue)/[知彼诀](https://github.com/duckytan/skills/tree/main/zhibi-jue)协作（4 诀互引），补[三司会审](https://github.com/duckytan/skills/tree/main/sansi-huishen)评审。触发词：「穿透假设」「看骨头」「揪自性执」「挑刺」「挑毛病」「找茬」「审设计」「代码 review」「scrutiny assumption」，或与三司会审协同时激活。
 ---
 
 ## 这是谁
@@ -13,6 +13,8 @@ description: 破妄诀 v1.5 — 穿透信念前提，揪出自性执。纵轴 3 
 3. 如果在某个环节卡住了——这恰恰是有价值的发现
 
 ## 什么时候别用
+
+> **🔗 互引**：假设「什么」该看、什么背景 → 调[](https://github.com/duckytan/skills/tree/main/zhibi-jue)（需要外部调研时）。纯内部假设穿透 = 不调。
 - 只是收集信息不用破妄
 - 纯粹的数据分析(2+2=4)不用破妄
 - 新人第一天上手,先跑明辨决,不用一上来就破妄
