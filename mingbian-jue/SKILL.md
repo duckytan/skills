@@ -1,6 +1,6 @@
 ---
 name: mingbian-jue
-description: 第一性原理全面审查模式（v3.0.2 · 6+1 步法 + 4 大类 17 子类）。当用户要求审计、审查、复盘、review 方案/项目/代码/讨论内容时激活。快速切换为"先审后干"的对抗式思考模式。自动执行 Pre-Mortem → 事实收集 → 否定性对抗 → 追问性对抗 → 根因 → 推荐行动 → **实态核验**，全面验证每一个假设和结论。
+description: 第一性原理全面审查模式（v3.1 · 6+1 步法 + 4 大类 17 子类）。**v3.1 触发词扩充**：「挑刺」「找问题」「挑 bug」「事故复盘」「踩坑了 帮我看看」。当用户要求审计/审查/复盘/review 方案/项目/代码/讨论内容时激活。快速切换为"先审后干"的对抗式思考模式。自动执行 Pre-Mortem → 事实收集 → 否定性对抗 → 追问性对抗 → 根因 → 推荐行动 → **实态核验**，全面验证每一个假设和结论。**唯一有 scripts**（catch_incidents.py 自升级工具）。
 ---
 
 # 明辨诀 v3.0.2 — 第一性原理审查模式
@@ -19,19 +19,24 @@ description: 第一性原理全面审查模式（v3.0.2 · 6+1 步法 + 4 大类
 - 已经拍板执行的事不用再审
 - 5 分钟能解决的小问题不用
 
-> **6+1 步法**：6 步审查 + 第 6 步「实态核验」+ 6.5 子步「系统环境核验」。
-> **倒逼来源（原环境教训）**：3 次自审连错（只信项目自述未核验实际）+ 磁盘方案改 ulimit 被系统服务绕过 0% 生效。
+> **v3.0.2 升级**（2026-07-20 09:10）· 第 6 步实态核验加 **6.5 子步骤"系统环境核验"**
+> **倒逼来源**：7-16 ABRT 教训（`memory/lessons-learned/scrutiny/磁盘方案v1-abrt盲点-7-16.md`）
+> **拍板人**：錡哥（§3 P0 全自动授权）· **作者**：周星星 🌟
+
+> **v3.0.1**（7-13 09:08）· 第 0 步加 6 类硬触发场景
+> **v3.0**（7-4 15:05）· 6 步法 → 6+1 步法（加第 6 步"实态核验"）
+> **倒逼来源**：7-4 3 次自审连错 → `memory/lessons-learned/scrutiny/三次连错-7-4.md`
 > **拍板人**：錡哥 · **作者**：周星星 🌟
 
 > ⚠️ **核心警告 1：项目自述 ≠ 实际**——不核验就动手 = 必定失误
-> ⚠️ **核心警告 2：改配置 ≠ 自动生效**——改系统级配置（如资源限制/内核参数/系统服务/定时任务）前，必查是否有底层服务在接管，导致改了不生效（详见第 6.5 步，Linux 服务场景为主）
+> ⚠️ **核心警告 2（v3.0.2 补）：系统服务依赖 ≠ 无**——改 ulimit/sysctl/cron 前,必查 ABRT / systemd-coredump / auditd 等拦截服务
 
 ## 触发词
 
 - `/scrutiny`（显式调用）
 - 用户说"审计"、"审查一下"、"复盘"、"review 一下这个方案"、"帮我审审"
 
-> **何时不应启动**：见上方「什么时候别用」。原环境中系统级判定放在 `AGENTS.md`；WorkBuddy 对应工作区约定（如 SOUL.md / 项目上下文），此处不重复。
+> **何时不应启动**：见 `AGENTS.md` 规则 #5（系统级判定在 AGENTS，不在此处重复）。
 
 ## 核心指令
 
@@ -84,6 +89,8 @@ description: 第一性原理全面审查模式（v3.0.2 · 6+1 步法 + 4 大类
 **核心警示**：**五行诀 ≠ /scrutiny**（前者思维框架，后者操作流程，两者正交不可替代）。
 
 ### 第 1 步：事实收集
+
+> **🆕 8-3 知彼诀集成**："事实收集"能力已提取到知彼诀（`~/.agents/skills/zhibi-jue/` 知己·盘点方法）。明辨诀作为**纯法官**不再自行收集事实——**输入 = 调用方提供的「事实清单」+「验证结果」**（由知彼诀前置情报包或主控阶段 0 提供）。若调用方未提供事实清单 → 明辨诀拒绝审查（缺输入）→ 主控需先调知彼诀知己方法。法官不亲自取证，法官审证据。
 
 列出所有已确认的客观事实（facts），每一条都必须有来源佐证：
 - 日志原文 / 配置文件原文 / 工具输出 / 运行结果
@@ -182,21 +189,19 @@ description: 第一性原理全面审查模式（v3.0.2 · 6+1 步法 + 4 大类
 
 ### 第 6 步：实态核验（v3.0 新增 · **必走**）
 
-> **背景**：3 次自审连错的教训（原环境沉淀，新环境教训写入 `.workbuddy/memory/lessons-learned/scrutiny/`）
+> **🆕 8-3 知彼诀集成**："实态核验"能力已提取到知彼诀（`~/.agents/skills/zhibi-jue/` 知己·验证方法）。明辨诀的实态核验命令（find/wc/ls/stat/json 验证 4 命令）由**知彼诀调用**（调用由知彼诀触发）。明辨诀仍保留"实态核验"作为**审查时自检**（验证调用方提供的事实是否属实）——命令复用知彼诀，不重复造轮子。
+
+> **背景**：7-4 15:00 周星星 3 次自审连错（教训：`memory/lessons-learned/scrutiny/三次连错-7-4.md`）
 > **5 次失误 100% 失效率** = 全因"只信项目自述，未核验实际"
 
-#### 4 个硬命令（**审前必跑** · 跨平台）
-
-> WorkBuddy 在 Windows 上走 Git Bash，下列命令可直接用；PowerShell 等价写法见注释。
+#### 4 个硬命令（**审前必跑**）
 
 ```bash
-find <项目> -type f | wc -l              # 1. 文件数 — 防"README 说待写，实际已写"
-ls -la <项目>/                            # 2. 隐藏文件 — 防"判断空目录误删"
+find <项目> -type f | wc -l        # 1. 文件数 — 防"README 说待写，实际已写"
+ls -la <项目>/                      # 2. 隐藏文件 — 防"判断空目录误删"
 stat -c '%Y %n' <项目>/* | sort -rn | head   # 3. 时序 — 防"以为停更，实际正常间隔"
-python -c "import json,sys; print(list(json.load(open(sys.argv[1])).keys()))" <file>  # 4. 字段位置
+python3 -c "import json; d=json.load(open('<file>')); print(list(d.keys()))"  # 4. 字段位置
 ```
-
-> PowerShell 等价：`(Get-ChildItem <项目> -Recurse -File).Count` / `Get-ChildItem -Force` / `Get-ChildItem | Sort LastWriteTime -Desc` / `(Get-Content <file> | ConvertFrom-Json).PSObject.Properties.Name`。
 
 #### 自述 vs 实态判断矩阵
 
@@ -220,52 +225,71 @@ python -c "import json,sys; print(list(json.load(open(sys.argv[1])).keys()))" <f
 
 > **"自述看 1 遍，核验 4 步走；不核验就动手 = 必定失误"**
 
-#### 6.5 子步骤：环境核验（**改配置类必走**）
+#### 6.5 子步骤：系统环境核验（v3.0.2 必走 · 7-16 P0 触发）
 
-> **核心警示（普适）**：**改配置 ≠ 自动生效**——一定要问「有没有更底层的东西在接管我这个配置，让它悄悄不生效？」审方案 = 审方案 + 审运行环境。
-> **原始教训**：某磁盘方案改 `ulimit -c 0` 禁用 core dump，但系统装了 ABRT，内核把 core dump 直接 pipe 给 abrt-hook，**完全绕过 ulimit**——方案 0% 生效却毫无报错。这是最隐蔽的一类失误。
+> **背景**：7-16 磁盘方案 v1.0 改 `ulimit -c 0` 禁用 core dump，但系统装了 ABRT（Automatic Bug Reporting Tool），内核把 core dump pipe 给 `/usr/libexec/abrt-hook-ccpp`，**完全绕过 ulimit**——方案 v1.0 0% 生效。
+> **核心警示**：**改系统配置 ≠ 自动生效**——必有"系统服务依赖"在底层接管。审方案 = 审方案 + 审系统环境。
 
-**核验通式（3 问 · 任何平台任何配置都适用）**：
-
-1. **谁在我上面？** 这个配置之上有没有更高优先级的层会覆盖它？（构建工具覆盖源码配置 / 环境变量覆盖配置文件 / 系统服务覆盖用户设置）
-2. **改了真生效吗？** 不能只看「配置文件改了」，要看「运行时实际值变了」——重新读一次实际生效值。
-3. **能真触发一次吗？** 造一个最小场景把改动真跑一遍，确认行为按预期变化。
-
-**WorkBuddy 常见场景对照（前端 / 应用开发为主）**：
-
-| 改动类型 | 底层接管者（易被忽略）| 核验方式 |
-|---------|---------------------|---------|
-| 改 `.env` / 环境变量 | 构建时内联、`import.meta.env` 前缀规则、shell 已缓存旧值 | 重启 dev server + 打印实际读到的值 |
-| 改 vite/webpack 配置 | 缓存(`node_modules/.vite`)、mode 覆盖、CI 另一套配置 | 清缓存重构 + 看产物 |
-| 改 `package.json` 依赖版本 | lockfile 锁死实际版本 | `npm ls <pkg>` 看实际安装版本 |
-| 改 Windows 系统设置 | 组策略 / 服务 / 注册表更高优先级 | 改后重新读取实际值 |
-
-**Linux 服务器场景参考（仅当审的是 Linux 部署 / 运维方案时才用）**：
+**必查 5 类系统服务拦截器**：
 
 ```bash
-# core dump 接管者 / 审计服务 / 自动 bug 报告 / 定时任务覆盖 / 日志配额
-cat /proc/sys/kernel/core_pattern        # | 开头 = pipe 给其他服务（绕过 ulimit）
-systemctl status auditd --no-pager       # 审计服务是否拦截
-systemctl list-timers --no-pager | head  # systemd-timer 是否覆盖 cron
-prlimit | grep CORE; ulimit -c           # 改后看"实际生效"，不只看配置
+# 1. core dump 接管者（最常见盲点）
+cat /proc/sys/kernel/core_pattern    # 若含 | 开头 = pipe 给其他服务
+ls /etc/abrt/ 2>/dev/null            # Red Hat 系 ABRT 配置
+cat /etc/systemd/coredump.conf 2>/dev/null  # systemd-coredump 配置
+
+# 2. 审计服务（拦截文件访问/系统调用）
+systemctl status auditd --no-pager
+auditctl -l 2>/dev/null
+
+# 3. 自动 bug 报告（Ubuntu apport 等）
+ls /etc/apport/ 2>/dev/null
+
+# 4. cron 拦截（systemd-timer 覆盖 cron？）
+systemctl list-timers --no-pager | head
+
+# 5. 日志/资源拦截（logrotate/journald 配额）
+journalctl --verify 2>&1 | head -3
+cat /etc/systemd/journald.conf 2>/dev/null | grep -v '^#'
 ```
 
-**改配置类方案文档模板**：
+**修改后必验证（v3.0.2 加）**：
+
+```bash
+# 不只是看配置改了 — 要看"实际生效"
+prlimit | grep CORE          # 实际进程 limit
+ulimit -c                    # 当前 shell
+# 真触发一次测试（如 yes | python3 -c "import ctypes; ctypes.string_at(0)"）
+```
+
+**方案文档新模板（v3.0.2 加）**：
 
 ```markdown
 ## Step X：xxx 修改
-**修改命令 / 文件**：xxx
-**底层接管检查**：
-- [ ] 有没有更高优先级的层覆盖它？（构建/环境变量/系统服务/lockfile）
-**验证**（必带）：
-- 改前实际值：xxx
-- 改后实际值：xxx（重新读取，不是看配置文件）
+**修改命令**：xxx
+**依赖服务检查**：
+- [ ] ABRT / systemd-coredump 是否拦截？
+- [ ] auditd / fail2ban 是否拦截？
+- [ ] systemd-timer 是否覆盖 cron？
+**验证命令**（必带）：
+- 改前：xxx
+- 改后：xxx
 - 真触发测试：xxx
 ```
 
-#### 6 步升级口诀
+**系统环境核验 vs 项目实态核验 差异表**：
 
-> **"自述看 1 遍，核验 4 步走；改配置问 3 问（谁在上面/真生效吗/能触发吗）；不核验就动手 = 必定失误"**
+| 维度 | 项目实态核验（v3.0 第 6 步）| 系统环境核验（v3.0.2 6.5 步）|
+|------|----------------------------|---------------------------|
+| 核验对象 | 项目内部文件 / 配置 / cron | 系统服务 / 内核参数 / 包管理器 |
+| 核验命令 | `find / ls -la / stat / json` | `systemctl / sysctl / cat /proc/...` |
+| 失误类型 | 自述≠实态（README 撒谎）| 服务拦截（ABRT 接管 ulimit）|
+| 触发场景 | 项目文档说改 A | 改 ulimit/sysctl/cron/config |
+| 失误后果 | 误判项目状态 | **方案 0% 生效**（更隐蔽）|
+
+#### 6 步升级口诀（v3.0.2 终版）
+
+> **"自述看 1 遍，核验 4 步走；系统环境 5 类查；不核验就动手 = 必定失误"**
 
 ---
 
@@ -323,15 +347,13 @@ prlimit | grep CORE; ulimit -c           # 改后看"实际生效"，不只看�
 
 ## 备份前置模板（v3.0 必走 · P1）
 
-> **背景**：曾误删 audits/issues → 原则"任何动手前 = 先备份后动手"
+> **背景**：7-4 14:32 误删 audits/issues → 原则"任何动手前 = 先备份后动手"
 
 ```bash
-# 跨平台（Git Bash）：备份到当前工作区 .workbuddy/memory/audit/
-mkdir -p "$(pwd)/.workbuddy/memory/audit/<YYYY-MM-DD>-<动作>/"
-cp -r <项目根> "$(pwd)/.workbuddy/memory/audit/<YYYY-MM-DD>-<动作>/<项目>.bak"
+WORKDIR="$(pwd)"  # ← 当前 workspace 根目录
+mkdir -p "$WORKDIR/memory/audit/<YYYY-MM-DD>-<动作>/"
+cp -r <项目根> "$WORKDIR/memory/audit/<YYYY-MM-DD>-<动作>/<项目>.bak"
 ```
-
-> PowerShell 等价：`New-Item -ItemType Directory -Force ".workbuddy/memory/audit/<日期>-<动作>"; Copy-Item <项目根> ".workbuddy/memory/audit/<日期>-<动作>/<项目>.bak" -Recurse`
 
 ## 三段式决策格式（v3.0 P1 · 防误判）
 
@@ -380,8 +402,8 @@ cp -r <项目根> "$(pwd)/.workbuddy/memory/audit/<YYYY-MM-DD>-<动作>/<项目>
 
 ## 验证标准（v2.0 + v3.0 必做）
 
-- **V1**：审 1 个真实方案 + 写教训进 `.workbuddy/memory/lessons-learned/scrutiny/`（自评 < 7 分必走）
+- **V1**：用 v3.0 审 1 个真实方案 + 写教训进 `memory/lessons-learned/scrutiny/`（自评 < 7 分必走）
 - **V2**：找 1 个外部用户试用 1 周
-- **V3**：SKILL.md 保持精简（原环境自我约束 ≤ 16KB）。WorkBuddy 不做文件大小硬限制，此为可读性/上下文成本的自我建议。
+- **V3**：SKILL.md 文件大小 ≤ 16KB（v3.0 + 自升级调整，原 14KB 阈值因自升级章节自然超出）<!-- 7-19 标注：16KB 是 **mingbian-jue V3 自我约束**（自升级检查器会真报警），**不是 OpenClaw 强制要求**。OpenClaw 本身不卡文件大小。混淆这两层会导致误判。-->
 
 📋 变更历史 → `references/CHANGELOG.md`
