@@ -12,7 +12,7 @@
 | **five-dimensions.md** | 75 | 3.7K | 决策时（最常用）| 5 维详解 + 挡中医误读 + 5 不是巧合 + 哲学纵轴 + 8 关系修仙术语 |
 | **eight-relations.md** | 71 | 2.8K | 决策时 | 8 关系动态平衡（4 基础 + 4 高级 + 复盘精化）|
 | **evolution.md** | 52 | 2.1K | 想知道版本史 | v1.0 → v4.0.4 演化 + 3 大教训 + 拍板记录 |
-| **naming-decision.md** | 143 | 6.9K | 写"为什么叫五行诀" | 命名全过程（6 候选 + 般若虾反馈 + 锡哥拍板理由）|
+| **naming-decision.md** | 143 | 6.9K | 写"为什么叫五行诀" | 命名全过程（6 候选 + 般若虾反馈 + 錡哥拍板理由）|
 | **external-review.md** | 178 | 7.4K | 写"东方哲学权威" | 般若虾 2 轮反馈全集（v4.0.1 完善建议 + 修仙术语 100% 经典出处）|
 | **cross-cultural-comparison.md** | 140 | 6.4K | 写"5 步跨文化共识" | Dewey/唯识/Cynefin/道家内炼 + 调研 4 大发现 |
 | **2026-07-06-learnings.md** | 198 | 7.7K | 写"五行诀是怎么炼出来的" | 7-6 反思 5 大教训 + 元模式：自纠循环 |
@@ -37,7 +37,7 @@
 | 文章类型 | 读哪个 |
 |---|---|
 | **「五行诀是什么」简介** | `external-review.md` + `naming-decision.md` |
-| **「为什么叫五行诀」** | `naming-decision.md`（锡哥修仙法术感原话）|
+| **「为什么叫五行诀」** | `naming-decision.md`（錡哥修仙法术感原话）|
 | **「五行诀 vs /scrutiny」** | `2026-07-07-deep-comparison.md` |
 | **「五行诀的 7-6 一天」故事** | `2026-07-06-learnings.md` |
 | **「5 步跨文化共识」** | `cross-cultural-comparison.md` |
