@@ -3,6 +3,10 @@ name: mingbian-jue
 description: 第一性原理全面审查模式（v3.1 · 6+1 步法 + 4 大类 17 子类）。**v3.1 触发词扩充**：「挑刺」「找问题」「挑 bug」「事故复盘」「踩坑了 帮我看看」。当用户要求审计/审查/复盘/review 方案/项目/代码/讨论内容时激活。快速切换为"先审后干"的对抗式思考模式。自动执行 Pre-Mortem → 事实收集 → 否定性对抗 → 追问性对抗 → 根因 → 推荐行动 → **实态核验**，全面验证每一个假设和结论。**唯一有 scripts**（catch_incidents.py 自升级工具）。与[破妄决](https://github.com/duckytan/skills/tree/main/powang-jue)/[五行诀](https://github.com/duckytan/skills/tree/main/wuxing-jue)/[知彼诀](https://github.com/duckytan/skills/tree/main/zhibi-jue)协作（4 诀互引），补[三司会审](https://github.com/duckytan/skills/tree/main/sansi-huishen)评审。
 ---
 
+> **🔗 源头仓库**：https://github.com/duckytan/skills/tree/main/mingbian-jue
+> **📥 自动更新（raw 直链）**：https://raw.githubusercontent.com/duckytan/skills/main/mingbian-jue/SKILL.md
+> **🏷 Skill 名**：`mingbian-jue`（明辨诀）· **编排入口**：[三司会审](https://github.com/duckytan/skills/tree/main/sansi-huishen) — 只装三司会审一个，即可经主控一键拉全套 4 诀（含本诀）
+
 # 明辨诀 v3.0.2 — 第一性原理审查模式
 
 ## 这是谁

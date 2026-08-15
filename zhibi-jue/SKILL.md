@@ -3,6 +3,10 @@ name: zhibi-jue
 description: 知彼诀 v1.1 — 兵家「知彼知己，百战不殆」**独立情报收集器**。三阶段工作流（知己/知彼/对标），6 个独立方法（盘点/验证/调研/横向/对标/度量），**不依赖其他诀，不依赖三司会审**。触发词：「调研」「查一下」「别人怎么做」「参考」「竞品」「选型」「盘点现状」「摸底」「情报」「看看外面」。Use when the user asks to research external solutions, survey competitors, benchmark options, or gather intel independently — without needing 三司会审's coordination.与[明辨诀](https://github.com/duckytan/skills/tree/main/mingbian-jue)/[破妄诀](https://github.com/duckytan/skills/tree/main/powang-jue)/[五行诀](https://github.com/duckytan/skills/tree/main/wuxing-jue)协作（4 诀互引），补[三司会审](https://github.com/duckytan/skills/tree/main/sansi-huishen)评审。 与明辨诀（对内对抗审查）/破妄诀（对内假设穿透）/五行诀（对内平衡判断）互补——知彼诀专门对「内+外」收集情报。
 ---
 
+> **🔗 源头仓库**：https://github.com/duckytan/skills/tree/main/zhibi-jue
+> **📥 自动更新（raw 直链）**：https://raw.githubusercontent.com/duckytan/skills/main/zhibi-jue/SKILL.md
+> **🏷 Skill 名**：`zhibi-jue`（知彼诀）· **编排入口**：[三司会审](https://github.com/duckytan/skills/tree/main/sansi-huishen) — 只装三司会审一个，即可经主控一键拉全套 4 诀（含本诀）。知彼诀亦可独立使用（不依赖三司会审）。
+
 # 知彼诀 (Zhi-Bi Jue)
 
 > **版本**：skill v1.1 · **定位**：**独立情报收集器**（v1.1 脱神秘）· 三司会审需要时可作为前置情报提供者被调度
