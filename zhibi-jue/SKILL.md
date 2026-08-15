@@ -6,7 +6,7 @@ description: 知彼诀 v1.1 — 兵家「知彼知己，百战不殆」**独立�
 > **🔗 源头仓库**：https://github.com/duckytan/skills/tree/main/zhibi-jue
 > **📥 自动更新（raw 直链）**：https://raw.githubusercontent.com/duckytan/skills/main/zhibi-jue/SKILL.md
 > **🏷 Skill 名**：`zhibi-jue`（知彼诀）· **编排入口**：[三司会审](https://github.com/duckytan/skills/tree/main/sansi-huishen) — 只装三司会审一个，即可经主控一键拉全套 4 诀（含本诀）。知彼诀亦可独立使用（不依赖三司会审）。
-> **🔄 自动更新**：每 7 天上 GitHub 检查版本号（commit sha），有新版自动下载 raw 覆盖本地。协议见三司会审「自动更新协议」。
+> **🔄 自动更新**：每 7 天上 GitHub 检查版本号，有新版**仅提示，不自动覆盖**。本诀已内置 `scripts/update_check.py`，每次被调用时自动运行——间隔≥7天才真正联网检测，不足则静默跳过（省资源）。协议见三司会审「自动更新协议」。
 
 # 知彼诀 (Zhi-Bi Jue)
 
