@@ -3,6 +3,10 @@ name: wuxing-jue
 description: 五行诀 v4.1 — 道家内炼 5 维认知心法（太初诀/观复诀/洞观诀/颠倒诀/知几诀）× 5 行（木火土金水）× 8 关系动态平衡。**v4.1 新增 scripts/five-dim-quick.py**（5 维快速打分 + 失衡提示）。与[明辨诀](https://github.com/duckytan/skills/tree/main/mingbian-jue)/[破妄诀](https://github.com/duckytan/skills/tree/main/powang-jue)/[知彼诀](https://github.com/duckytan/skills/tree/main/zhibi-jue)协作（4 诀互引），补[三司会审](https://github.com/duckytan/skills/tree/main/sansi-huishen)评审。用于 4 大场景：决策辅助/方案审查/复盘分析/教学引导。触发词：「五行诀审一下」「做五维复盘」「决策方法」「该投不该投」「5 维打分」「颠倒诀」「知几诀」「decision framework」「wuxing-jue」「5-dimension analysis」。误读挡板见 SKILL.md §1（≠ 中医/算命/风水）。
 ---
 
+> **🔗 源头仓库**：https://github.com/duckytan/skills/tree/main/wuxing-jue
+> **📥 自动更新（raw 直链）**：https://raw.githubusercontent.com/duckytan/skills/main/wuxing-jue/SKILL.md
+> **🏷 Skill 名**：`wuxing-jue`（五行诀）· **编排入口**：[三司会审](https://github.com/duckytan/skills/tree/main/sansi-huishen) — 只装三司会审一个，即可经主控一键拉全套 4 诀（含本诀）
+
 # Wuxing Jue (五行诀)
 
 > **版本**：skill v4.0.5（**10 个 references**）· 内容版 v4.0.4。**两个版本号含义不同**：v4.0.4 = 五行诀方法本身，v4.0.5 = skill 化 + 资料库扩充。

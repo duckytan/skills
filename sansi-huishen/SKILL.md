@@ -955,6 +955,21 @@ python3 scripts/trigger-router.py "帮我调研一下竞品"
 > **8-4 錡哥**："知彼诀的下载地址，有没有写进三司会审里？" → 补全。
 > **GitHub 仓库**：https://github.com/duckytan/skills
 
+### 🚪 一键入口（只装三司会审 = 拉全套）
+
+> **设计**：三司会审是编排主控，自带全套 4 诀地址清单。**用户只需安装 `sansi-huishen` 一个 skill**，主控即自动发现并按需调度 4 个诀（明辨/破妄/五行/知彼）。缺哪个诀，从下表 raw 直链补齐即可，不必分别安装 5 次。
+> **WorkBuddy 安装路径**：`~/.workbuddy/skills/`（user 级，跨项目可用）或 `{workspace}/.workbuddy/skills/`（project 级）。下方"方式 A/B"里 `~/.agents/skills/` 是通用 agents 平台路径，WorkBuddy 用户自行替换为上述路径。
+
+**raw 直链表（自动更新程序直接拉原文用，比 tree 网页链接更稳）**：
+
+| 诀 | Skill 名 | raw 直链 |
+|----|---------|---------|
+| 明辨诀 | `mingbian-jue` | https://raw.githubusercontent.com/duckytan/skills/main/mingbian-jue/SKILL.md |
+| 破妄诀 | `powang-jue` | https://raw.githubusercontent.com/duckytan/skills/main/powang-jue/SKILL.md |
+| 五行诀 | `wuxing-jue` | https://raw.githubusercontent.com/duckytan/skills/main/wuxing-jue/SKILL.md |
+| 知彼诀 | `zhibi-jue` | https://raw.githubusercontent.com/duckytan/skills/main/zhibi-jue/SKILL.md |
+| **三司会审（本层/编排入口）** | `sansi-huishen` | https://raw.githubusercontent.com/duckytan/skills/main/sansi-huishen/SKILL.md |
+
 ### 4 诀 + 1 编排层（路径表）
 
 | 诀 | Skill 名 | GitHub 路径 | 触发时机 |
@@ -1007,6 +1022,27 @@ npx skills add https://github.com/duckytan/skills/tree/main/sansi-huishen --skil
 git clone https://github.com/duckytan/skills /tmp/skills-duckytan
 cp -r /tmp/skills-duckytan/sansi-huishen ~/.agents/skills/
 ```
+
+### 🔄 自动更新协议（7 天间隔 · 资源平衡 · 8-15 錡哥拍板）
+
+> **问题**：每次 skill 启用都查 GitHub = 浪费系统资源。
+> **方案**：7 天间隔 + 本地时间戳闸门。能不查就不查。
+
+**机制（6 步）**：
+1. 每个诀目录下存 `.update-check.json`：`{"lastCheck": "ISO 8601 时间", "lastSha": "上次见到的 commit sha", "lastVersion": "vx.x"}`
+2. skill 启用时先读本诀的 `.update-check.json` 的 `lastCheck`
+3. `now - lastCheck >= 7 天` → 触发检测（拉 raw 直链 → 比对 sha）
+4. 有更新 → 提示用户 / 覆盖本地 + 更新时间戳 + sha
+5. 无更新 → 仅更新时间戳（sha 不变）
+6. `now - lastCheck < 7 天` → 跳过检测，直接用本地版
+
+**时间戳路径**：`~/.workbuddy/skills/<诀名>/.update-check.json`（每个诀独立一份）
+
+**触发点**：skill 实际启用时（即被调用/加载进上下文时），**不是每次对话**。日常对话不触发检测。
+
+**首装特例**：首次安装时 `.update-check.json` 不存在 → 当作"立即检测一次"，写入时间戳 + sha，之后走 7 天间隔。
+
+**协议源**：本协议由三司会审主控定义，4 诀遵循（4 诀自描述块已指向三司会审编排入口，更新协议同源，不必在各诀重复全文）。
 
 ### 命名规范（8-4 錡哥拍板）
 
