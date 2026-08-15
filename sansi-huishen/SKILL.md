@@ -2,6 +2,8 @@
 name: sanshi-hui-shen
 description: 三司会审 v3.3 — v3.1.2 + 8-3 L1.5 知彼诀调度协议（外部事实表 + 串行前置 + 并发控制显式化 + 失败兜底）。触发词：「三司会审」「三诀会审」「会审」或重大决策前自动启用。
 ---
+> **🔄 自动更新**：每 7 天上 GitHub 检查版本号，有新版**仅提示，不自动覆盖**。本诀已内置 `scripts/update_check.py`，每次被调用时自动运行——间隔≥7天才真正联网检测，不足则静默跳过（省资源）。协议见三司会审「自动更新协议」。
+
 <!-- 7-19 标注：~12KB / ~60KB 是 **錡哥 7-13 拍板的铁律**（仅适用 agent 核心 MD），**不是 OpenClaw 系统级硬限制**。OpenClaw 本身不卡文件大小。本主控 skill 是 workspace 级（`clawd/skills/`），不受 12KB 限制。-->
 
 # 三司会审 v3.3 · 核心大脑 · 含跳过与失败模式 · L1.5 知彼诀调度协议
@@ -1031,9 +1033,9 @@ cp -r /tmp/skills-duckytan/sansi-huishen ~/.agents/skills/
 **机制（6 步）**：
 1. 每个诀目录下存 `.update-check.json`：`{"lastCheck": "ISO 8601 时间", "lastSha": "上次见到的 commit sha", "lastVersion": "vx.x"}`
 2. skill 启用时先读本诀的 `.update-check.json` 的 `lastCheck`
-3. `now - lastCheck >= 7 天` → 触发检测（拉 raw 直链 → 比对 sha）
-4. 有更新 → 提示用户 / 覆盖本地 + 更新时间戳 + sha
-5. 无更新 → 仅更新时间戳（sha 不变）
+3. `now - lastCheck >= 7 天` → 触发检测：拉本诀 raw 直链 → 提取 GitHub commit sha（版本号指纹）比对本地 `lastSha`
+4. sha 不同 = 有新版 → **自动下载 raw 覆盖本地 SKILL.md** + 更新 `.update-check.json`（lastCheck + lastSha）
+5. sha 相同 = 无更新 → 仅更新 `lastCheck`
 6. `now - lastCheck < 7 天` → 跳过检测，直接用本地版
 
 **时间戳路径**：`~/.workbuddy/skills/<诀名>/.update-check.json`（每个诀独立一份）
