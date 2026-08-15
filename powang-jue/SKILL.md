@@ -6,6 +6,7 @@ description: 破妄诀 v1.5 — 穿透信念前提，揪出自性执。纵轴 3 
 > **🔗 源头仓库**：https://github.com/duckytan/skills/tree/main/powang-jue
 > **📥 自动更新（raw 直链）**：https://raw.githubusercontent.com/duckytan/skills/main/powang-jue/SKILL.md
 > **🏷 Skill 名**：`powang-jue`（破妄诀）· **编排入口**：[三司会审](https://github.com/duckytan/skills/tree/main/sansi-huishen) — 只装三司会审一个，即可经主控一键拉全套 4 诀（含本诀）
+> **🔄 自动更新**：每 7 天上 GitHub 检查版本号（commit sha），有新版自动下载 raw 覆盖本地。协议见三司会审「自动更新协议」。
 
 ## 这是谁
 这技能是干嘛的:穿透隐藏的假设(自以为",揪出你以为"对"但实际不对的信念前提。
