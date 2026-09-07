@@ -114,9 +114,18 @@ python3 scripts/bazi_paipan.py 1990 7 22 14 1
 
 ## 🚀 安装使用
 
+### 依赖说明
+
+| 依赖 | 是否必需 | 安装命令 |
+|------|----------|----------|
+| Python 3.8+ | ⚠️ **仅八字模块必需** | 系统自带 / [python.org](https://www.python.org/downloads/) |
+| `lunar-python==1.4.8` | ⚠️ **仅八字模块必需** | `pip install lunar-python==1.4.8` |
+
+**说明**：倪海厦中医诊断的核心能力（六经辨证 + 问诊十问 + 经方选药）**不依赖任何 Python 包**，直接读取 `SKILL.md` + `modules/` + `cases/` 即可。`bazi_paipan.py` 是**可选的八字辅助工具**，只有用户主动提供公历生日、需要八字排盘时才调用。
+
 ### 方式一：GitHub 链接一键装（豆包 / 支持 Agent 的 AI）
 1. 打开 AI 工具，进入带 Agent / 联网抓取能力的模式（如豆包「办公任务 Turbo」）
-2. 输入：`github.com/gotchkonopskied432-cloud/nihaixia 帮我装一下这个skill`
+2. 输入：`github.com/duckytan/skills 帮我装 nihaixa 这个 skill`
 3. 等待安装完毕，即可对话
 
 ### 方式二：本地手动安装（Claude Code / Claude 桌面版 / Claudian）
@@ -126,6 +135,21 @@ python3 scripts/bazi_paipan.py 1990 7 22 14 1
    - Mac：`~/.claude/skills/`
 3. 确认路径为 `.claude/skills/nihaixia/SKILL.md`
 4. 重启 AI 工具，说触发词即可
+
+### 八字辅助模块安装（可选）
+
+```bash
+# 1. 基础安装
+pip install lunar-python==1.4.8
+
+# 2. 验证安装成功
+python3 -c "from lunar_python import Solar; print('OK')"
+
+# 3. 测试排盘
+python3 scripts/bazi_paipan.py 1990 7 22 14 1
+```
+
+**完整安装排错**：详见 [`INSTALL.md`](./INSTALL.md) 或 [`02-体质先天判定.md` § 常见安装问题](./02-体质先天判定.md)。
 
 ### 使用示例
 - 「倪海厦会怎么看失眠？」
