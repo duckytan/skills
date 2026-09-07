@@ -188,5 +188,101 @@ python3 scripts/bazi_paipan.py 1990 7 22 14 1
 
 ---
 
+## 🔄 如何更新到最新版
+
+本 skill 在 GitHub 持续维护（脱敏公开版·周迭代）。新版修复 bug、增加医案、补充经方内容。
+
+### 更新地址（固定 URL）
+
+> **https://github.com/duckytan/skills/tree/main/nihaixia**
+
+### 更新方法
+
+#### 方式一：git pull（推荐·适用于 git clone 装的用户）
+
+```bash
+# 1. 定位到 skill 目录
+cd ~/.claude/skills/nihaixia    # Mac/Linux 默认路径
+# Windows: cd %USERPROFILE%\.claude\skills\nihaixa
+
+# 2. 拉取最新版
+git pull origin main
+
+# 3. 查看本次更新了什么
+git log --oneline -5
+```
+
+#### 方式二：重新下载 ZIP（适用于 ZIP 下载装的用户）
+
+```bash
+# 1. 下载最新版
+# 访问 https://github.com/duckytan/skills/tree/main/nihaixia
+# 点击 "Code" → "Download ZIP"
+
+# 2. 解压覆盖旧版本
+unzip nihaixa-main.zip -d ~/.claude/skills/nihaixa-new
+
+# 3. 备份旧版本
+mv ~/.claude/skills/nihaixa ~/.claude/skills/nihaixa.bak-$(date +%Y%m%d)
+
+# 4. 重命名新版
+mv ~/.claude/skills/nihaixa-new ~/.claude/skills/nihaixa
+
+# 5. 验证
+ls ~/.claude/skills/nihaixa/SKILL.md  # 确认存在
+```
+
+#### 方式三：直接重新拷贝（适用于临时验证）
+
+```bash
+# 1. 删除旧版本
+rm -rf ~/.claude/skills/nihaixa
+
+# 2. 重新克隆或拷贝
+git clone --depth 1 https://github.com/duckytan/skills.git /tmp/skills
+cp -r /tmp/skills/nihaixa ~/.claude/skills/
+
+# 3. 清理
+rm -rf /tmp/skills
+```
+
+### 版本验证
+
+```bash
+# 查本地版本（看最近 commit）
+cd ~/.claude/skills/nihaixa && git log -1 --format="%h %ai %s"
+# 输出: 03d14f3 2026-09-07 fix(nihaixa): 补全依赖安装指引...
+
+# 查远端最新版本
+curl -s "https://api.github.com/repos/duckytan/skills/commits?path=nihaixa&per_page=1" \
+  | python3 -c "import json,sys; print(json.load(sys.stdin)[0]['sha'][:7])"
+# 输出: 远端最新 commit hash
+
+# 对比,不同 = 有新版可更新
+```
+
+### 完整 URL 列表
+
+| 用途 | URL |
+|------|-----|
+| 🏠 上游仓库 | https://github.com/duckytan/skills |
+| 📍 nihaixa 路径 | https://github.com/duckytan/skills/tree/main/nihaixia |
+| 📥 Raw SKILL.md | https://raw.githubusercontent.com/duckytan/skills/main/nihaixia/SKILL.md |
+| 📜 commit 列表 | https://github.com/duckytan/skills/commits/main/nihaixia |
+| 📋 最新 commit | https://github.com/duckytan/skills/commits/main/nihaixia/SKILL.md |
+| 🐛 Issues | https://github.com/duckytan/skills/issues |
+| 📥 Download ZIP | https://github.com/duckytan/skills/archive/refs/heads/main.zip |
+
+### 常见更新问题
+
+| 问题 | 原因 | 解决 |
+|------|------|------|
+| `git pull` 报错 `Your local changes would be overwritten` | 本地有未提交修改 | `git stash` → `git pull` → `git stash pop`（或删了重装） |
+| ZIP 下载后 AI 认不到 | skill 路径不对 | 确认是 `~/.claude/skills/nihaixa/SKILL.md`（**不是** nihaixia-public） |
+| lunar-python 报 `ModuleNotFoundError` | 更新后依赖版本变了 | 重新 `pip install lunar-python==1.4.8` |
+| 装好后行为变了 | 可能是更新导致 | 查看 GitHub commit 说明：`https://github.com/duckytan/skills/commits/main/nihaixia` |
+
+---
+
 **最后更新**：2026-09-07
 **维护者**：本 skill 为公共版，由 duckytan/skills 仓库托管
