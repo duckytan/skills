@@ -9,11 +9,39 @@ bazi_paipan.py · 通用八字排盘+倪师体质判定脚本
 用法：
   python3 bazi_paipan.py 1990 7 22 14 1
   参数：年 月 日 时(24h) 性别(1男0女)
+
+依赖：
+  Python 3.8+ · lunar-python==1.4.8
+  安装：pip install lunar-python==1.4.8
+  验证：python3 -c "from lunar_python import Solar; print('OK')"
 """
 
-from datetime import datetime
-from lunar_python import Solar
 import sys
+
+# ============ 依赖检测（友好报错 · v1.2 公共版）============
+try:
+    from lunar_python import Solar
+except ImportError:
+    print("=" * 60, file=sys.stderr)
+    print("❌ 缺少依赖: lunar-python==1.4.8", file=sys.stderr)
+    print("=" * 60, file=sys.stderr)
+    print("", file=sys.stderr)
+    print("安装命令：", file=sys.stderr)
+    print("    pip install lunar-python==1.4.8", file=sys.stderr)
+    print("", file=sys.stderr)
+    print("如果是 macOS/Linux 多 Python 环境，可能需要：", file=sys.stderr)
+    print("    pip3 install lunar-python==1.4.8", file=sys.stderr)
+    print("    python3 -m pip install lunar-python==1.4.8", file=sys.stderr)
+    print("", file=sys.stderr)
+    print("验证安装：", file=sys.stderr)
+    print('    python3 -c "from lunar_python import Solar; print(\'OK\')"', file=sys.stderr)
+    print("", file=sys.stderr)
+    print("如已安装但仍报错，可能是虚拟环境问题：", file=sys.stderr)
+    print("    pip install --user lunar-python==1.4.8", file=sys.stderr)
+    print("=" * 60, file=sys.stderr)
+    sys.exit(1)
+
+from datetime import datetime
 import json
 
 

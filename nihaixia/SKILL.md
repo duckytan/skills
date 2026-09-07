@@ -14,8 +14,10 @@ metadata:
     emoji: "🌿"
     requires:
       bins: ["bash", "grep"]
+      pip: ["lunar-python==1.4.8"]   # Python 依赖（仅 02 八字模块需要）
     os:
       - linux
+      - macos
   已合并 nihaisha-perspective 资源：新增①逐字 raw 讲义原文（references/raw/：伤寒/金匮/神农本草/黄帝内经/针灸/天纪）；②伤寒论逐条条文完整注解（references/sources/books/人纪-4-伤寒论/：太阳三篇+阳明+少阳+太阴+少阴+厥阴全文+汉唐度量衡换算）；③倪师表达 DNA/角色扮演规则+条文1-129逐条蒸馏（modules/10_perspective_verbatim.md）。查一手原文/逐条精读/模仿倪师口吻时读这些。
 ---
 
