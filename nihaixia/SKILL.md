@@ -18,8 +18,15 @@ metadata:
     os:
       - linux
       - macos
-  已合并 nihaisha-perspective 资源：新增①逐字 raw 讲义原文（references/raw/：伤寒/金匮/神农本草/黄帝内经/针灸/天纪）；②伤寒论逐条条文完整注解（references/sources/books/人纪-4-伤寒论/：太阳三篇+阳明+少阳+太阴+少阴+厥阴全文+汉唐度量衡换算）；③倪师表达 DNA/角色扮演规则+条文1-129逐条蒸馏（modules/10_perspective_verbatim.md）。查一手原文/逐条精读/模仿倪师口吻时读这些。
+  # 已合并 nihaisha-perspective 资源：①逐字 raw 讲义原文（references/raw/：伤寒/金匮/神农本草/黄帝内经/针灸/天纪）；②伤寒论逐条条文完整注解（references/sources/books/人纪-4-伤寒论/：太阳三篇+阳明+少阳+太阴+少阴+厥阴全文+汉唐度量衡换算）；③倪师表达 DNA/角色扮演规则+条文1-129逐条蒸馏（modules/10_perspective_verbatim.md）。查一手原文/逐条精读/模仿倪师口吻时读这些。
 ---
+
+> **🔗 源头仓库**：https://github.com/duckytan/skills/tree/main/nihaixia
+> **📥 Raw 直链**（SKILL.md）：https://raw.githubusercontent.com/duckytan/skills/main/nihaixia/SKILL.md
+> **🔄 更新检查**：本 skill 公共版在 GitHub 持续维护。需要时去源头仓库 `git pull` 或重新下载 ZIP。详细指引见 README.md § 如何更新到最新版 / INSTALL.md § 如何更新到最新版。
+> **📋 当前 commit**：`03d14f3`（fix: 补全依赖安装指引 + 友好报错 + INSTALL.md）
+
+# 关键词索引与检索指南
 
 # 关键词索引与检索指南
 
@@ -175,7 +182,6 @@ metadata:
 | modules/09_zhenjiu_bencao.md | 针灸教程+本草经345种+倪师药性总义视频精萃+天纪 | 穴位查询/药物性味/药性理论/命理风水 |
 | SKILL.md「六经辨证诊断公式」节 | 8个诊断公式+快速流程图+脉舌速查+合病并病+真寒假热+七步走 | 临床快速辨证定位六经选方剂 |
 
----
 
 ### 辅助文件说明（问诊 + 八字 · 公共版）
 

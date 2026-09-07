@@ -156,6 +156,32 @@ python3 scripts/bazi_paipan.py 1990 7 22 14 1
 - 「用经方思维分析一下这个症状」
 - 「倪师对乳癌的医案有哪些？」
 
+### 🔄 如何更新到最新版
+
+本 skill 在 GitHub 持续维护（脱敏公开版·周迭代）。更新方法：
+
+```bash
+# 方式一：git pull（推荐·适用于 git clone 装的用户）
+cd ~/.claude/skills/nihaixia   # 或安装路径
+git pull origin main
+
+# 方式二：重新克隆（适用于 ZIP 下载装的用户）
+# 1. 删除旧目录: rm - ~/.claude/skills/nihaixia
+# 2. 重新拉取:  https://github.com/duckytan/skills/tree/main/nihaixia
+```
+
+**版本检查·固定 URL**：
+
+> **https://github.com/duckytan/skills/tree/main/nihaixia**
+
+每次 skill 启动时可以去这个地址对比 changelog / commit 历史，看看有没有新版。
+
+**GitHub 仓库**：
+- 🏠 上游仓库：`duckytan/skills` (https://github.com/duckytan/skills)
+- 📍 nihaixa 路径：`https://github.com/duckytan/skills/tree/main/nihaixia`
+- 📜 commit 列表：`https://github.com/duckytan/skills/commits/main/nihaixia`
+- 📋 Raw 直链（SKILL.md）：`https://raw.githubusercontent.com/duckytan/skills/main/nihaixia/SKILL.md`
+
 ---
 
 ## 📁 目录结构
