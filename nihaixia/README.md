@@ -188,30 +188,61 @@ git pull origin main
 
 ```
 nihaixia/
-├── SKILL.md                 # 主技能文件（AI 直接读取的入口）
-├── 01-问诊十问.md          # v1.1 · 十问清单 + 八字调用钩子
-├── 02-体质先天判定.md      # v1.2 · 八字判定（599 行）
-├── scripts/
-│   └── bazi_paipan.py       # 通用八字排盘工具
-├── modules/                 # 10 个知识模块
-│   ├── 01_shanghan_sun.md   # 伤寒论太阳病篇
-│   ├── 02_shanghan_other.md # 阳明/少阳/太阴/少阴/厥阴
-│   ├── 03_yian.md           # 医案集 + 闭门课
-│   ├── 04_jingui.md         # 金匮要略
-│   ├── 05_huangdi_neijing.md# 黄帝内经
-│   ├── 06_liangdong.md      # 梁冬对话
-│   ├── 07_bimen_hantang.md  # 闭门课 + 汉唐文章
-│   ├── 08_huangdi_detail.md # 黄帝内经详注
-│   ├── 09_zhenjiu_bencao.md # 针灸 + 神农本草 + 天纪
-│   └── 10_perspective_verbatim.md # 逐条条文 + 表达DNA
-├── cases/                   # 分类医案库（六大类）
-├── references/
-│   ├── raw/                 # 逐字讲义原文（一手底稿）
-│   ├── sources/books/       # 伤寒论逐条条文 + 度量衡换算
-│   └── research/            # 生平/表达/教学等研究资料
-├── distilled_cases.md
-├── expression_style.md      # 表达 DNA
-└── logo.jpg
+├── SKILL.md                       # 主技能文件（AI 直接读取的入口 · v1.0）
+├── README.md                      # 用户指南
+├── INSTALL.md                     # 安装指南
+├── LICENSE.md                     # MIT License + 第三方依赖归因
+│
+├── assets/                        # 资源文件
+│   ├── logo.jpg                   # skill 图标
+│   └── index.html                 # 网页入口
+│
+├── docs/                          # 辅助 SOP
+│   ├── 01-问诊十问.md            # 10 项问诊清单（任何诊断必走）
+│   └── 02-体质先天判定.md        # 八字判定（可选辅助）
+│
+├── scripts/                       # 可执行脚本
+│   ├── bazi_paipan.py             # 通用八字排盘（依赖 lunar-python==1.4.8）
+│   └── update_check.py            # 7 天懒检查 GitHub 新版本
+│
+├── modules/                       # 10 个深度知识模块
+│   ├── _index.md                  # 模块索引 + 加载策略
+│   ├── 01_shanghan_sun.md         # 伤寒论太阳病篇
+│   ├── 02_shanghan_other.md       # 阳明/少阳/太阴/少阴/厥阴
+│   ├── 03_yian.md                 # 医案集 + 闭门课
+│   ├── 04_jingui.md               # 金匮要略
+│   ├── 05_huangdi_neijing.md      # 黄帝内经
+│   ├── 06_liangdong.md            # 梁冬对话
+│   ├── 07_bimen_hantang.md        # 闭门课 + 汉唐文章
+│   ├── 08_huangdi_detail.md       # 黄帝内经详注
+│   ├── 09_zhenjiu_bencao.md       # 针灸 + 神农本草 + 天纪
+│   └── 10_perspective_verbatim.md # 逐条条文 + 表达DNA（来自 nihaisha-perspective）
+│
+├── cases/                         # 6 类分类医案库（849 个）
+│
+├── references/                    # 拆分出去的速查/参考/一手资料
+│   ├── keyword-index.md           # 关键词 → 位置定位表
+│   ├── qa-quickref.md             # 常见问题 Q&A 速查
+│   ├── style-profile.md           # 决策启发式 + 表达DNA + 价值观 + 诚实边界
+│   ├── nihaisha-perspective.md    # 倪海厦视角补充资源说明
+│   ├── pending-distill.md         # 待蒸馏医案工作清单
+│   ├── expression-style.md        # 表达风格研究
+│   ├── raw/                       # 一手底稿·逐字讲义原文（8 份）
+│   │   ├── 01-天纪-人间道-raw.txt
+│   │   ├── 02-天纪-地脉道-raw.txt
+│   │   ├── 03-天纪-天机道-raw.txt
+│   │   ├── 04-讲义-伤寒论-raw.txt
+│   │   ├── 05-讲义-神农本草-raw.txt
+│   │   ├── 06-讲义-金匮要略-raw.txt
+│   │   ├── 07-讲义-针灸教程-raw.txt
+│   │   └── 08-讲义-黄帝内经-raw.txt
+│   ├── sources/                   # 二手整理
+│   │   └── books/
+│   │       └── renji-4-shanghanlun/  # 人纪-4-伤寒论（14 份逐条注解）
+│   └── research/                  # 倪海厦生平/教学/临床研究
+│
+└── tests/                         # 基础测试
+    └── test_smoke.py              # 烟雾测试（YAML/文件/脚本/索引）
 ```
 
 ---
