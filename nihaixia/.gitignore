@@ -1,16 +1,24 @@
+# Old/temp files
+SKILL.old.md
+SKILL_compressed.md
+analyze.py
+compress.py
+compress_v2.py
+distill_cases.py
+distill_cases_v2.py
+distillation_analysis.txt
+long_lines_analysis.txt
+undistilled_lines.txt
+split_skill.py
+
 # Python
 __pycache__/
 *.pyc
 
 # OS
-.DS_Store
 Thumbs.db
 Desktop.ini
+.DS_Store
 
-# IDE
-.vscode/
-.idea/
-
-# Temp
-*.swp
-*.bak
+# Auto-generated state file
+.last_check
