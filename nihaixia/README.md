@@ -4,13 +4,14 @@
 
 # 倪海厦 Skill · 经方中医 AI（全网最全整合版）
 
-**将经方大师倪海厦的完整中医思维体系注入 AI Agent**
+**将经方大师倪海厦的完整中医思维体系注入 AI Agent · 🔬 科研学习版**
 
 `伤寒论129条` · `金匮23篇` · `黄帝内经` · `神农本草345种` · `849个医案` · `逐字讲义原文` · `表达DNA`
 
 ![版本](https://img.shields.io/badge/版本-整合最全版-blue?style=for-the-badge)
 ![类型](https://img.shields.io/badge/AI%20Skill-Agent%20Ready-orange?style=for-the-badge)
 ![用途](https://img.shields.io/badge/仅供-中医学习研究-green?style=for-the-badge)
+![定位](https://img.shields.io/badge/%F0%9F%94%AC-科研学习版-red?style=for-the-badge)
 
 </div>
 
