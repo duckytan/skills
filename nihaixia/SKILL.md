@@ -19,7 +19,7 @@ metadata:
     os:
       - linux
       - macos
-  # 已合并 nihaisha-perspective 资源：①逐字 raw 讲义原文（references/raw/：伤寒/金匮/神农本草/黄帝内经/针灸/天纪）；②伤寒论逐条条文完整注解（references/sources/books/人纪-4-伤寒论/：太阳三篇+阳明+少阳+太阴+少阴+厥阴全文+汉唐度量衡换算）；③倪师表达 DNA/角色扮演规则+条文1-129逐条蒸馏（modules/10_perspective_verbatim.md）。查一手原文/逐条精读/模仿倪师口吻时读这些。
+  # 已合并 nihaisha-perspective 资源：①逐字 raw 讲义原文（references/raw/：伤寒/金匮/神农本草/黄帝内经/针灸/天纪）；②伤寒论逐条条文完整注解（references/sources/books/renji-4-shanghanlun/：太阳三篇+阳明+少阳+太阴+少阴+厥阴全文+汉唐度量衡换算）；③倪师表达 DNA/角色扮演规则+条文1-129逐条蒸馏（modules/10_perspective_verbatim.md）。查一手原文/逐条精读/模仿倪师口吻时读这些。
 ---
 
 > **🔗 源头仓库**：https://github.com/duckytan/skills/tree/main/nihaixia
@@ -45,6 +45,10 @@ metadata:
 | [`references/pending-distill.md`](references/pending-distill.md) | ~135K | **待蒸馏医案**（849 个超长医案）| 需要引用具体医案原文时 |
 | [`references/expression-style.md`](references/expression-style.md) | ~6K | **表达风格研究** | 模仿倪师语气时 |
 | [`references/research/`](references/research/) | ~20K | **倪海厦生平/教学/临床研究** | 背景问题/学术研究时 |
+
+### 模块索引（modules/_index.md）
+
+加载 modules/ 之前先读 [`modules/_index.md`](modules/_index.md) 看加载策略。
 
 ### 一手底稿（references/raw/）
 
@@ -5574,7 +5578,7 @@ metadata:
 # 《伤寒论》阳明病、少阳病、太阴病、少阴病、厥阴病篇核心解读
 
 > 增量蒸馏时间：2026-04-14
-> 数据源：人纪-4-伤寒论（各篇完整讲解文稿）
+> 数据源：renji-4-shanghanlun/（各篇完整讲解文稿）
 
 ---
 
@@ -6014,7 +6018,7 @@ metadata:
 **预后判断**：睡眠改善+胃口恢复+二便通畅+手足温暖+体力恢复 = 病情好转。反之则恶化。
 
 *本篇蒸馏内容基于倪海厦《人纪-伤寒论》视频讲义整理*
-*来源：人纪-4-伤寒论（各篇完整讲解文稿）*
+*来源：renji-4-shanghanlun/（各篇完整讲解文稿）*
 *蒸馏时间：2026-04-14*
 
 ---
@@ -6483,7 +6487,7 @@ IF 脉细数 + 心烦不得卧 + 舌红少苔 → 少阴热化证
 
 > 本模块收录倪海厦临床医案精华
 > 蒸馏时间：2026-04-14 14:02
-> **蒸馏索引**：`distilled_cases.md` 含849个医案的结构化索引（疾病/六经/方剂/疗效）
+> **蒸馏索引**：`references/pending-distill.md` 含849个医案的结构化索引（疾病/六经/方剂/疗效）
 > **超长医案**：243个医案超过500字，已标记待进一步蒸馏
 
 ### 050324乳癌

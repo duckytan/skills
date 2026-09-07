@@ -264,7 +264,7 @@ D:\qclaw-skills\nihaisha-perspective\references\sources\books\
 │   ├── 1.自序.md ~ 5.结尾.md
 │   └── 讲义-倪海厦人纪系列之神农本草经.pdf
 │
-├── 人纪-4-伤寒论/
+├── renji-4-shanghanlun/ (人纪-4-伤寒论)
 │   ├── 1.倪注《伤寒论》序言.md
 │   ├── 2.前言.md
 │   ├── 3.辨太阳病脉证并治法上篇.md
