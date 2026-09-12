@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+# 个人密码库：含真实密码，绝不入库/推送
+*.local.txt
+passwords.local.txt
