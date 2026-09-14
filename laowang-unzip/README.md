@@ -107,7 +107,7 @@ python3 cli.py run --root <处理根目录> --src <压缩包文件夹>
 | [`SKILL.md`](SKILL.md) | 工作流、配置表、密码策略、泛化说明（中文） |
 | [`references/design-v2.1.md`](references/design-v2.1.md) | 完整设计：DDL、伪代码、每个阈值的来由 |
 | [`references/scripts-api.md`](references/scripts-api.md) | **实现契约**：模块清单 + 函数签名 |
-| [`references/failure-matrix.md`](references/failure-matrix.md) | 25 个失败枚举、7z 输出分类、12 道删除检查 |
+| [`references/failure-matrix.md`](references/failure-matrix.md) | 26 个失败枚举、7z 输出分类、12 道删除检查 |
 | [`references/magic-signatures.md`](references/magic-signatures.md) | 魔数表、头部伪装 / carve / 魔数修补判定标准 |
 | [`references/pitfalls.md`](references/pitfalls.md) | 26 条踩坑经验（动手前必读） |
 
