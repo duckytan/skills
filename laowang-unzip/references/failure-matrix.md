@@ -1,9 +1,9 @@
 # 异常处理矩阵（failure-matrix）
 
-> 供 `pipeline/core/sz.py::classify_extract_fail()` 与 `pipeline/sched/*` 实现用。
+> 供 `scripts/pipeline_lib/sz.py::classify_extract_fail()` 与 `scripts/pipeline_lib/scheduler.py` 实现用。
 > 完整上下文见 `design-v2.1.md` §7。
 
-## 1. `fail_reason` 完整枚举（25 个，含 NONE）
+## 1. `fail_reason` 完整枚举（26 个，含 NONE；以 `config.py` 为唯一权威来源）
 
 | # | 枚举值 | 归类 | 含义 |
 |---|---|---|---|
@@ -32,6 +32,7 @@
 | 23 | `DELETE_FAILED` | 结果 | 解压成功但删源包失败 |
 | 24 | `IO_ERROR` | 环境 | 读文件失败 / 哈希算不出来（不阻断，`hash_mode=NONE` 继续解压） |
 | 25 | `UNCLASSIFIED` | — | 以上都不匹配，保留 `last_error` 原文等人工看 |
+| 26 | `UNSAFE_PATH` | 安全 | 解压产物路径逃逸提取根（zip-slip）；包判 FAILED 且**永不删源**（P1-1） |
 
 ## 2. 失败 → 判据 → 落库 → 动作（主表）
 
@@ -72,19 +73,19 @@
 
 ## 4. 删除源包的 12 条 check（逐条全过才删，缺一不可）
 
-> 实现：`pipeline/sched/scheduler.py::maybe_delete_source()`。任何一条不过 → 不删，按备注处置。
+> 实现：`scripts/pipeline_lib/scheduler.py::_maybe_delete_source()`。任何一条不过 → 不删，按备注处置。
 
 | # | check | 判据 | 不过时处置 |
 |---|---|---|---|
 | 1 | 7z 返回码 | `res.rc == 0` | 已在第 8 步进 `FAILED` |
-| 2 | 输出目录存在 | `os.path.isdir(out_dir)` | `fail_reason=OUTPUT_MISSING` |
+| 2 | 输出目录存在 | `os.path.isdir(out_dir)`（或子包已证内容被消费，LES-20260909-11①） | 不置枚举，仅记原因串 `check2: output dir missing`（见 scheduler.py:1063） |
 | 3 | 输出目录有实质内容 | `stat.non_archive_children >= 1` | 判「未彻底解开」，转去挖子包，**不删** |
 | 4 | 无 0 字节残根 | `stat.zero_byte_files == 0` | `fail_reason=OUTPUT_ZERO_ROOTS` |
 | 5 | 子包全终结 | `all(k.status in TERMINAL_STATES for k in children)` | 等子包。只靠 `on_terminal()` 回溯 / 收尾复判变绿（父包出队后主循环不再看它） |
-| 6 | 产物已全部入库 | 输出目录真枚举数 == 库里 `parent_id=fid` 行数 | 重新枚举补录，仍不一致则不删 |
+| 6 | 产物已全部入库 | 输出顶层逐项查库；未登记项自动补录为子包并跳过删除（**非计数相等判据**） | 补录后跳过删除，等子包消化 |
 | 7 | 数据库已落成功状态 | `status == COMPLETE` 且事务已提交 | 先提交事务再删 |
-| 8 | 非去重待定夺 | `status != DUPLICATE_PENDING` | **永不删** |
-| 9 | 非垃圾待定夺 | `status != JUNK_PENDING` | 等用户确认 |
+| 8 | 非去重待定夺 | `status != DUPLICATE_PENDING` | **永不删**；结构性由 check#7-9 的 `COMPLETE` 闸门保证（`_maybe_delete_source` 仅在转 COMPLETE 后调用） |
+| 9 | 非垃圾待定夺 | `status != JUNK_PENDING` | 等用户确认；同上结构性保证 |
 | 10 | carved 包有效 | `7z l <carved>` 返回 `VALID` | `ENCRYPTED`/`INVALID` 时源包与 carved 包都保留 |
 | 11 | 路径不在保护白名单 | 不在 `PROTECTED_PREFIXES` 内 | 拒绝并记 `events.level=ERROR` |
 | 12 | **无 FAILED 子包** | `children 中 status=FAILED 数量 == 0` | 父包**仍转 COMPLETE** 但**跳过删除**；报告「待手动清理」单列，注明「存在失败子包，保留源包以备重试」 |

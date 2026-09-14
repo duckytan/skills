@@ -1118,9 +1118,6 @@ class Pipeline:
         # Volume sets are deleted as a whole group or not at all (§4.1).
         paths = [row["path"]]
         rows = [row]
-        if row["volume_group"] and row["volume_role"] == "FIRST":
-            for k in db.children_of(fid) + db.all_with_status(C.STATUS_SKIPPED):
-                pass  # children_of used for lineage; volumes found via group:
         if row["volume_group"]:
             cur = db.conn.execute(
                 "SELECT * FROM files WHERE volume_group=? AND source_deleted=0"
