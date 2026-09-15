@@ -70,6 +70,7 @@ ACTION_COLLECT = "COLLECT"             # 成品归集 move/copy of a leaf conten
 # v3.6.0 Part A: a winning password was recorded into the self-learning library.
 # Doubles as the idempotency credential (one PW_LEARNED event per file_id).
 ACTION_PW_LEARNED = "PW_LEARNED"
+ACTION_PRUNE = "PRUNE"                 # v3.7.0: empty-directory removal (§6.6)
 
 # ---------------------------------------------------------------------------
 # fail_reason enum (§7.1, 25 values)
@@ -208,6 +209,41 @@ CONTENT_KEYWORDS = ["加微信", "加qq", "扫码", "资源尽在", "解压密�
 # A file/dir whose name mentions a password is precious, never junk (§6.2).
 PASSWORD_HINT_WORDS = ["解压码", "密码", "提取码", "解压密码"]
 PASSWORD_FILE_BASENAME = "password.txt"
+
+# Advertisement *directory* keywords (§6.1 rule 8).
+# v3.7.0: moved here from a hard-coded tuple inside junk.py so that users can
+# extend the list without touching code.  Edit freely — matching is on the
+# normalized (full-width -> half-width, lower-cased) directory path.
+AD_DIR_KEYWORDS = ["广告", "推广", "加群"]
+
+# ---------------------------------------------------------------------------
+# Junk library — self-learning layer (§6.5, v3.7.0)
+# ---------------------------------------------------------------------------
+# A small on-disk ledger of junk files the USER has explicitly confirmed.
+# Hard rule: nothing enters this ledger automatically.  The rule table in
+# junk.py only ever *proposes*; only an explicit user confirmation (or an
+# explicit `junk-learn` command) may write an entry.  Rationale: a wrong
+# password costs one retry, a wrong junk entry deletes real data silently.
+JUNK_HASH_MAX_BYTES = 1024 * 1024      # above this we do not fingerprint
+JUNK_RULE_LIBRARY_PREFIX = "LIBRARY:"  # junk_rule value: LIBRARY:<KIND>
+JUNK_LIBRARY_KINDS = ("hash", "name", "namepart")
+# Minimum length of a name fragment.  Deliberately 2 and NOT 3: the whole
+# point of fragments is to catch the two-character ad vocabulary (广告 / 推广 /
+# 加群 / 最新 / 扫码); a 3-char floor would reject exactly those words.  The
+# floor only exists to stop a single character ("a", "的") from becoming a
+# blanket rule — and fragments can only be added by hand anyway.
+JUNK_NAMEPART_MIN_CHARS = 2
+
+# ---------------------------------------------------------------------------
+# Empty-directory pruning (§6.6, v3.7.0)
+# ---------------------------------------------------------------------------
+# After junk/archive deletions a directory can be left as an empty shell
+# (typ. an ad folder whose only content was removed).  v3.7.0 removes such
+# shells bottom-up — but ONLY directories that are already empty, never the
+# processing root itself, never a path under PROTECTED_PRUNE_PREFIXES and
+# never a directory whose name looks like a password carrier.
+EMPTY_DIR_PRUNE_ON_FINISH = True
+PROTECTED_PRUNE_PREFIXES = (PIPELINE_DIRNAME,)
 
 # ---------------------------------------------------------------------------
 # Misc

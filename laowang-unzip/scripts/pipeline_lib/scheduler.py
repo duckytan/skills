@@ -30,6 +30,7 @@ from . import fsutil
 from . import hasher
 from . import header
 from . import junk as junk_mod
+from . import junklib as junklib_mod
 from . import passwords as pw_mod
 from . import pwstats
 from . import recycle as recycle_mod
@@ -137,6 +138,10 @@ class Pipeline:
         self.unsafe_paths: List[str] = []   # P1-1 zip-slip escapes (this batch)
         self.sweep_round = 0         # convergence sweep counter (P0-1: always exists)
         self.lock_held = False
+        # -- v3.7.0: junk library + empty-dir pruning ----------------------
+        self.library_hits: List[dict] = []     # LIBRARY:* hits this batch (report)
+        self.prune_candidates: set = set()     # dirs we may have emptied
+        self.prune_removed: List[str] = []     # empty dirs removed at batch end
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -323,6 +328,9 @@ class Pipeline:
                 deferred_fresh += 1
         self.deferred_fresh = deferred_fresh
 
+        # -- 4c. §6.6 (v3.7.0): remove the empty shells this batch left behind
+        self.prune_removed = self._prune_empty_dirs()
+
         # -- 5. report ---------------------------------------------------------
         from .report import generate_report
         report_path = generate_report(self)
@@ -343,6 +351,8 @@ class Pipeline:
             "recycle_freed_end": freed_end,
             "deferred_fresh": deferred_fresh,
             "db_path": cfg.db_path,
+            "library_hits": len(self.library_hits),
+            "pruned_dirs": len(self.prune_removed),
         }
 
     # ------------------------------------------------------------------
@@ -912,10 +922,21 @@ class Pipeline:
             pass
         rule = junk_mod.match(row["path"], info.real_type, row["size_bytes"],
                               content_head)
+        if not rule:
+            # §6.5 (v3.7.0): the rule table missed — consult the
+            # user-confirmed junk library (content fingerprint -> name ->
+            # name fragment).  The library can only ever contain entries the
+            # user confirmed in person, so a hit counts as zero-risk.
+            hit = junklib_mod.lookup_file(row["path"], size=row["size_bytes"])
+            if hit:
+                rule = hit["rule"]
+                self.library_hits.append({
+                    "path": row["path"], "kind": hit["kind"],
+                    "value": hit["value"], "count": hit["count"]})
         if rule:
             db.update_fields(fid, is_junk=1, junk_rule=rule)
             db.bump_batch(cfg.batch, "n_junk")
-            if rule in C.JUNK_AUTO_RULES and not cfg.ask_all and \
+            if junk_mod.is_auto_rule(rule) and not cfg.ask_all and \
                     self._delete_allowed(row["path"]):
                 if cfg.dry_run:
                     db.transition(fid, C.STATUS_JUNK_PENDING, C.ACTION_ANALYZE,
@@ -923,6 +944,8 @@ class Pipeline:
                     return
                 ok, rc = fsutil.delete_file(row["path"])
                 if ok:
+                    # §6.6: this directory may now be an empty shell.
+                    self.prune_candidates.add(os.path.dirname(row["path"]))
                     # Audit parity with _delete_one (P2-1): record which
                     # route the deletion actually took.
                     if fsutil.last_delete_mode != "RECYCLE":
@@ -1601,6 +1624,8 @@ class Pipeline:
         gone = not fsutil.exists(path)
         self.probe_done = True
         if ok and gone:
+            # §6.6 (v3.7.0): the parent may have just become an empty shell.
+            self.prune_candidates.add(os.path.dirname(path))
             if fsutil.last_delete_mode != "RECYCLE":
                 # P1-2/P2 audit: the recycle route did not take it (fallback
                 # permanent delete, or an external hook moved it) — record
@@ -1695,6 +1720,44 @@ class Pipeline:
     # ------------------------------------------------------------------
     # Recycle purge (§4.3 / §11: only OUR entries, ever)
     # ------------------------------------------------------------------
+    def _prune_empty_dirs(self) -> List[str]:
+        """§6.6 (v3.7.0): remove the empty shells THIS batch left behind.
+
+        Only directories reachable upward from a path we just deleted are
+        considered (``prune_candidates``) — pre-existing empty structure in
+        the user's tree is never touched by the automatic path.  A dry run or
+        ``EMPTY_DIR_PRUNE_ON_FINISH=False`` disables it entirely.
+
+        Every removal is audited (``ACTION_PRUNE``); a directory is only ever
+        removed when it is genuinely empty, and never the processing root
+        itself, the pipeline directory, or anything looking like a password
+        carrier.
+        """
+        cfg, db = self.cfg, self.db
+        if cfg.dry_run or not C.EMPTY_DIR_PRUNE_ON_FINISH:
+            return []
+        if not self.prune_candidates:
+            return []
+        protected = [os.path.join(cfg.src_dir, p)
+                     for p in C.PROTECTED_PRUNE_PREFIXES]
+        protected.append(cfg.pipeline_dir)
+        try:
+            removed, failed = fsutil.prune_empty_dirs(
+                cfg.src_dir, protected=protected,
+                candidates=sorted(self.prune_candidates))
+        except Exception as exc:  # noqa: BLE001 — never break a finished batch
+            db.event(None, C.ACTION_PRUNE, "prune skipped: %r" % exc,
+                     level="WARN", batch=cfg.batch)
+            return []
+        for d in removed:
+            db.event(None, C.ACTION_PRUNE, "empty dir removed: %s" % d,
+                     batch=cfg.batch)
+        for d, rc in failed:
+            db.event(None, C.ACTION_PRUNE,
+                     "empty dir kept (rc=%s): %s" % (rc, d), level="WARN",
+                     batch=cfg.batch)
+        return list(removed)
+
     def _purge_recycle(self, phase: str) -> int:
         if not self.cfg.purge_recycle or self.cfg.dry_run:
             return 0

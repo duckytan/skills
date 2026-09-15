@@ -163,3 +163,11 @@
 - 关联：LES-20260915-06；SKILL.md §3.2；来源：QA 第 2 轮回归独立复核发现
 - 指纹：d1收尾时把条目标成p0而按skillmd32定义p0丢数据整批失败其真实后果只读命令多出2个影子文件主库md5未变应为p1标p0使其立即命中提升判据p0或oc
 - 复现：1 次
+
+### [LES-20260915-08] bug P1 open
+- 现象：为 §6.6 新写的空目录清理，其安全论证是「`os.rmdir` 拒绝非空目录，所以删不掉东西」。探针实测该论证在本开发沙箱**不成立**：对非空目录 `os.rmdir` 返回成功（`None`）并把 `sub/a.txt` 一并删掉；改用 Win32 `RemoveDirectoryW` 同样返回成功，把 `sub/deep/b.txt` 整棵子树删掉（`GetLastError` 非标准码 14007）。若照原论证交付，一旦判空误判为「空」（本沙箱有「Python 枚举幻影」前科，见 pitfalls #36），就会静默递归删掉真实内容且返回值显示成功——错误不可观测。
+- 根因：把「环境/OS 会拦住危险操作」当成安全属性，未区分「生产语义」与「本沙箱被 safe-delete 层改写后的语义」；钩子把失败伪造成成功，使错误无法被调用方观测。
+- 处置：把判空提升为**唯一**防线并用钩子不可达的 API 加固——新增 `fsutil._dir_is_empty_win32`（ctypes `FindFirstFileW`，pattern `*` 不返回 `.`/`..`，直连 kernel32）+ `dir_is_empty` 双通道 fail-closed（Win32 与 `os.scandir` 任一认为非空即不删）+ `remove_empty_dir` 弃用 `os.rmdir` 改 `RemoveDirectoryW`，docstring 明确「不继承 OS 的拒绝语义」。回归 `tests/test_prune_empty.py` 41 例，含 `test_never_removes_ancestors_of_content`（深层内容保护整条祖先链）。
+- 关联：pitfalls #49；fsutil.py §6.6；SKILL.md §6.6；LES-20260915-01（本机删除语义与生产不同）
+- 指纹：目录删除在本沙箱是递归的osrmdir与RemoveDirectoryW对非空目录也返回成功
+- 复现：1 次
