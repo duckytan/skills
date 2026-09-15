@@ -688,7 +688,7 @@ def enqueue(cid, path, queue, seen):
 | `EXTRACTING` | **回退为 `EXTRACTED` 的处理前状态**：先检查输出目录——若 `non_archive_children > 0` 且无 0 字节残根，视为解压已完成 → 直接进 `EXTRACTED`；否则回退 `QUEUED` 重解 | 崩溃点可能在解压前/中/后，用磁盘事实校正 |
 | `PASSWORD_TESTING` / `ANALYZING` / `HASHING` | 回退到 `QUEUED` / `DISCOVERED` | 这三个动作都幂等，重做无副作用 |
 | `EXTRACTED`（非终结） | 重新扫描输出目录，更新 `extracted_files` / `non_archive_children`，继续挖子包；**并对本批所有 `EXTRACTED` 记录跑一次全量复判（同 §3.3 收尾）** | 子包可能没处理完；崩溃前可能刚好漏了回溯（修订 C2） |
-| `COMPLETE` / `FAILED` / `SKIPPED` / `DELETED` / `LOST` | **不动**（除非用户显式 `--retry-failed`） | 终结态 |
+| `COMPLETE` / `FAILED` / `SKIPPED` / `DELETED` / `LOST` | **不动**（除非用户显式 `--retry-failed`）。**例外**：启动时 reconcile（④ `_reconcile_disk_db`）会对**仍留在盘上**的行重跑完整 12 条删除检查——凡 `source_deleted=0` 的 `DELETED` 行（任何 origin），以及 `COMPLETE` 且为压缩包（`is_archive=1`，任何 origin）的行；`COMPLETE` 是终态、主循环永不回访，若无此兜底则 carved/已解出容器会永久搁浅（§fix⑨） | 终结态 |
 | `DUPLICATE_PENDING` / `JUNK_PENDING` | **不动**，等用户定夺 | 用户硬要求 5 |
 | 库里有、磁盘上没有了 | 置 `LOST`，记一条 WARN | 可能被外部删了 |
 
