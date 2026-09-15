@@ -165,5 +165,96 @@ class KeywordHintTests(unittest.TestCase):
         self.assertIn(("abc.def", "FILE_NAME"), cands)
 
 
+class TxtMinedPasswordTests(unittest.TestCase):
+    """§fix⑥ 最后兜底：从已解压出来的 .txt 文档里挖密码。
+
+    两类高信号候选：
+      (1) 文件名本身就是密码提示（密码/解压码/…）→ 取其修剪后的首行
+      (2) 任意内容行带提示词（解压密码：abc123）→ 取其后代码
+    仅扫描已落盘的 .txt 文件；非 .txt 忽略；错误命中无害（7z t 会失败）。
+    """
+
+    def _write(self, d, name, content):
+        p = os.path.join(d, name)
+        with open(p, "w", encoding="utf-8") as fh:
+            fh.write(content)
+        return p
+
+    def test_name_is_pw_first_line(self):
+        # 密码.txt 唯一一行就是密码 → 取首行
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            self._write(td, "密码.txt", "abc123\n")
+            got = pw.mine_txt_passwords([td])
+        self.assertEqual(got, [("abc123", "TXT_MINED")])
+
+    def test_content_line_hint(self):
+        # note.txt 内容里一行带提示词 → 取其后代码
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            self._write(td, "readme.txt", "这是一些说明\n解压密码：xyz789\n完毕\n")
+            got = pw.mine_txt_passwords([td])
+        self.assertEqual(got, [("xyz789", "TXT_MINED")])
+
+    def test_recursive_subdir(self):
+        # 子目录里的 .txt 也要能扫到
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            sub = os.path.join(td, "out", "deep")
+            os.makedirs(sub)
+            self._write(sub, "提取码.txt", "kLm42\n")
+            got = pw.mine_txt_passwords([td])
+        self.assertEqual(got, [("kLm42", "TXT_MINED")])
+
+    def test_only_txt_scanned(self):
+        # 非 .txt 文件（.md）即使内容含密码提示也不应被扫描
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            self._write(td, "hint.md", "解压密码：nope123\n")
+            self._write(td, "密码.txt", "realpw\n")
+            got = pw.mine_txt_passwords([td])
+        self.assertEqual(got, [("realpw", "TXT_MINED")])
+
+    def test_non_existent_root_safe(self):
+        # 不存在的 root 不报错、返回空
+        got = pw.mine_txt_passwords(["C:\\nonexistent\\__no_such_dir__"])
+        self.assertEqual(got, [])
+
+    def test_dedup_across_files(self):
+        # 两个 .txt 给出相同密码 → 只保留一条（TXT_MINED）
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            self._write(td, "密码.txt", "dup123\n")
+            self._write(td, "readme.txt", "解压密码：dup123\n")
+            got = pw.mine_txt_passwords([td])
+        self.assertEqual(got, [("dup123", "TXT_MINED")])
+
+    def test_min_length_enforced(self):
+        # 提示词后代码 < 3 字符 → 丢弃（与 candidates_for 一致的长度下限）
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            self._write(td, "note.txt", "解压密码：ab\n")  # "ab" 太短
+            self._write(td, "密码.txt", "ok456\n")
+            got = pw.mine_txt_passwords([td])
+        self.assertEqual(got, [("ok456", "TXT_MINED")])
+
+    def test_strips_swallowed_extension(self):
+        # 文件名扩展名被 RE_PW_HINT 吞进候选时，应剥掉（维生素.rar -> 维生素）
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            self._write(td, "note.txt", "解压码：维生素.rar\n")
+            got = pw.mine_txt_passwords([td])
+        self.assertEqual(got, [("维生素", "TXT_MINED")])
+
+    def test_mine_one_txt_unit(self):
+        # 直接单文件单测：文件名提示 + 内容提示 两类都命中
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            p = self._write(td, "密码.txt", "firstpw\n解压口令：second99\n")
+            cands = pw._mine_one_txt(p, 65536)
+        self.assertIn("firstpw", cands)
+        self.assertIn("second99", cands)
+
+
 if __name__ == "__main__":
     unittest.main()

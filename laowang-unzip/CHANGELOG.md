@@ -1,5 +1,27 @@
 # Changelog
 
+## v3.4.0 (2026-09-15) — 最后兜底密码来源：从已解压出来的 .txt 文档里挖密码（§fix⑥）
+
+**新规则：标准来源全失败后，从已解压的 .txt 文档里找密码（用户规则）**
+- 用户原话：「如果都找不到密码的，可以尝试从解压出来的 txt 文档里找一下」。
+- 新增第 5 顺位密码来源 `TXT_MINED`，**严格最后兜底**：只有当 `candidates_for` 的
+  1–4 顺位（`NONE` / `INHERITED` / `TRAIL_BRACKET`+`DIR_NAME` / `FILE_NAME` / `LIBRARY`）
+  全部试完且未命中（`hit is None`）时才启动，不改变原有优先级与命中即停语义。
+- 两类高信号候选（`passwords.mine_txt_passwords`）：
+  1. **文件名本身就是密码提示**（密码 / 解压码 / 提取码 / 解压密码 / 口令 / 解压口令）→
+     取该文件**修剪后的首个非空行**（例 `密码.txt` 只有一行 `abc123` → `abc123`）；
+  2. **任意内容行带提示词** → 取其后代码，复用既有 `RE_PW_HINT`
+     （例 `解压密码：abc123` → `abc123`，并同样经 `_HINT_TRAIL_EXT` 剥掉被吞的扩展名）。
+- 扫描范围 `_txt_mine_roots`（廉价优先、有界）：
+  父包 `extract_output_dir`（`密码.txt` 通常落这儿）→ 本包自身目录 → 整棵源目录兜底；
+  `mine_txt_passwords` 用 `max_files=500` / `max_bytes=65536` 双上限卡住开销，重叠根靠去重集兜底。
+- 仅读**已落盘**文件——待解密的包此刻还读不了，所以这是真兜底，不会形成"要密码才能读出密码"的死循环。
+- 误命中无害：`sz.test_passwords` 只是试一下，失败即跳过；真命中则写入 `self.library`，
+  同批次兄弟/同源包立即可复用。
+- 新增 `scripts/tests/test_passwords.py::TxtMinedPasswordTests`（10 用例：名字即密码取首行 /
+  内容行提示 / 递归子目录 / 非 .txt 不扫 / 不存在的根不炸 / 跨文件去重 / 长度下限 /
+  扩展名剥离 / `_mine_one_txt` 单测）。全量 `python -m unittest discover` **96/96 OK**。
+
 ## v3.3.0 (2026-09-15) — 优化：carved/repair 产物随源删除 + dry-run 非破坏 + 残余盘点
 
 **§fix① carved/repair 产物随源一起删（根治 ~7.4GB 残留）**

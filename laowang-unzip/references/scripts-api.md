@@ -293,9 +293,20 @@ def candidates_for(row, parent_row, library: list[str]) -> list[tuple]:
     """完整候选序列（去重保序），与 SKILL.md §5 同口径：
     ① ("", "NONE") 空密码快速路径（stdin=DEVNULL 下安全，不挂死）
     ② 父包命中密码（INHERITED）
-    ③ 文件名抠码（FILE_NAME）→ ④ 目录名抠码（DIR_NAME）
-    ⑤ 密码库全部条目（LIBRARY，合并顺序见 load_library）。
-    命中即停；命中密码明文落库（password + password_source）。"""
+    ③ 文件名/父目录名末尾配对括号（TRAIL_BRACKET / DIR_NAME）
+    ④ 文件名抠码（FILE_NAME）→ ⑤ 目录名抠码（DIR_NAME）
+    ⑥ 密码库全部条目（LIBRARY，合并顺序见 load_library）。
+    命中即停；命中密码明文落库（password + password_source）。
+    注：以上全部未命中时，调度层再追加第 7 顺位 TXT_MINED（见 mine_txt_passwords）。"""
+
+def mine_txt_passwords(roots, max_files: int = 500,
+                       max_bytes: int = 65536) -> list[tuple]:
+    """§fix⑥ 最后兜底来源 TXT_MINED：从**已解压出来的** .txt 文档里挖密码。
+    仅当 candidates_for 全部未命中时由 scheduler 调用（不改变原优先级）。
+    两类候选：①文件名含 密码/解压码/提取码/解压密码/口令/解压口令 → 取修剪后
+    首个非空行；②任意内容行经 RE_PW_HINT 取值（同样剥掉被吞的扩展名）。
+    只读已落盘的 .txt（待解密包此刻读不了，是真兜底）；max_files/max_bytes 双上限
+    卡住开销；返回 [(pwd, "TXT_MINED")]，跨文件按密码值去重。误命中无害。"""
 ```
 
 ## 9. pipeline_lib/sz.py —— 7z 封装（design §3.6 / §7.3）

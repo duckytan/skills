@@ -10,6 +10,10 @@ Candidate order (cheap & specific first):
    (v1 pitfall 13: full-width brackets!)
 4. ``LIBRARY``         — the bundled passwords.txt + the user's own
                           ``<workdir>/password.txt`` if present
+5. ``TXT_MINED``       — LAST RESORT (§fix⑥): when 1-4 all fail, mine
+                          already-extracted ``.txt`` docs (a 密码.txt that came
+                          out of a friend/parent archive, or any line carrying a
+                          密码/解压码/提取码/口令 hint).  See ``mine_txt_passwords``.
 
    A bracket pair at the very end of the filename (immediately before the
    extension) is treated as the password with its own ``TRAIL_BRACKET`` source,
@@ -27,6 +31,7 @@ import re
 from typing import List, Optional
 
 from . import config as C
+from . import fsutil
 
 # P0-2 (SKILL.md §5): brackets may wrap ANY code — Chinese, symbols, spaces —
 # so the only excluded characters are the bracket characters themselves.
@@ -220,4 +225,106 @@ def candidates_for(row, parent_row, library: List[str]) -> List[tuple]:
 
     for pwd in library:
         add(pwd, "LIBRARY")
+    return cands
+
+
+# ---------------------------------------------------------------------------
+# §fix⑥: last-resort password mining from ALREADY-EXTRACTED txt docs
+# ---------------------------------------------------------------------------
+# Hint keywords that mark a txt file/line as carrying the password.  Same set
+# as RE_PW_HINT (minus the regex boilerplate) — used to recognise a file whose
+# NAME itself is the password hint (e.g. 密码.txt).
+_PW_HINT_KEYWORDS = ("密码", "解压码", "提取码", "解压密码", "口令", "解压口令")
+
+
+def mine_txt_passwords(roots, max_files: int = 500,
+                       max_bytes: int = 65536) -> List[tuple]:
+    """§fix⑥ LAST-RESORT password source: mine ALREADY-EXTRACTED ``.txt`` docs.
+
+    Scans ``roots`` (recursively, bounded) for ``.txt`` files and extracts two
+    high-signal candidate classes, tagged ``TXT_MINED``:
+
+    1. A txt whose NAME itself is a password hint (密码/解压码/提取码/解压密码/
+       口令/解压口令) -> its trimmed first non-empty line is the candidate
+       (e.g. ``密码.txt`` whose only line is ``abc123`` -> ``abc123``).
+    2. Any content line carrying a hint keyword -> the code after it
+       (reuses ``RE_PW_HINT``, so ``解压密码：abc123`` yields ``abc123``).
+
+    Only plain files already on disk are read.  The locked archive we are
+    trying to open is NOT readable yet, so this is a true fallback — never a
+    chicken-and-egg loop.  False hits are harmless: ``sz.test_passwords`` simply
+    fails them and moves on.  Cost is bounded by ``max_files`` / ``max_bytes``.
+    """
+    out: List[tuple] = []
+    seen = set()
+    count = 0
+    for root in roots:
+        if not fsutil.isdir(root):
+            continue
+        for f in _iter_txt(root, max_files):
+            count += 1
+            for pwd in _mine_one_txt(f, max_bytes):
+                if pwd not in seen:
+                    seen.add(pwd)
+                    out.append((pwd, "TXT_MINED"))
+            if count >= max_files:
+                break
+        if count >= max_files:
+            break
+    return out
+
+
+def _iter_txt(root: str, max_files: int):
+    """Yield up to ``max_files`` ``.txt`` paths under ``root`` (bounded DFS).
+
+    ``os.scandir`` returns plain (non-extended) paths; callers that need
+    long-path-safe IO should wrap with ``fsutil.to_extended`` themselves.
+    """
+    stack = [root]
+    visited = set()
+    n = 0
+    while stack:
+        d = stack.pop()
+        if d in visited:
+            continue
+        visited.add(d)
+        try:
+            with os.scandir(d) as it:
+                for e in it:
+                    if e.is_dir():
+                        stack.append(e.path)
+                    elif e.name.lower().endswith(".txt"):
+                        yield e.path
+                        n += 1
+                        if n >= max_files:
+                            return
+        except OSError:
+            continue
+
+
+def _mine_one_txt(path: str, max_bytes: int) -> List[str]:
+    """Extract candidate passwords from one txt file (see mine_txt_passwords)."""
+    fname = os.path.basename(path)
+    name_is_pw = any(k in fname for k in _PW_HINT_KEYWORDS)
+    try:
+        with open(fsutil.to_extended(path), "r", encoding="utf-8-sig",
+                  errors="ignore") as fh:
+            text = fh.read(max_bytes)
+    except OSError:
+        return []
+    cands: List[str] = []
+    if name_is_pw:
+        # The whole trimmed first non-empty line is the candidate.
+        for line in text.splitlines():
+            line = line.strip()
+            if line:
+                code = _HINT_TRAIL_EXT.sub("", line)
+                if 3 <= len(code) <= 128:
+                    cands.append(code)
+                break
+    for m in RE_PW_HINT.finditer(text):
+        code = re.split(r"[()（）]", m.group(1))[0].strip(_STRIP_EDGE)
+        code = _HINT_TRAIL_EXT.sub("", code)
+        if 3 <= len(code) <= 128 and code not in cands:
+            cands.append(code)
     return cands

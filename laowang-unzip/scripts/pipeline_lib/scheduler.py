@@ -572,6 +572,22 @@ class Pipeline:
         parent = db.get(row["parent_id"]) if row["parent_id"] else None
         candidates = pw_mod.candidates_for(row, parent, self.library)
         hit, last_res = self.sz.test_passwords(row["path"], candidates)
+        if hit is None:
+            # §fix⑥ last-resort: mine passwords from ALREADY-EXTRACTED txt docs
+            # (e.g. a 密码.txt that came out of a friend/parent archive).  Only
+            # tried when standard sources 1-4 all failed — matches the user rule
+            # "都找不到密码的，再从解压出来的txt里找一下".
+            mined = pw_mod.mine_txt_passwords(self._txt_mine_roots(row, parent))
+            if mined:
+                db.event(fid, C.ACTION_PW_TEST,
+                         "no std password; trying %d txt-mined candidate(s)"
+                         % len(mined), batch=cfg.batch)
+                hit2, last_res = self.sz.test_passwords(row["path"], mined)
+                if hit2 is not None:
+                    hit = hit2
+                    # remember for sibling/friend archives in this batch
+                    if hit[0] and hit[0] not in self.library:
+                        self.library.append(hit[0])
         non_empty_tried = any(pw for pw, _ in candidates)
         if hit is None:
             # Distinguish "no password worked" from "the archive is broken":
@@ -858,6 +874,35 @@ class Pipeline:
                           fail_reason=C.FAIL_NOT_ARCHIVE if reason == C.FAIL_NOT_ARCHIVE
                           else reason)
         self._on_terminal(fid)
+
+    # ------------------------------------------------------------------
+    def _txt_mine_roots(self, row, parent_row):
+        """§fix⑥ last-resort password mining roots.
+
+        Where to look for an ALREADY-EXTRACTED .txt doc that carries the
+        password (e.g. a 密码.txt that fell out of a friend/parent archive,
+        or a note.txt beside the archive).  Cheapest-first, bounded:
+
+          * parent_row.extract_output_dir — where a sibling archive's
+            密码.txt usually lands (most targeted);
+          * row["dir_path"] — this archive's own folder;
+          * cfg.src_dir — the whole source tree (catch-all; mine_txt_passwords
+            caps total files scanned, so this stays cheap).
+
+        Returns existing dirs only; overlap between roots is tolerated by the
+        miner's dedup set.
+        """
+        roots = []
+        ext_dir = parent_row.get("extract_output_dir") if parent_row else None
+        if ext_dir and fsutil.isdir(ext_dir):
+            roots.append(ext_dir)
+        own = row["dir_path"]
+        if own and fsutil.isdir(own):
+            roots.append(own)
+        src = self.cfg.src_dir
+        if src and fsutil.isdir(src):
+            roots.append(src)
+        return roots
 
     # ------------------------------------------------------------------
     def _dry_run_scan(self, fid: int, row) -> None:
