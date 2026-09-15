@@ -345,3 +345,29 @@ NONE），把良性计数一并落稿。
 回归：`tests/test_evolve.py`（FailReasonClassifyTests / DraftGuardTests /
 MineThreeWayTests / EvolveApplyBenignSkipTests，~22 例）。
 关联：evolve.py §classify_fail_reason；SKILL.md §3.2；LES-20260915-09；CHANGELOG v3.7.1。
+
+**#51. 分卷成员的伪装 mp4 被当独立 7z 处理：卷组未聚合 → 误报 ARCHIVE_CORRUPT（v3.7.2）**
+现象：批 2026-09-15 里 `【done】\2026-09-15\18xx\风景01.mp4` 共 6 份（不同编号目录各一份）
+FAILED 为 ARCHIVE_CORRUPT，但 `extract_rc=None`、`last_error=None`——**解压根本没跑**。
+实锤：real_type=7Z、declared_ext=.mp4、体积清一色整 MB（314572800=300MB / 20971520=20MB /
+157286400=150MB），同目录还各有 `风景02.mp4`（real_type=UNKNOWN）成对出现。
+根因：整 MB 尺寸 + 同名成批 + 成对出现是**分卷成员**的典型指纹；这些伪装 mp4 的 7z 分卷
+被逐个当独立包处理，`volume_group` 没有把「同名（或同前缀成对）、real_type=7Z、整 MB 体积、
+extract 前就 FAILED」的成员聚合，导致每个成员单独判失败。
+教训：**解压前就 FAILED 且 rc=None 的 ARCHIVE_CORRUPT 是误报信号**——真损坏至少跑过 7z
+（rc≠0）。遇到它先查 volume_group / 同名兄弟文件，别直接信 fail_reason。
+处置：v3.7.2 修复卷组聚合 + 新增 VOLUME_INCOMPLETE 形态（分卷不全 ≠ corrupt）。
+关联：LES-20260915-11；scheduler.py volume_group；LES-20260910-01（分卷残骸处置边界）。
+
+**#52. 无扩展名包的输出目录默认取「文件名同名目录」，与源文件本身路径冲突（v3.7.2）**
+现象：批 2026-09-15 两个无扩展名裸 7z 包（`6713777888999` 1.1GB / `6717777888999` 3.7GB）
+密码已命中（LIBRARY `上老王论坛当老王`），7z 退出码 2 报
+`Cannot create output directory : 当文件已存在时，无法创建该文件`，fail_reason 落 UNCLASSIFIED。
+根因：输出目录由「文件名去扩展名」派生——无扩展名文件去完还是原名，而默认输出位置是源文件
+父目录 → **输出目录路径 == 源文件路径**，7z 建目录必然失败。该错误形态不在 fail_reason
+已知映射里 → UNCLASSIFIED。
+教训：**凡是「从文件名派生路径」的逻辑，都必须对「无扩展名」这一退化情形单独设防**——
+去扩展名是恒等变换时，派生结果会撞上源文件本身。
+处置：v3.7.2 修复：无扩展名（或派生目录 == 源路径）时输出目录加 `_ext` 后缀；
+7z `Cannot create output directory` 错误串映射进已知 fail_reason（OUTPUT_DIR_CONFLICT）。
+关联：LES-20260915-12；scheduler.py extract_output_dir 派生；evolve.py fail_reason 映射。

@@ -1,5 +1,46 @@
 # Changelog
 
+## v3.7.2 (2026-09-16) — LES-11 伪装分卷误报损坏 + LES-12 无扩展名输出目录撞源
+
+**背景**：批 2026-09-15 暴露两个真 bug（pitfalls #51 / #52）：6 组伪装 mp4 的
+split-7z 分卷被逐个判 ARCHIVE_CORRUPT（解压根本没跑），两个无扩展名裸 7z 包的
+派生输出目录与源文件路径重合导致 7z 落盘即败且 fail_reason 落 UNCLASSIFIED。
+
+### FIX1 — 伪装分卷组守卫（LES-11，scheduler.py + header.py）
+- `header.looks_like_split_first()`：机械判据**全部命中才算**——real_type=7Z、
+  声明扩展名非规范压缩包后缀、名字匹配裸编号词干 `RE_NUM_STEM`（`<base><N>`，
+  `volume_info` 为 NONE）、且 **7z 尾头截断**（`sevenz_header_intact` 为 False，
+  「分卷首卷」与「完整单文件」的唯一机械分界——完整单个 7z 伪装 mp4 的
+  carve/直解场景绝不误伤）。
+- `header.split_set_targets()`：同目录扫描同 base 的无头编号兄弟（有头 = 独立
+  压缩包绝不动），产出整组归一清单 `[(old, <base>.7z.NNN)]`；任一目标撞车
+  即整组放弃（**永不覆盖**，不做半套改名）。
+- `scheduler._handle_disguised_split_set()`：`_process_one` 里 ARCHIVE_CORRUPT
+  分类后挂守卫——判据命中且能整组归一 → 复用 ①② 改名 + DB 对账，整组改名后
+  重排队（retry_count 守卫）走卷组联解；首卷截断但无续卷兄弟/目标撞车 →
+  落新 fail_reason `VOLUME_INCOMPLETE`（分卷不全 ≠ corrupt，绝不伪造损坏）。
+- 可解性结论：生产 6 组（1878/1882/1883/1886/1887/1893）重跑（retry-failed）
+  即可自愈——守卫会把每组两个 mp4 归一为 `风景.7z.001/.002` 并联解；仅当某组
+  续卷丢失时才会诚实落 VOLUME_INCOMPLETE 供人工补卷。
+
+### FIX2 — 无扩展名包输出目录防撞（LES-12，scheduler.py + sz.py）
+- `scheduler._stem_of()`：源文件无扩展名（`splitext` 恒等变换）或派生输出目录
+  normcase 等于源文件路径时，输出目录追加 `_ext`（`6717777888999_ext`）。
+- `sz.classify_extract_fail()`：7z 文本 `Cannot create output directory` 映射为
+  新 fail_reason `OUTPUT_DIR_CONFLICT`——存量 FAILED 行 retry-failed 后语义正确，
+  不再落 UNCLASSIFIED。
+- `evolve.MINEABLE_FAIL_PATTERNS` 增补 `"CONFLICT"` / `"INCOMPLETE"`：两个新
+  fail_reason 都是真失败，必须能建教训。
+
+### 回归测试（tests/test_v372_fixes.py，18 例）
+- LES-12：7z 错误串映射、`_stem_of` 无扩展名 `_ext` / 正常名不变 / 卷组 base、
+  端到端（密码命中 → `_ext` 目录 → FAILED/OUTPUT_DIR_CONFLICT）。
+- LES-11：split-first 命中 / **完整单 7z 绝不误伤** / 规范卷名不参与 / 非 7z
+  magic 不参与、整组归一清单 / 无兄弟=不全 / 有头兄弟=独立包 / 目标撞车整组放弃、
+  调度端到端（整组改名重排 / 孤首卷 VOLUME_INCOMPLETE / 真损坏仍 ARCHIVE_CORRUPT）、
+  两个新 fail_reason 的 mineable 判定。
+- 全量 `python -m unittest discover -s tests`：362 例全绿。
+
 ## v3.7.1 (2026-09-16) — 自进化环三分类修复 + 调度器崩溃修复
 
 **背景**：批 2026-09-15 跑完后，自进化环把正常终态 NOT_ARCHIVE ×142 当真失败采集成
