@@ -120,6 +120,7 @@ class Pipeline:
         self.probe_done = False      # §4.1 minimal probe: first delete is verified
         self._deferred_recently = False  # a file bounced for fresh mtime
         self._deferred_ids: set = set()  # unique files deferred for fresh mtime
+        self.orphan_carved = []        # §fix②⑤: carved/repair leftovers after delete (report + invariant)
         self.delete_blocked = False  # probe failure stops ALL deletions this batch
         self.unsafe_paths: List[str] = []   # P1-1 zip-slip escapes (this batch)
         self.sweep_round = 0         # convergence sweep counter (P0-1: always exists)
@@ -223,6 +224,13 @@ class Pipeline:
         # -- 0. crash recovery: normalize states left by a killed process -----
         recovered = self._recover_states()
 
+        # -- 0b. DB↔disk reconciliation (④): do NOT trust stale COMPLETE /
+        #     DELETED flags.  A row whose source file is still physically on
+        #     disk is re-judged by the full 12-check delete path, so a dirty
+        #     "done" flag can never again short-circuit the deletion stage to
+        #     0 seconds and leave a deletable source (or its carved) behind.
+        self._reconcile_disk_db()
+
         # -- recycle purge on start (default on; only OUR entries) ------------
         freed_start = self._purge_recycle("start")
         self.recycle_freed_start = freed_start
@@ -271,6 +279,13 @@ class Pipeline:
 
         # -- 3. final full re-check of EXTRACTED rows (revision C2 bottom line) -
         self._final_recheck()
+
+        # -- 3b. §fix②⑤: surface carved/repair artifacts that outlived their
+        #     (deleted) parent source.  NEVER auto-deleted here — removal needs
+        #     explicit user authorization (three-expert verdict).  We only make
+        #     the omission visible (report section + terminal invariant WARN).
+        self.orphan_carved = self._scan_orphan_carved(cfg.src_dir)
+        self._assert_carved_invariant()
 
         # -- 4. recycle purge on finish ---------------------------------------
         freed_end = self._purge_recycle("finish")
@@ -372,6 +387,12 @@ class Pipeline:
         row = db.get(fid)
         if row is None:
             return
+        # §fix③: dry-run is SCAN-ONLY — never write disk (no extract / carve /
+        # rename / delete).  Return BEFORE any status transition so the row
+        # stays in an OPEN state and a later real run can reprocess it.
+        if cfg.dry_run:
+            self._dry_run_scan(fid, row)
+            return
         status = row["status"]
         if status not in C.OPEN_STATES and status != C.STATUS_EXTRACTED:
             return    # terminal / pending-user rows are never re-processed
@@ -454,6 +475,17 @@ class Pipeline:
         # (real case: 140889.part2.mp4 stuck 3 days).  Normalize our own
         # name first so the volume parsing below sees the true role.
         if info.is_archive:
+            if cfg.dry_run:
+                # ③ dry-run: skip the in-place volume-member rename (disk write);
+                # leave the row re-processable for the real run.
+                db.event(fid, C.ACTION_ANALYZE,
+                         "dry-run: volume-member rename skipped (no disk write)",
+                         batch=cfg.batch)
+                db.transition(fid, C.STATUS_QUEUED, C.ACTION_ANALYZE,
+                              "dry-run: queued for real run (vol rename skipped)",
+                              fail_reason=C.FAIL_NONE)
+                self.seen.add(row["path"])
+                return
             new_path = header.volume_member_rename(row["path"], info.real_type)
             if new_path and self._rename_volume_member(fid, row, new_path):
                 info = header.analyze(new_path)
@@ -486,6 +518,17 @@ class Pipeline:
 
         # -- 4a2. 「删」-suffixed archive: rename in place, requeue the fix -------
         if info.needs_rename:
+            if cfg.dry_run:
+                # ③ dry-run: skip the in-place rename (disk write); keep re-
+                # processable for the real run.
+                db.event(fid, C.ACTION_ANALYZE,
+                         "dry-run: rename repair skipped (no disk write)",
+                         batch=cfg.batch)
+                db.transition(fid, C.STATUS_QUEUED, C.ACTION_ANALYZE,
+                              "dry-run: queued for real run (rename skipped)",
+                              fail_reason=C.FAIL_NONE)
+                self.seen.add(row["path"])
+                return
             arts = header.repair_artifacts(row, info)
             if arts:
                 # The old path no longer exists; drop its hash so it cannot
@@ -571,6 +614,19 @@ class Pipeline:
 
         # -- 6. extraction (single-threaded, watchdogged) ------------------------
         out_dir = os.path.join(row["dir_path"], _stem_of(row, info))
+        if cfg.dry_run:
+            # ③ dry-run MUST NOT write to disk.  Analysis + password-test above
+            # already updated DB metadata; skip the real extraction and leave the
+            # row re-processable (QUEUED) so a real run does the work.  We do NOT
+            # transition past EXTRACTING — that would make a real run believe the
+            # archive is already done (the 0-second short-circuit bug).
+            db.event(fid, C.ACTION_EXTRACT,
+                     "dry-run: extraction skipped (no disk write)", batch=cfg.batch)
+            db.transition(fid, C.STATUS_QUEUED, C.ACTION_EXTRACT,
+                          "dry-run: queued for real run (extraction skipped)",
+                          extract_output_dir=out_dir)
+            self.seen.add(row["path"])
+            return
         db.transition(fid, C.STATUS_EXTRACTING, C.ACTION_EXTRACT,
                       "extracting to %s" % out_dir,
                       extract_output_dir=out_dir)
@@ -706,6 +762,18 @@ class Pipeline:
             self._on_terminal(fid)
             return
 
+        if cfg.dry_run:
+            # ③ dry-run: never carve/patch/rename/concat — those WRITE
+            # *_carved.* files to disk.  Leave the row analyzed & re-processable;
+            # the junk auto-delete branch below is already dry-run safe.
+            db.event(fid, C.ACTION_ANALYZE,
+                     "dry-run: repair/carve skipped (no disk write)",
+                     batch=cfg.batch)
+            db.transition(fid, C.STATUS_QUEUED, C.ACTION_ANALYZE,
+                          "dry-run: queued for real run (repair skipped)",
+                          fail_reason=C.FAIL_NONE)
+            self.seen.add(row["path"])
+            return
         # Try the four repair kinds (§3.3 step 8b: they live OUT of out_dir).
         # repair_artifacts internally decides carve/patch/rename/concat; an
         # empty result means "nothing to repair" -> junk / plain skip path.
@@ -790,6 +858,26 @@ class Pipeline:
                           fail_reason=C.FAIL_NOT_ARCHIVE if reason == C.FAIL_NOT_ARCHIVE
                           else reason)
         self._on_terminal(fid)
+
+    # ------------------------------------------------------------------
+    def _dry_run_scan(self, fid: int, row) -> None:
+        """§fix③: dry-run is SCAN-ONLY — never write disk, never transition.
+
+        Detects disguised archives via header.analyze and records what *would*
+        be carved/extracted, but performs NO extract / carve / rename / delete.
+        The row is left in an OPEN state so a later real run reprocesses it
+        identically — this closes the §fix③ leak where dry-run used to enter
+        the real delete path and silently removed source containers.
+        """
+        db, cfg = self.db, self.cfg
+        info = header.analyze(row["path"])
+        db.update_fields(fid, real_type=info.real_type,
+                         is_archive=1 if info.is_archive else 0)
+        note = "dry-run scan-only: real_type=%s is_archive=%s" % (
+            info.real_type, info.is_archive)
+        if info.sig_offset:
+            note += " sig_offset=%s (carve candidate)" % info.sig_offset
+        db.event(fid, C.ACTION_DISCOVER, note, level="INFO", batch=cfg.batch)
 
     # ------------------------------------------------------------------
     def _resume_extracted(self, row) -> None:
@@ -1037,6 +1125,163 @@ class Pipeline:
             self._on_terminal(fid)
 
     # ------------------------------------------------------------------
+    # Carved / repair-artifact deletion helpers (§4.1 ① + P0 误删闸门)
+    # ------------------------------------------------------------------
+    def _collect_deletable_tree(self, fid: int) -> Optional[List[str]]:
+        """① — gather REPAIR_ORIGINS descendant paths safe to delete with *fid*.
+
+        Returns ``None`` to signal the P0 误删闸门 trip: some carved package's
+        content subtree is NOT yet fully extracted AND registered, so the caller
+        must ABORT the entire deletion (keep source + carved, like check#12).
+        Returns a (possibly empty) list of paths otherwise; an empty list means
+        "no carved descendants" (the source deletes normally on its own).
+
+        Reuses ``db.children_of`` / ``_is_fully_done`` / ``fsutil.scan_output``
+        — never rewrites the existing delete logic.
+        """
+        db = self.db
+        carved_ids: List[int] = []
+        seen: set = set()
+        stack = [fid]
+        while stack:
+            cur = stack.pop()
+            if cur in seen:
+                continue
+            seen.add(cur)
+            for kid in db.children_of(cur):
+                if kid["origin"] in REPAIR_ORIGINS:
+                    carved_ids.append(kid["id"])
+                if kid["id"] not in seen:
+                    stack.append(kid["id"])
+        ready: List[str] = []
+        for cid in carved_ids:
+            if not self._carved_subtree_ready(cid):
+                return None                         # P0 gate: abort ALL deletion
+            crow = db.get(cid)
+            if crow is not None and crow["path"] not in ready:
+                ready.append(crow["path"])
+        return ready
+
+    def _carved_subtree_ready(self, cid: int) -> bool:
+        """P0 误删闸门: has carved package *cid*'s ENTIRE content subtree been
+        extracted AND registered in the DB?
+
+        A carved/patched/concatenated package is redundant ONLY once its real
+        content has been second-pass extracted and registered — otherwise
+        deleting it loses genuine content (本机删除永久不可回).  Uses the
+        existing ``_is_fully_done`` over its output dir PLUS a full-tree walk
+        that rejects any unresolved FAILED / ARCHIVE_CORRUPT descendant.
+        """
+        db = self.db
+        row = db.get(cid)
+        if row is None:
+            return False
+        out = row["extract_output_dir"]
+        stat = fsutil.scan_output(out) if (out and fsutil.isdir(out)) else None
+        if not self._is_fully_done(cid, stat):
+            return False
+        # Deepest check: every node in the carved subtree is terminal, and no
+        # descendant carries an unresolved FAILED / ARCHIVE_CORRUPT verdict.
+        stack = [cid]
+        seen: set = set()
+        while stack:
+            cur = stack.pop()
+            if cur in seen:
+                continue
+            seen.add(cur)
+            r = db.get(cur)
+            if r is not None:
+                if r["status"] == C.STATUS_FAILED:
+                    return False
+                if (r["fail_reason"] or C.FAIL_NONE) == C.FAIL_ARCHIVE_CORRUPT:
+                    return False           # corruption still pending -> not ready
+            for kid in db.children_of(cur):
+                if kid["id"] not in seen:
+                    stack.append(kid["id"])
+        return True
+
+    def _scan_orphan_carved(self, src_dir: str) -> List[str]:
+        """② residual scan (read-only): find repair-derived packages
+        (*_carved.* / *_patched.* / *.concat* / *_renamed.*) still on disk whose
+        parent source file is GONE from disk.  These are orphans left behind by a
+        previous run; we NEVER auto-delete them (deletion needs explicit user
+        authorization per the three-court verdict) — we only surface them in the
+        report for the user to confirm.
+        """
+        orphans: List[str] = []
+        tokens = ("_carved", "_patched", ".concat", "_renamed")
+        for f in fsutil.real_list_files(src_dir):
+            base = os.path.basename(f)
+            low = base.lower()
+            if not any(tk in low for tk in tokens):
+                continue
+            # Strip the repair token to recover the original source stem.
+            stem, _ext = os.path.splitext(base)
+            orig_stem = None
+            for tk in ("_carved", "_patched", "_renamed"):
+                if stem.endswith(tk):
+                    orig_stem = stem[: -len(tk)]
+                    break
+            if orig_stem is None:
+                # e.g. "<stem>.concat<ext>" -> remove the ".concat"
+                li = stem.lower().rfind(".concat")
+                if li >= 0:
+                    orig_stem = stem[:li]
+            if not orig_stem:
+                continue
+            # Source present iff some sibling in the same dir shares the stem.
+            d = os.path.dirname(f)
+            src_present = any(
+                os.path.splitext(os.path.basename(s))[0] == orig_stem
+                for s in fsutil.list_top_level(d))
+            if not src_present:
+                orphans.append(f)
+        return sorted(orphans)
+
+    def _assert_carved_invariant(self) -> None:
+        """⑤ terminal invariant (safety net for ①): every REPAIR_ORIGINS row
+        still on disk whose parent SOURCE was deleted MUST be flagged — it should
+        have been removed together with the source.  With ① in place this should
+        never fire; it only catches paths ① missed.
+        """
+        db, cfg = self.db, self.cfg
+        for row in db.conn.execute(
+                "SELECT * FROM files WHERE origin IN "
+                "('CARVED','MAGIC_PATCHED','CONCATENATED','RENAMED') "
+                "AND source_deleted=0").fetchall():
+            if not fsutil.exists(row["path"]):
+                continue
+            parent = db.get(row["parent_id"]) if row["parent_id"] else None
+            if parent is None:
+                continue
+            source_gone = (parent["source_deleted"] == 1) or \
+                not fsutil.exists(parent["path"])
+            if source_gone:
+                db.event(row["id"], C.ACTION_VERIFY,
+                         "终局不变量告警：父源已删但 carved 包仍残留于盘上"
+                         "（① 未覆盖到此路径，请人工核查）: %s" % row["path"],
+                         level="WARN", batch=cfg.batch)
+
+    def _reconcile_disk_db(self) -> None:
+        """④ DB↔disk reconciliation (start of run).
+
+        Rows marked COMPLETE/DELETED in the DB but still physically on disk are
+        NOT blindly trusted: re-run the full 12-check delete path.  In dry-run
+        ``_maybe_delete_source`` / ``_delete_one`` are no-ops, so this only
+        audits; in a real run it actually re-judges and deletes if warranted.
+        """
+        db, cfg = self.db, self.cfg
+        for row in db.conn.execute(
+                "SELECT * FROM files WHERE status IN ('COMPLETE','DELETED') "
+                "AND origin='DOWNLOAD' AND source_deleted=0").fetchall():
+            if not fsutil.exists(row["path"]):
+                continue
+            if row["status"] == C.STATUS_COMPLETE:
+                self._maybe_delete_source(row["id"])
+            elif row["status"] == C.STATUS_DELETED and self._delete_allowed(row["path"]):
+                self._delete_one(row["path"], row)
+
+    # ------------------------------------------------------------------
     def _maybe_delete_source(self, fid: int, row=None,
                              stat: Optional[fsutil.OutputStat] = None) -> bool:
         """§4.1 — the 12 delete checks.  ANY failure keeps the source file.
@@ -1126,6 +1371,25 @@ class Pipeline:
                 if m["path"] not in paths and fsutil.exists(m["path"]):
                     paths.append(m["path"])
                     rows.append(m)
+
+        # §fix①: also delete carved/repair artifacts (REPAIR_ORIGINS descendants)
+        # together with their source.  This is what closes the ~7.4GB leftover
+        # gap — carved .7z/.rar/.zip were never collected for deletion before.
+        # P0 误删闸门 (_collect_deletable_tree -> None) trips -> ABORT the WHOLE
+        # deletion and keep source + carved, exactly like check#12.
+        carved_paths = self._collect_deletable_tree(fid)
+        if carved_paths is None:
+            db.event(fid, C.ACTION_VERIFY,
+                     "delete skipped: a carved/repair artifact's content is "
+                     "not fully extracted yet (P0 misdelete gate)",
+                     batch=cfg.batch)
+            return False
+        for p in carved_paths:
+            if p not in paths and fsutil.exists(p):
+                r = db.get_by_path(p)
+                if r is not None:
+                    paths.append(p)
+                    rows.append(r)
 
         ok_all = True
         for p, r in zip(paths, rows):
@@ -1239,8 +1503,24 @@ class Pipeline:
                 kids = db.children_of(cur_id)
                 if kids and all(k["status"] in C.TERMINAL_STATES for k in kids) \
                         and not any(k["status"] == C.STATUS_FAILED for k in kids):
-                    if self._delete_allowed(p["path"]):
-                        self._delete_one(p["path"], p)
+                    # ① the fake shell AND its carved/repair packages must go
+                    # together ("两个一起删", design §2.1).  P0 gate: abort the
+                    # whole deletion if ANY carved subtree is not fully ready;
+                    # otherwise delete the source and every redundant carved
+                    # package via the shared probe / _delete_one path.
+                    carve = self._collect_deletable_tree(cur_id)
+                    if carve is None:
+                        db.event(cur_id, C.ACTION_VERIFY,
+                                 "HOLD_SOURCE delete skipped: carved subtree "
+                                 "not fully extracted — source + carved kept",
+                                 batch=self.cfg.batch)
+                    else:
+                        if self._delete_allowed(p["path"]):
+                            self._delete_one(p["path"], p)
+                        for cp in carve:
+                            crow = db.get_by_path(cp)
+                            if crow is not None and self._delete_allowed(cp):
+                                self._delete_one(cp, crow)
             cur_id = p["parent_id"]
 
     # ------------------------------------------------------------------

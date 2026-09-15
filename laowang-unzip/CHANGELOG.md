@@ -1,5 +1,36 @@
 # Changelog
 
+## v3.3.0 (2026-09-15) — 优化：carved/repair 产物随源删除 + dry-run 非破坏 + 残余盘点
+
+**§fix① carved/repair 产物随源一起删（根治 ~7.4GB 残留）**
+- 根因：删除逻辑只删"源容器"，从不收集 `REPAIR_ORIGINS`（`CARVED` / `MAGIC_PATCHED` /
+  `CONCATENATED` / `RENAMED`）后代产物；伪装包解出的中间 `.7z/.rar/.zip` 一旦解压成功就随
+  源被删，但**它自己解出的 carved 子包**不在删除集里 → 永久残留（本次实战残留 7 个约 7.4GB）。
+- 修复：`_maybe_delete_source` 在 12 条 check 之后、删除循环之前调用
+  `_collect_deletable_tree(fid)`，把已就绪的 carved/repair 后代并入删除集一并删
+  （对外接口 `references/scripts-api.md` 不变）。
+- **P0 误删闸门**：`_collect_deletable_tree` 对任何"内容尚未完全解出并登记"的 carved 包返回
+  `None`，调用方**整体放弃本次删除**（源 + carved 都保留，等同 check#12）——本机删除永久不可
+  回，宁可漏删不可误删。
+
+**§fix③ dry-run 非破坏（修复"假 dry-run 真删除"泄露）**
+- 根因：旧 `--dry-run` 仍会进入真实删除路径，实测误删了源容器。
+- 修复：`_process_one` 最前插入 dry-run 扫描分支，只调 `header.analyze` 记录"会怎么解"
+  （real_type / is_archive / 签名偏移），**不 extract / carve / rename / delete，也不做状态
+  转移**，行留在 OPEN 态，后续真跑完全等效重处理。
+- 新增 `scripts/tests/test_delete_carved.py::test_c_dry_run_scan_only` 钉死：FakeSZ.extract
+  不得被调用、不得写出 `_carved.*`、行状态不变且仍 OPEN。
+
+**§fix②⑤ 残余 carved 盘点 + 终态不变量**
+- `_run_locked_main` 收尾调 `_scan_orphan_carved`（盘上仍在、DB 已删/已 COMPLETE 的 carved
+  残留）与 `_assert_carved_invariant`（每个 REPAIR_ORIGINS 行要么已删、要么其父链已闭环）；
+  `report.py` 已预留 `orphan_carved` 段落输出。
+
+**测试与验证**
+- 新增 `scripts/tests/test_delete_carved.py`（5 用例：carved 就绪入删除集 / P0 闸门拦停 /
+  dry-run 非破坏 / 整删放弃护源 / 源+carved 同删）；全量 `python -m unittest discover`
+  **87/87 OK**，`py_compile` 全过。
+
 ## v3.2.0 (2026-09-13) — 文件名/文件夹名末尾括号 = 解压密码（多括号配对）+ 提示词同义词
 
 **新规则：文件名/父文件夹名「末尾配对括号」= 解压密码（用户规则，Ducky 直接给用例）**
