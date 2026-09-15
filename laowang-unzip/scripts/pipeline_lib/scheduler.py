@@ -1221,6 +1221,20 @@ class Pipeline:
         row = db.get(cid)
         if row is None:
             return False
+        # §fix⑧: a DELETED / LOST carved row's verdict is MOOT — the SAME
+        # principle as §fix⑦ just below, but applied to the HEAD of the gate
+        # instead of only to the deep-tree half.  Once such a row is gone (its
+        # bytes already removed — e.g. a superseded bogus-carve package that
+        # was correctly deleted earlier), demanding that its now-nonexistent
+        # extract_output_dir still scan as "fully done" can never be satisfied:
+        # isdir(out) is False -> stat=None -> _is_fully_done returns False, so
+        # this gate can never pass again and it permanently strands the PARENT
+        # container on disk (observed: containers #16 / #25, ~2.2GB, stuck
+        # because their carved child #85 was already DELETED).  Blocking a
+        # parent's deletion here cannot recover any bytes — they are gone.  So
+        # a DELETED/LOST carved row counts as "ready" (nothing left to protect).
+        if row["status"] in (C.STATUS_DELETED, C.STATUS_LOST):
+            return True
         out = row["extract_output_dir"]
         stat = fsutil.scan_output(out) if (out and fsutil.isdir(out)) else None
         if not self._is_fully_done(cid, stat):
@@ -1236,10 +1250,19 @@ class Pipeline:
             seen.add(cur)
             r = db.get(cur)
             if r is not None:
-                if r["status"] == C.STATUS_FAILED:
-                    return False
-                if (r["fail_reason"] or C.FAIL_NONE) == C.FAIL_ARCHIVE_CORRUPT:
-                    return False           # corruption still pending -> not ready
+                # §fix⑦: a DELETED / LOST descendant's verdict is MOOT — its
+                # bytes are already gone, so blocking the parent's deletion
+                # cannot recover anything (it only strands the container on
+                # disk forever).  Only FAILED / pending-corruption verdicts of
+                # rows that still EXIST may block.  This was the trap that left
+                # a superseded bogus-carve row's stale ARCHIVE_CORRUPT flag
+                # vetoing its grandparent's deletion after the bogus file was
+                # already removed.
+                if r["status"] not in (C.STATUS_DELETED, C.STATUS_LOST):
+                    if r["status"] == C.STATUS_FAILED:
+                        return False
+                    if (r["fail_reason"] or C.FAIL_NONE) == C.FAIL_ARCHIVE_CORRUPT:
+                        return False       # corruption still pending -> not ready
             for kid in db.children_of(cur):
                 if kid["id"] not in seen:
                     stack.append(kid["id"])
@@ -1314,11 +1337,28 @@ class Pipeline:
         NOT blindly trusted: re-run the full 12-check delete path.  In dry-run
         ``_maybe_delete_source`` / ``_delete_one`` are no-ops, so this only
         audits; in a real run it actually re-judges and deletes if warranted.
+
+        §fix⑨: the row filter is deliberately a strict superset of the original
+        ``origin='DOWNLOAD'`` predicate.  COMPLETE is a TERMINAL state, so the
+        main loop never revisits it — yet a COMPLETE container may still sit on
+        disk (the classic case: a carved/repair-derived container, or an
+        extracted intermediate, whose own 12 checks never got a second chance).
+        Restricting reconcile to ``origin='DOWNLOAD'`` excluded exactly those
+        rows, so their delete checks were never re-run and the container was
+        stranded forever (observed: origin=CARVED #16 and origin=EXTRACTED #25,
+        ~2.2GB).  Coverage is now:
+          * every source_deleted=0 row in DELETED (any origin) — a row the DB
+            already calls "deleted" but that is still on disk is a contradiction
+            and MUST be re-deleted;
+          * every COMPLETE row that is an archive (is_archive=1, any origin).
+        It never widens beyond that: COMPLETE non-archive rows (is_archive=0)
+        and the pre-existing DOWNLOAD rows it already covered stay the same.
         """
         db, cfg = self.db, self.cfg
         for row in db.conn.execute(
-                "SELECT * FROM files WHERE status IN ('COMPLETE','DELETED') "
-                "AND origin='DOWNLOAD' AND source_deleted=0").fetchall():
+                "SELECT * FROM files WHERE source_deleted=0 AND ("
+                "status='DELETED' OR (status='COMPLETE' AND "
+                "(origin='DOWNLOAD' OR is_archive=1)))").fetchall():
             if not fsutil.exists(row["path"]):
                 continue
             if row["status"] == C.STATUS_COMPLETE:

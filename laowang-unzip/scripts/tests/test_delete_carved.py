@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Regression tests for the carved/repair-artifact cleanup fixes (§fix①③⑤).
+"""Regression tests for the carved/repair-artifact cleanup fixes (§fix①③⑤⑧⑨).
 
 Covers:
   (a) source fully extracted + carved package fully extracted -> the delete
@@ -14,6 +14,22 @@ Covers:
       NOT deleted while its carved child is still pending (whole delete aborts);
   (e) integration — when the carved child is ready, _maybe_delete_source removes
       BOTH the source and the carved artifact.
+
+§fix⑧/§fix⑨ additions (2026-09-15):
+  (f) _carved_subtree_ready returns True for an already DELETED carved row
+      whose extract_output_dir no longer exists (MOOT, same as §fix⑦);
+  (g) same for a LOST carved row;
+  (h) regression guard — a carved row still ON DISK whose content is not yet
+      fully extracted must STILL return False (P0 gate semantics not widened);
+  (i) _reconcile_disk_db routes a COMPLETE + origin=CARVED + is_archive=1 row
+      back through _maybe_delete_source;
+  (j) same for COMPLETE + origin=EXTRACTED + is_archive=1;
+  (k) it must NOT touch a COMPLETE + is_archive=0 non-archive row;
+  (l) a DELETED row (any origin) still on disk with source_deleted=0 is
+      re-routed to _delete_one;
+  (m) end-to-end: reconcile really deletes a COMPLETE carved container;
+  (n) superset guard: the original COMPLETE + origin=DOWNLOAD archive is still
+      reconciled/deleted.
 
 Run:  python -m unittest tests.test_delete_carved -v   (from scripts/)
 """
@@ -195,6 +211,126 @@ class DeleteCarvedTests(unittest.TestCase):
                          "carved artifact must be deleted together with source")
         self.assertEqual(pipe.db.get(sid)["source_deleted"], 1)
         self.assertEqual(pipe.db.get_by_path(carved_path)["source_deleted"], 1)
+
+    # ------------------------------------------------------------------
+    # §fix⑧ — _carved_subtree_ready MOOT head-of-gate for DELETED / LOST rows
+    # ------------------------------------------------------------------
+    def test_f_gate_true_for_deleted_carved_row(self):
+        """An already-DELETED carved row (bytes gone, out dir nonexistent)
+        must NOT strand its parent: the gate returns True (MOOT)."""
+        sid, _ = self._seed_source("shell.mp4")
+        cid, cpath = self._seed_carved(sid, "shell_carved.7z", out_dir=None)
+        os.remove(cpath)                     # bytes already permanently gone
+        self.db.transition(cid, C.STATUS_DELETED, C.ACTION_DELETE,
+                           "seed: bogus carve already deleted")
+        self.db.update_fields(cid, source_deleted=1)
+        pipe = self._pipe()
+        self.assertTrue(
+            pipe._carved_subtree_ready(cid),
+            "a DELETED carved row's verdict is MOOT -> gate must pass")
+
+    def test_g_gate_true_for_lost_carved_row(self):
+        sid, _ = self._seed_source("shell.mp4")
+        cid, cpath = self._seed_carved(sid, "shell_carved.7z", out_dir=None)
+        os.remove(cpath)
+        self.db.transition(cid, C.STATUS_LOST, C.ACTION_DISCOVER, "seed lost")
+        self.assertTrue(
+            self._pipe()._carved_subtree_ready(cid),
+            "a LOST carved row's verdict is MOOT -> gate must pass")
+
+    def test_h_gate_still_blocks_pending_on_disk_carved(self):
+        """REGRESSION guard — P0 semantics must NOT be widened: a carved row
+        still ON DISK with content not fully extracted stays False."""
+        sid, _ = self._seed_source("shell.mp4")
+        cid, cpath = self._seed_carved(sid, "shell_carved.7z", out_dir=None)
+        self.assertTrue(os.path.exists(cpath), "row is still on disk")
+        pipe = self._pipe()
+        self.assertFalse(
+            pipe._carved_subtree_ready(cid),
+            "on-disk pending carved row must still trip the P0 gate")
+
+    # ------------------------------------------------------------------
+    # §fix⑨ — _reconcile_disk_db coverage of carved / extracted containers
+    # ------------------------------------------------------------------
+    def _container(self, rel, origin="DOWNLOAD", is_archive=1,
+                   status=C.STATUS_COMPLETE):
+        """A container on disk + its DB row, with a REGISTERED non-archive leaf
+        in its output dir so it passes all 12 delete checks if re-judged."""
+        p = self._put(rel)
+        fid, _ = self.db.upsert_file(p, batch=BATCH, origin=origin)
+        out = os.path.join(self.src, "o_" + rel.replace(".", "_"))
+        os.makedirs(out, exist_ok=True)
+        leaf = os.path.join(out, "leaf.bin")
+        with open(leaf, "wb") as fh:
+            fh.write(b"real content" * 200)
+        lid, _ = self.db.upsert_file(leaf, batch=BATCH, origin="EXTRACTED",
+                                     depth=1, parent_id=fid, root_id=fid)
+        self.db.transition(lid, C.STATUS_COMPLETE, C.ACTION_VERIFY, "seed leaf")
+        self.db.update_fields(fid, is_archive=is_archive, extract_rc=0,
+                              extract_output_dir=out, status=status)
+        return fid, p
+
+    def _reconcile_spy(self):
+        """Pipeline whose delete entry points are recorded instead of run."""
+        pipe = self._pipe()
+        seen = {"complete": [], "deleted": []}
+        pipe._maybe_delete_source = (
+            lambda fid, row=None, stat=None:
+            seen["complete"].append(fid) or True)
+        pipe._delete_one = (
+            lambda path, row: seen["deleted"].append(path) or True)
+        return pipe, seen
+
+    def test_i_reconcile_routes_complete_carved_archive(self):
+        fid, _ = self._container("c_carved.7z", origin="CARVED", is_archive=1)
+        pipe, seen = self._reconcile_spy()
+        pipe._reconcile_disk_db()
+        self.assertIn(fid, seen["complete"],
+                      "COMPLETE + CARVED + archive must be re-judged")
+
+    def test_j_reconcile_routes_complete_extracted_archive(self):
+        fid, _ = self._container("e_extracted.7z", origin="EXTRACTED",
+                                 is_archive=1)
+        pipe, seen = self._reconcile_spy()
+        pipe._reconcile_disk_db()
+        self.assertIn(fid, seen["complete"],
+                      "COMPLETE + EXTRACTED + archive must be re-judged")
+
+    def test_k_reconcile_ignores_complete_non_archive(self):
+        fid, _ = self._container("plain_leak.bin", origin="EXTRACTED",
+                                 is_archive=0)
+        pipe, seen = self._reconcile_spy()
+        pipe._reconcile_disk_db()
+        self.assertNotIn(fid, seen["complete"])
+        self.assertNotIn(fid, seen["deleted"])
+
+    def test_l_reconcile_reroutes_deleted_row_on_disk(self):
+        """DB says DELETED, source_deleted=0, file still on disk -> contradiction
+        -> must be re-deleted (any origin)."""
+        fid, p = self._container("ghost_carved.7z", origin="CARVED",
+                                 is_archive=1, status=C.STATUS_DELETED)
+        self.assertTrue(os.path.exists(p))
+        pipe, seen = self._reconcile_spy()
+        pipe._reconcile_disk_db()
+        self.assertIn(p, seen["deleted"])
+
+    def test_m_reconcile_really_deletes_complete_carved(self):
+        fid, p = self._container("real_carved.7z", origin="CARVED",
+                                 is_archive=1)
+        self.assertTrue(os.path.exists(p))
+        pipe = self._pipe()
+        pipe._reconcile_disk_db()
+        self.assertFalse(os.path.exists(p),
+                         "reconcile must really delete the stranded container")
+        self.assertEqual(pipe.db.get(fid)["source_deleted"], 1)
+
+    def test_n_reconcile_still_covers_download_archive(self):
+        """Superset guard: the original DOWNLOAD coverage is preserved."""
+        fid, p = self._container("dl.7z", origin="DOWNLOAD", is_archive=1)
+        pipe = self._pipe()
+        pipe._reconcile_disk_db()
+        self.assertFalse(os.path.exists(p))
+        self.assertEqual(pipe.db.get(fid)["source_deleted"], 1)
 
 
 if __name__ == "__main__":

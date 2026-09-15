@@ -1,5 +1,47 @@
 # Changelog
 
+## v3.4.1 (2026-09-15) — 补全 P0 闸门对已删行的 MOOT 判定 + reconcile 覆盖 carved/已解出容器（§fix⑧/§fix⑨）
+
+**根因：两处缺陷叠加，导致 2 个容器（合计约 2.2GB）永久残留在磁盘（生产库实测）**
+- 涉事行：`#16`（`价格信号与社会资源-S03E21_30199866_carved.7z`，1.1GB，`COMPLETE`，`origin=CARVED`）
+  与 `#25`（`..._carved\18e7032d8e57401c.7z`，1.1GB，`COMPLETE`，`origin=EXTRACTED`）。
+  事件日志实测：`delete skipped: a carved/repair artifact's content is not fully
+  extracted yet (P0 misdelete gate)`（2026-09-15 13:20:46 / 13:23:45 各一次）。
+
+**§fix⑧ — `_carved_subtree_ready` 对已删除的 carved 行判 False（P0 闸门只在深层遍历一半打了补丁）**
+- 根因：该函数开头的第一个判据要求 `extract_output_dir` 仍能被 `scan_output` 判定为
+  「已完全解出」；但涉事 carved 行 `#85` 早已被正确删除（判定为「假 carve」无效包），其
+  `extract_output_dir` 随之消失 → `stat=None` → `_is_fully_done` 直接 `False` → 闸门永远
+  无法通过 → 父容器 `#16`/`#25` 被永久搁浅（本机删除不可回，但那是保护**活字节**的，字节已
+  没了就没有可保护的对象）。
+- 修复：`row = db.get(cid)` 之后、扫描输出目录之前**早返回**——`status in (DELETED, LOST)`
+  的 carved 行直接 `return True`。这与函数下方 `§fix⑦` 的推理**同源**：已删/已失行判据
+  MOOT，只作用于「还在盘上、尚未解完」的行。`row is None` 分支行为不变（仍 `False`）。
+- 语义未放宽：**仍在盘上、内容尚未解完**的 carved 行依旧 `False`（P0 闸门原意不变）。
+
+**§fix⑨ — `_reconcile_disk_db` 行筛选漏掉 carved / 已解出容器（COMPLETE 是终态，主循环永不回访）**
+- 根因：原筛选 `status IN ('COMPLETE','DELETED') AND origin='DOWNLOAD'` 把 `#16`（`CARVED`）
+  与 `#25`（`EXTRACTED`）排除在外；而它们的状态已是终态 `COMPLETE`，主循环
+  （`TERMINAL_STATES` 含 `COMPLETE`）永不回访 → 12 条删除检查再也不会执行 → 永久搁浅。
+  这正是「COMPLETE 终态」与「产物必须删掉」的矛盾没有被启动时 reconcile 兜住。
+- 修复：放宽为原查询的**严格超集**——
+  `source_deleted=0 AND (status='DELETED' OR (status='COMPLETE' AND (origin='DOWNLOAD' OR is_archive=1)))`：
+  ① 任何 `source_deleted=0` 且 `status='DELETED'` 的行（无论 origin，删了却还在盘上是矛盾，
+  必须重删）；② `status='COMPLETE'` 且是压缩包（`is_archive=1`，无论 origin）的行。
+  对 COMPLETE 调 `_maybe_delete_source`、对 DELETED 调 `_delete_one` 的分支、`dry_run`
+  无副作用、`_delete_allowed` 路径保护、首次删除探针、12 条检查——**全部未改**。
+
+**文档同步**：`references/design-v2.1.md` 启动定正表 `COMPLETE` 行补注「仍留在盘上的
+COMPLETE 压缩包 / DELETED 行由启动时 reconcile（④）重跑 12 条检查」这一例外。
+
+**测试与验证**
+- `scripts/tests/test_delete_carved.py` 新增 9 用例（f–n）：DELETED/LOST carved 行闸门放行 /
+  仍在盘上未解完仍 `False`（回归护栏）/ reconcile 捞 `COMPLETE+CARVED+archive`、
+  `COMPLETE+EXTRACTED+archive`、`DELETED` 在盘行、真删除 carved 容器、不碰
+  `COMPLETE+is_archive=0`、保留原 `DOWNLOAD` 覆盖（超集护栏）。
+- 突变验证：把两处修复分别中和后，f/g/i/j/l/m 共 6 个新用例如期失败，证明测试确实咬住缺陷。
+- 全量 `python -m unittest discover -s tests` **105/105 OK**（基线 96，新增 9）。
+
 ## v3.4.0 (2026-09-15) — 最后兜底密码来源：从已解压出来的 .txt 文档里挖密码（§fix⑥）
 
 **新规则：标准来源全失败后，从已解压的 .txt 文档里找密码（用户规则）**
