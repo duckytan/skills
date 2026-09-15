@@ -9,7 +9,7 @@ description: >-
   详细判据见 references/，接口约定见 references/scripts-api.md，完整设计见 references/design-v2.1.md。
 ---
 
-# 伪装压缩包批量整理（通用版 v3 · skill 3.7.1）
+# 伪装压缩包批量整理（通用版 v3 · skill 3.7.2）
 
 > ## ⚠️ 平台：Windows 专用（Q1 拍板 2026-09-09）
 > 本 skill 的**删除与回收站语义只在 Windows 上完整成立**：

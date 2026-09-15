@@ -425,7 +425,11 @@ def archive(path: str, archive_path: Optional[str] = None, force: bool = False) 
 # 对策：用**机械可判**的子串规则把 fail_reason 分成「真失败」与「正常终态」两类
 # （另有第三档「待判/未分类」仅供审计展示）。判据写死、大小写不敏感。
 MINEABLE_FAIL_PATTERNS = ("CORRUPT", "WRONG_", "FAIL", "LOST", "MISSING",
-                          "DATA_LOSS")
+                          "DATA_LOSS",
+                          # v3.7.2: OUTPUT_DIR_CONFLICT（LES-12，无扩展名包的输出
+                          # 目录与源路径重合）/ VOLUME_INCOMPLETE（LES-11，伪装
+                          # 分卷组缺员）都是真失败，必须能建教训，≠ UNCLASSIFIED。
+                          "CONFLICT", "INCOMPLETE")
 BENIGN_FAIL_PATTERNS = ("NOT_ARCHIVE", "_RESOLVED", "VERIFIED", "JUNK_CLEANED",
                         "DUP_KEEP_NEW_OLD_MISSING", "DUPLICATE", "SKIPPED")
 # 精确良性白名单（**在子串匹配之前**判定）：某些「正常终态」的名字恰好包含一个

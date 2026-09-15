@@ -16,10 +16,11 @@ from __future__ import annotations
 
 import os
 import re
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 from . import config as C
 from . import fsutil
+from . import sz as _szmod
 
 # ---------------------------------------------------------------------------
 # Volume-set regexes (§7.2 rows 12-14)
@@ -31,6 +32,14 @@ RE_DELETE_SUFFIX = re.compile(r"^(?P<name>.+?)(?:删除|删)$", re.IGNORECASE)
 # Same shape as RE_VOL_PART but on a stem: matches "<base>.part<N>" BEFORE
 # any trailing (possibly fake) extension — used by volume-member rename.
 RE_PART_STEM = re.compile(r"^(?P<base>.+)\.part(?P<num>\d+)$", re.IGNORECASE)
+# v3.7.2 (LES-11): 裸编号词干 —— `风景01.mp4` 这类「<base><N>.<伪装扩展名>」。
+# RE_VOL_COMPOUND 要求 base 自带扩展名（风景.7z.001 才匹配），裸编号词干
+# 匹配不上，于是整个分卷组对 volume_info 完全隐形 —— 误判 ARCHIVE_CORRUPT
+# 的根子。非贪婪 base 保证编号归 num（风景01 -> base=风景, num=1）。
+RE_NUM_STEM = re.compile(r"^(?P<base>.+?)(?P<num>\d{1,4})$", re.DOTALL)
+
+# 规范压缩包扩展名（已是这些后缀的名字不参与 split-set 判定）。
+CANONICAL_ARCHIVE_EXTS = (".rar", ".zip", ".7z", ".gz", ".tar")
 
 TYPE_TO_EXT = {"ZIP": ".zip", "7Z": ".7z", "RAR": ".rar", "RAR5": ".rar",
                "TAR": ".tar", "GZ": ".gz"}
@@ -219,6 +228,92 @@ def check_volume_complete(path: str, file_name: str, group: str) -> tuple:
         names = nums.get(lo + 1) or nums.get(max(nums)) or file_name
         return False, ["%s (expect sibling #%d)" % (names, min(missing))]
     return True, []
+
+
+# ---------------------------------------------------------------------------
+# v3.7.2 (LES-11): 伪装 split-7z 组检测（裸编号词干形态）
+# ---------------------------------------------------------------------------
+# 生产实锤（批 2026-09-15，6 组 12 行）：`风景01.mp4`（内容 7z、体积整 MiB、
+# volume_group=None）+ 同目录 `风景02.mp4`（real_type=UNKNOWN 无头续卷）。
+# 7z t 对首卷单测必然 "Unexpected end of data" -> 误判 ARCHIVE_CORRUPT
+# （extract_rc=None，解压根本没跑）。人工复盘结论（LES-20260910 同源案例）：
+# 改名 `风景.7z.001/.002` 后整组联解成功。本组函数把那次人工 SOP 机械化。
+
+def looks_like_split_first(path: str, real_type: str) -> Optional[Tuple[str, int]]:
+    """判断 *path* 是否「伪装 split-7z 首卷」；命中返回 ``(base, num)``，否则 ``None``。
+
+    机械判据（**全部命中才算**，缺一即否 —— 宁可放过，不可误伤）：
+
+    1. 内容是 7Z（magic 在 offset 0，``real_type == "7Z"``）。生产实锤只有 7z
+       分卷组（``7z -vN`` 切卷，首卷体积恒为整 MiB）；RAR 的 ``partN`` 形态已由
+       :data:`RE_PART_STEM` 覆盖、ZIP 走 ``.zNN``，两者都无需此守卫，刻意不放开。
+    2. 声明扩展名不是规范压缩包扩展名（.mp4 等伪装壳）。
+    3. 名字匹配 :data:`RE_NUM_STEM`（词干以 1-4 位数字结尾），且
+       ``volume_info(name)`` 为 NONE —— 已是规范卷名的不归这里管。
+    4. **7z 尾头截断**（:func:`sz.sevenz_header_intact` 为 False）。完整单文件
+       7z 的尾头 (NextHeaderOffset + NextHeaderSize) 必然落在文件内；split
+       首卷的尾头在整个分卷组的末尾，必然越过首卷边界。这是「分卷首卷」与
+       「真损坏 / 完整单文件」的唯一机械分界 —— 也是「单个 7z 伪装成 mp4」
+       （carve/直解场景）绝不误伤的关键闸门。
+    """
+    if real_type != "7Z":
+        return None
+    base_name = os.path.basename(path)
+    stem, ext = os.path.splitext(base_name)
+    if ext.lower() in CANONICAL_ARCHIVE_EXTS:
+        return None
+    if volume_info(base_name)[0] != "NONE":
+        return None
+    m = RE_NUM_STEM.match(stem)
+    if not m:
+        return None
+    try:
+        if _szmod.sevenz_header_intact(path):
+            return None        # 尾头完整 => 完整单文件，不是分卷首卷
+    except (OSError, ValueError):
+        return None
+    return m.group("base"), int(m.group("num"))
+
+
+def split_set_targets(path: str, real_type: str) -> List[Tuple[str, str]]:
+    """整组归一清单 ``[(old_path, new_path), ...]``；判据不齐返回 ``[]``。
+
+    前置：:func:`looks_like_split_first` 命中（首卷判据成立）。
+    兄弟判据：同目录、词干同 base 且编号不同、内容**非压缩包**（split 7z 的
+    续卷是纯数据、无任何 magic —— 有头即独立压缩包，绝不动它）、且规范目标名
+    不存在（**永不覆盖**）。任一目标撞车即整组放弃（宁可不动，不做半套改名）。
+    目标名按首卷 real_type 推导：``<base>.7z.<%03d 编号>``（与人工复盘
+    LES-20260910 的 `风景.7z.001/.002` 命名一致）。
+
+    返回空表但 :func:`looks_like_split_first` 命中时，调用方应落
+    ``VOLUME_INCOMPLETE``（首卷截断但无续卷兄弟 / 目标撞车 = 分卷不全，
+    ≠ corrupt）。
+    """
+    first = looks_like_split_first(path, real_type)
+    if not first:
+        return []
+    base, own_num = first
+    src_dir = os.path.dirname(path)
+    own_target = os.path.join(src_dir, "%s.7z.%03d" % (base, own_num))
+    if fsutil.exists(own_target):
+        return []                       # 永不覆盖：整组放弃
+    targets: List[Tuple[str, str]] = [(path, own_target)]
+    for entry in fsutil.list_top_level(src_dir):
+        sib_name = os.path.basename(entry)
+        if sib_name.lower() == os.path.basename(path).lower():
+            continue
+        m = RE_NUM_STEM.match(os.path.splitext(sib_name)[0])
+        if not m or m.group("base") != base or int(m.group("num")) == own_num:
+            continue                    # 不同组 / 非编号词干 / 自身
+        if probe_magic_only(entry) in C.ARCHIVE_TYPES:
+            continue                    # 有头 => 独立压缩包，不是续卷数据
+        dest = os.path.join(src_dir, "%s.7z.%03d" % (base, int(m.group("num"))))
+        if fsutil.exists(dest):
+            return []                   # 撞车：整组放弃，不做半套
+        targets.append((entry, dest))
+    if len(targets) < 2:
+        return []                       # 无续卷兄弟 => 分卷不全
+    return targets
 
 
 # ---------------------------------------------------------------------------

@@ -100,6 +100,12 @@ FAIL_OUTPUT_ZERO_ROOTS = "OUTPUT_ZERO_ROOTS"
 FAIL_DELETE_FAILED = "DELETE_FAILED"
 FAIL_IO_ERROR = "IO_ERROR"
 FAIL_UNCLASSIFIED = "UNCLASSIFIED"
+# v3.7.2 (LES-12): 7z 无法创建输出目录 —— 无扩展名包的派生输出目录与源文件
+# 路径完全重合（splitext 对 "6717777888999" 去不掉任何东西）。
+FAIL_OUTPUT_DIR_CONFLICT = "OUTPUT_DIR_CONFLICT"
+# v3.7.2 (LES-11): 分卷不全 / 伪装分卷组成员缺失 —— ≠ ARCHIVE_CORRUPT。
+# 首卷尾头截断（数据延续到下一卷）但整组无法归一时落此态，诚实于「损坏」。
+FAIL_VOLUME_INCOMPLETE = "VOLUME_INCOMPLETE"
 # P1-1: a product path escaped the extraction root (zip-slip).  The archive
 # is judged FAILED and its source is NEVER deleted.
 FAIL_UNSAFE_PATH = "UNSAFE_PATH"

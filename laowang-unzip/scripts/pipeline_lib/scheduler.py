@@ -642,6 +642,13 @@ class Pipeline:
                                   "member(s) normalized, retrying" % fixed)
                     self.queue.append(fid)
                     return
+            # v3.7.2 (LES-11): 伪装分卷组守卫 —— ARCHIVE_CORRUPT 先过一遍
+            # 「裸编号词干 + 7z 尾头截断 + 同目录无头编号兄弟」机械判据；疑似
+            # 分卷组则整组归一为 <base>.7z.NNN 后重试联解，绝不把「分卷」
+            # 误埋进「损坏」。
+            if cls == C.FAIL_ARCHIVE_CORRUPT and info.is_archive:
+                if self._handle_disguised_split_set(fid, row, info):
+                    return
             if cls in (C.FAIL_WRONG_PASSWORD, C.FAIL_ENCRYPTED_HEADER):
                 reason = C.FAIL_WRONG_PASSWORD if non_empty_tried \
                     else C.FAIL_PASSWORD_NOT_FOUND
@@ -1184,6 +1191,78 @@ class Pipeline:
         if new_path not in self.seen:
             self.seen.add(new_path)
             self.queue.append(fid)
+        return True
+
+    # ------------------------------------------------------------------
+    # v3.7.2 (LES-11): 伪装 split-7z 组守卫（裸编号词干形态）
+    # ------------------------------------------------------------------
+    def _handle_disguised_split_set(self, fid: int, row, info) -> bool:
+        """「解压前 ARCHIVE_CORRUPT（rc=None）」的分卷鉴别与整组归一。
+
+        ``风景01.mp4``（内容 7z、尾头截断、体积整 MiB）+ 同目录 ``风景02.mp4``
+        （real_type=UNKNOWN 无头续卷）是「<base><N>.<伪装扩展名>」的 split 7z
+        组。7z t 对首卷单测必然 "Unexpected end of data" —— 生产 6 组 12 行
+        全部被误判 ARCHIVE_CORRUPT，解压根本没跑。机械判据与处置（详见
+        ``header.looks_like_split_first`` / ``header.split_set_targets``）：
+
+          1. 判据全中且能整组归一 -> 改名 ``<base>.7z.NNN``（复用 ①② 的改名
+             与 DB 对账机制），自身重排队（retry_count 守卫）→ 下一遍按
+             FIRST/CONTINUE 卷组联解；
+          2. 首卷截断但无续卷兄弟 / 目标撞车 -> 落 ``VOLUME_INCOMPLETE``
+             （分卷不全 ≠ corrupt，绝不伪造损坏）；
+          3. dry-run 不落盘 -> 留 QUEUED 等真实 run。
+
+        返回 True 表示本函数已接管该行（重排或终态），调用方应直接 return。
+        """
+        db, cfg = self.db, self.cfg
+        if not header.looks_like_split_first(row["path"], info.real_type):
+            return False
+        targets = header.split_set_targets(row["path"], info.real_type)
+        if not targets:
+            db.transition(fid, C.STATUS_FAILED, C.ACTION_ANALYZE,
+                          "split-set first volume truncated but the set "
+                          "cannot be normalized (no headless numbered "
+                          "sibling / target exists)",
+                          fail_reason=C.FAIL_VOLUME_INCOMPLETE)
+            db.bump_batch(cfg.batch, "n_failed")
+            self._on_terminal(fid)
+            return True
+        if cfg.dry_run:
+            db.event(fid, C.ACTION_ANALYZE,
+                     "dry-run: split-set rename skipped (no disk write)",
+                     batch=cfg.batch)
+            db.transition(fid, C.STATUS_QUEUED, C.ACTION_ANALYZE,
+                          "dry-run: queued for real run (split-set rename "
+                          "skipped)", fail_reason=C.FAIL_NONE)
+            self.seen.add(row["path"])
+            return True
+        renamed = 0
+        for old_path, new_path in targets:
+            if old_path.lower() == row["path"].lower():
+                if self._rename_volume_member(fid, row, new_path):
+                    renamed += 1
+            elif self._rename_sibling_row(old_path, new_path):
+                renamed += 1
+        if renamed and (row["retry_count"] or 0) < C.MAX_RETRY:
+            db.update_fields(fid, retry_count=(row["retry_count"] or 0) + 1)
+            db.transition(fid, C.STATUS_QUEUED, C.ACTION_ANALYZE,
+                          "disguised split set suspected: %d member(s) "
+                          "normalized to canonical volume names, retrying "
+                          "for joint extraction" % renamed)
+            self.queue.append(fid)
+            return True
+        if renamed:
+            # retries exhausted：改名成功但重试额度用尽 —— 诚实落 incomplete。
+            db.transition(fid, C.STATUS_FAILED, C.ACTION_ANALYZE,
+                          "split set normalized but retries exhausted",
+                          fail_reason=C.FAIL_VOLUME_INCOMPLETE)
+        else:
+            db.transition(fid, C.STATUS_FAILED, C.ACTION_ANALYZE,
+                          "split set suspected but rename failed on disk: %s"
+                          % (targets,),
+                          fail_reason=C.FAIL_VOLUME_INCOMPLETE)
+        db.bump_batch(cfg.batch, "n_failed")
+        self._on_terminal(fid)
         return True
 
     # ------------------------------------------------------------------
@@ -1828,9 +1907,20 @@ def _safe_mtime(path: str) -> float:
 
 
 def _stem_of(row, info) -> str:
-    """Output dir name = archive name minus extension (volume base aware)."""
+    """Output dir name = archive name minus extension (volume base aware).
+
+    v3.7.2 (LES-12) 无扩展名防撞：``splitext`` 对 ``6717777888999`` 什么也去不掉，
+    派生输出目录 == 源文件路径，7z 落盘即报
+    ``Cannot create output directory : 当文件已存在时，无法创建该文件``（rc=2）。
+    此时输出目录追加 ``_ext`` 后缀（``6717777888999_ext``）；并按 normcase 全路径
+    比对兜底（防御未来其它「派生目录撞上源文件」的形态）。
+    """
     if info.volume_group and info.volume_role == "FIRST":
-        return os.path.basename(info.volume_group)
-    name = row["file_name"]
-    stem, _ext = os.path.splitext(name)
+        stem = os.path.basename(info.volume_group)
+    else:
+        stem, _ext = os.path.splitext(row["file_name"])
+    out_dir = os.path.join(row["dir_path"], stem)
+    if (not os.path.splitext(row["file_name"])[1]) \
+            or os.path.normcase(out_dir) == os.path.normcase(row["path"]):
+        stem += "_ext"
     return stem

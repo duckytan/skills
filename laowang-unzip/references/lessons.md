@@ -188,7 +188,7 @@
 - 指纹：UNKNOWN_BINARYmp4魔数识别不出被SKIP
 - 复现：6 次
 
-### [LES-20260915-11] bug P1 open（分卷成员 mp4 被当独立 7z 处理，卷组未聚合）
+### [LES-20260915-11] bug P1 promoted（分卷成员 mp4 被当独立 7z 处理，卷组未聚合）
 - 现象：自动采集：本批出现 ARCHIVE_CORRUPT ×6 次（生产全库 35 次）。抽查证据：`【done】\2026-09-15\18xx\风景01.mp4` 共 6 份（1878~1893 各目录一份），real_type=7Z、declared_ext=.mp4、体积清一色整 MB（314572800=300MB、20971520=20MB、157286400=150MB），`extract_rc=None`、`last_error=None` 即**没真正跑过 7z 就 FAILED**。另混有 1 份 `_carved.zip` 真损坏（extract_rc≠0）。
 - 根因：整 MB 尺寸 + 同名成批出现是**分卷成员**的典型指纹；这些 mp4 伪装的 7z 分卷被逐个当成独立包处理，`volume_group` 没有把它们聚合（缺其他卷 → 无法解 → 归为 corrupt），且失败发生在解压前（rc=None）说明卷组判定阶段就已放弃。
 - 处置（待办）：(1) 卷组识别应把「同名同目录、real_type=7Z、整 MB 体积」的成批文件聚合为一个 volume_group 后再判定；(2) 分卷不全时应报 VOLUME_INCOMPLETE 而非 ARCHIVE_CORRUPT，避免误导。影响面：此类场景按整包估算约占该批 20GB+，值得优先修。
@@ -196,7 +196,7 @@
 - 指纹：风景01mp4整MB体积成批7Z卷FAILED且extract_rc为None
 - 复现：6 次
 
-### [LES-20260915-12] bug P1 open（无扩展名包的输出目录与源文件同名，7z 建目录冲突）
+### [LES-20260915-12] bug P1 promoted（无扩展名包的输出目录与源文件同名，7z 建目录冲突）
 - 现象：自动采集：本批出现 UNCLASSIFIED ×2 次。实锤证据：`6713777888999`（1.1GB）与 `6717777888999`（3.7GB），real_type=7Z、declared_ext=None（无扩展名裸包），密码已命中 LIBRARY（`上老王论坛当老王`），7z 退出码 2，报错 `Cannot create output directory : 当文件已存在时，无法创建该文件`。
 - 根因：**输出目录规划撞上源文件本身**——无扩展名包的输出目录默认取「文件名同名目录」，而该目录路径正是源文件所在位置（`...\6713777888999\` 已是文件），7z 建目录必然失败。该错误形态此前未纳入 fail_reason 分类表 → 落到 UNCLASSIFIED。
 - 处置（待办，两步）：(1) 调度器为无扩展名包的输出目录加固定后缀（如 `6713777888999_ext\`），从源头消除同名冲突；(2) 把 7z `Cannot create output directory` 映射进 fail_reason 已知错误（如 OUTPUT_DIR_CONFLICT），不再是 UNCLASSIFIED。修复后这两个 3.7GB+1.1GB 的大包可直接重跑，不需要动源文件。

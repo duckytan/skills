@@ -327,6 +327,11 @@ def classify_extract_fail(res: Result, archive_path: str) -> str:
         return C.FAIL_CRC_FAILED
     if "No space left" in text or "not enough space" in text.lower():
         return C.FAIL_DISK_FULL
+    if "cannot create output directory" in text.lower():
+        # v3.7.2 (LES-12): 无扩展名包的派生输出目录与源文件路径重合，7z 落盘
+        # 即报此错（rc=2）。已知机械形态，绝非 UNCLASSIFIED；调度侧已用
+        # <stem>_ext 输出目录预防，此处映射保证存量行 retry-failed 后语义正确。
+        return C.FAIL_OUTPUT_DIR_CONFLICT
     if "Missing volume" in text or "Cannot find" in text:
         return C.FAIL_VOLUME_MISSING
     if "Unexpected end of archive" in text or "Unexpected end of data" in text:
