@@ -1,5 +1,98 @@
 # Changelog
 
+## v3.6.0 (2026-09-15) — 密码库自进化（Part A）+ 自进化环真正自动跑（Part B）
+
+**背景（用户原话）**：自我升级/迭代"不能仅停留在功能上，必须要实际能运作起来"；
+"如果以后在 txt 里发现新密码、成功解压了，也要加入密码库里"；"密码库要为每个密码设置
+优先级，按成功解压的次数排序，成功次数多的排在前面，优先尝试"。
+
+### Part A — 密码库自学习层（新模块 `scripts/pipeline_lib/pwstats.py`，纯标准库、绝不抛）
+- **受管文件** `assets/passwords.learned.txt`（机器维护，UTF-8/LF，`#` 注释；数据行
+  `TAB` 分隔 4 列 `<count>\t<pw>\t<last_date>\t<sources>`；落盘按 count 降序）。
+- `parse_learned` / `render_learned` **字节无损 round-trip**（护栏：真实 learned 文件
+  parse→render 逐字节一致）；裸密码行（无 TAB）→ count=0 且**不丢弃**；缺失 → 空结构；
+  `utf-8-sig` + `errors=ignore`。
+- `record_success`：成功解压 → count+1 / 合并 source（去重保序）/ 更新日期；同目录
+  `<name>.tmp` + `os.replace` **原子写**，写失败不动原文件、`written=False`、不抛。
+- `counts_from_db`（**只读** `WHERE is_extracted=1 GROUP BY password`，conn=None/表缺失→`{}`）、
+  `rebuild_counts`（**单调**合并 `max(file,db)`，绝不降低；DB 独有密码追加）、
+  `prioritize`（按次数降序、稳定、缺键按 0）、`format_table`。
+- **接线**：`passwords.describe_sources` 新增 `learned` 层（顺序 `external → local(skill) →
+  learned → local(root) → workdir → builtin`）；`load_library(..., counts=None,
+  prioritize_by_count=True)` 合并后按次数降序；新增 `library_password_set()`（未排序全库集合，
+  复用同一加载逻辑）。
+- **成功即学**：`scheduler._learn_password`（解压成功、`is_extracted=1` 之后接入）——
+  **dry-run 不写任何文件**（P0）；**幂等**（`file_id`+`PW_LEARNED` 事件为凭据，重复只记一次）；
+  空密码不学；学习失败只 warn、绝不崩；新密码首次入库打显著日志并记事件。
+- `scheduler.run` 初始化时把 `counts_from_db(conn)` 传给 `load_library`（拿不到 DB 就只靠
+  learned 文件，**不为此重排初始化**）。
+- **刻意保留**：候选来源顺序 `NONE → INHERITED → TRAIL_BRACKET → 名称抠码 → LIBRARY` 不变，
+  **只有 LIBRARY 段内部按次数排序**——显式名/父包信号优先于库（库只是先验），见 SKILL.md §5.1。
+
+### Part B — 自进化环自动运行（`evolve.py` / `pipeline.py`）
+- **`run` 收尾自动执行** `evolve(apply=True)`（新增 `--no-evolve` 跳过）；**整段 try/except**，
+  evolve 出任何异常只 `warn`、**绝不改变 run 返回码、绝不中断批次**；dry-run 也跑（evolve 的
+  apply 只动 skill 自己的 `references/`，不动用户数据）。收尾打印 6 项（错误聚合 / fail_reason
+  频次（新形态 `!!`）/ 自动动作 / 待提升 / 健康度 / **P0 待提升醒目区块**），中文+英文对照。
+- **occ 机械自增**：新增 `_signature`（去空白与标点、转小写、截断 80）与 `- 指纹：<sig>` 行；
+  `bump_occ`（按指纹 `occ += n`，返回 `crossed`；未命中不动文件；写前备份）、
+  `draft_lesson`（未记录过的 fail_reason 自动落 `open` 草稿，根因/处置写明"机器草稿"，
+  自带同一指纹）；`_backfill_occ` 顺带回填指纹；`evolve(apply=True)` 机械动作 =
+  回填 occ+指纹 → 按指纹 bump/draft → 归档（**落盘后重算 health/candidates**）。
+- **严格保留人机边界**：`apply=True` **绝不**自动把 `open` 改成 `promoted`、**绝不**自动改
+  Skill 层正文；`apply=False`（含 `--check`）纯只读、不写盘。
+- `mine_from_db` 新增 `pw_gaps`（`db_only`/`learned_total`/`db_success_total`，只读、降级安全）；
+  `health()` 新增第 9 项「密码库」（可解析/无重复/count 降序；漏学只作 hint 不计 problems；
+  import/DB 失败降级 `ok=True, detail="skipped"`）。
+- `report.py`「十一、自省」补：本批 `PW_LEARNED` 明细、密码学习缺口、`applied`（occ 自增/草稿/归档）。
+
+### CLI
+- 新增 `pw-stats [--rebuild] [--verify] [--top N] [--json]`（`--rebuild` 只写 learned 文件、
+  绝不写 DB；`--verify` 机械自检 rc 0/1）；`run` 新增 `--no-evolve`。
+
+### 测试
+- 新增 `scripts/tests/test_pwstats.py`（43 例：round-trip / 原子性 / 单调性 / DB 汇总 /
+  优先级稳定 / `_learn_password` dry-run+幂等 / CLI）；`tests/test_evolve.py` 扩 22 例
+  （`_signature` / `bump_occ` / `draft_lesson` / 指纹回填 round-trip / apply=False 只读 /
+  health「密码库」/ `pw_gaps` 降级）；`tests/test_readonly_open.py` 新增 10 例（D1 只读回归）。
+- 全量：**Ran 222 tests, OK**（v3.5.0 基线 133 → 222，只增不减；含 QA 的
+  `test_qa_password_priority.py` 4 例、D1 回归 `test_readonly_open.py` 10 例、
+  以及本轮新增的 `SkillLayersMonotonicTests` + 2 例 CLI 牙齿，共 10 例）。
+
+### 缺陷修复 D1 — 只读命令写用户目录（P0，QA 复现）
+- **现象**：`pw-stats` / `evolve` / `doctor --root <用户区>` 自称"只读、绝不写用户工作区"，却在用户
+  生产 DB 目录里新建了 `archive.db-shm`(32768B) + `archive.db-wal`(0B)（目录文件数 118543→118545），
+  而 `archive.db` 本身 md5 未变——纯粹的读副作用，直接违反只读承诺。
+- **根因**：`mode=ro` 只约束**主库文件**、不约束其**所在目录**；以 `mode=ro` 打开一个
+  `journal_mode=WAL` 的数据库时，SQLite 仍会物化 `-shm`/`-wal` 影子文件。
+- **修复**：`pipeline_lib/db.py` 新增**全仓唯一**只读入口 `open_readonly(db_path)`——WAL **干净**
+  （`<db>-wal` 不存在或 0 字节）时追加 `immutable=1`，SQLite 不再创建/触碰影子文件；WAL **非空**时
+  退回普通 `mode=ro`，保证读到**最新已提交数据**；`immutable=1` 打开/校验失败**降级重试** `mode=ro`；
+  文件缺失 / 非库文件 / 目录一律返回 `None`、**绝不抛**。`evolve._open_ro` 与
+  `pipeline._readonly_db_counts` 改为调用它并删除各自重复实现（`pipeline.py` 不再直接 `import sqlite3`）。
+- **回归**：新增 `scripts/tests/test_readonly_open.py`（10 例：WAL 干净不产生 `-shm`/`-wal`、朴素
+  `mode=ro` 根因锁、WAL 非空读最新、`immutable` 失败降级、缺失/垃圾/目录→`None`、两处委托）。
+  变异复验：把 `open_readonly` 退回朴素 `mode=ro` → 3 例见红（`-shm`/`-wal` 复现），改回即全绿。
+
+### 收尾更正与新增自检（v3.6.0，QA 第 2 轮复核）
+- **优先级定级更正**：`LES-20260915-06`（缺陷 D1）由误标的 `P0` **更正为 `P1`**——按 SKILL.md
+  §3.2 定义，P0 = 丢数据 / 整批失败，而 D1 的真实后果是「只读命令多出 2 个影子文件、主库 md5 未变」，
+  **无数据丢失、无整批失败**。原标 P0 会让这条 occ=1 的条目**立即命中**判据「P0 或 occ≥2」，
+  等于用优先级标签绕过「复现≥2 次」的机械累计。已在条目 `- 关联：` 内**显式写明破格理由**
+  （系人工判断提升、非机械命中，且已追加 pitfalls #48）。
+- **元教训 `LES-20260915-07`**（ops / P2 / open）：记录「优先级标签可被用来换取即时提升」这一
+  机制漏洞；处置待办 = 定级须第二方复核 + 破格须显式记录（已写入 `SKILL.md §3.2` 硬约束 ①②）。
+- **新增第 10 项健康自检 `Skill层只增不减`**：解析 `references/pitfalls.md` 的 `**#N.` 编号，
+  断言**无重复且恰为 `{1..max}`**（缺号=条目被删、重复=被重写）→ 违反时 `evolve --check` rc=1；
+  文件不存在降级 `skipped`、绝不抛。`failure-matrix.md` 使用表格 / 小节编号，**无稳定 `**#N.` 编号**
+  → 明确标注「跳过」，不制造脆弱解析。测试：`tests/test_evolve.py::SkillLayersMonotonicTests`（8 例：
+  连续 ok / 缺号 fail / 重复 fail / 无文件 skipped / failure-matrix 跳过·校验 / 真实副本缺号 fail）
+  + 2 例 CLI 牙齿（pitfalls 缺号 → `evolve --check` rc=1；编号连续 → rc=0）。
+
+### 破坏性变更
+- **无**。`load_library` / `mine_from_db` / `health` 均为向后兼容扩展（新增可选参数/键）；
+  库排序在无计数时退化为原行为。D1 修复只改只读打开方式，命令行为与输出不变。
+
 ## v3.5.0 (2026-09-15) — 自进化环机械化（§3.2 自我迭代协议 + evolve 引擎 / CLI / health 自检 / 报告第十一节）
 
 **背景：自进化环此前只是「纸面约定」，已实证失效**

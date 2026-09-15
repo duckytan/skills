@@ -16,8 +16,9 @@
   §B **绝不抛异常**：文件缺失 / DB 不存在 / 表为空 / 列缺失，一律降级为
      ``ok=False`` + hint。原因是它会被接进 doctor 与批次报告，任何异常都会
      污染主流程（报告必须永远生成成功）。
-  §C **只读优先**：DB 一律以 ``mode=ro`` 打开；落盘动作（append / archive /
-     backfill）一律先备份到 ``references/.backup/``。
+  §C **只读优先**：DB 一律经 ``db.open_readonly`` 只读打开（WAL 干净时用
+     ``immutable=1``，避免物化 ``-shm``/``-wal``；D1）；落盘动作（append /
+     archive / backfill）一律先备份到 ``references/.backup/``。
   §D **机械 vs 人工的边界**：occ 统计 / 归档 / 健康检测 / 候选挖掘 /
      CHANGELOG↔代码 mtime 比对 = 机械自动；判据正文 / 提升决策 = 必须人/AI 写。
      ``evolve --apply`` 绝不自动改 Skill 层正文、绝不自动把 open 改成 promoted。
@@ -36,11 +37,14 @@ from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
 from . import config as C
+from . import db
+from . import pwstats
 
 __all__ = [
-    "LESSON_RE", "OCC_RE", "ARCHIVE_THRESHOLD", "MIN_ENTRIES",
+    "LESSON_RE", "OCC_RE", "SIG_RE", "ARCHIVE_THRESHOLD", "MIN_ENTRIES",
     "Lesson", "parse_lessons", "render_lessons", "promotion_candidates",
     "append_lesson", "archive", "mine_from_db", "health", "evolve",
+    "bump_occ", "draft_lesson", "_signature",
 ]
 
 # ---------------------------------------------------------------------------
@@ -60,6 +64,15 @@ LESSON_RE = re.compile(
 # 正文行：`- 复现：N 次`（复现次数。缺省时 Lesson.occ 记 1，但「是否缺字段」
 # 由 _has_occ_line() 单独判定，health 的 missing_occ_field 要用它）。
 OCC_RE = re.compile(r"^-\s*复现[：:]\s*(\d+)\s*次")
+
+# v3.6.0: 复现指纹行 `- 指纹：<sig>`（可选，放在 `- 关联：` 之后）。指纹把
+# 「同一教训又出现」变成可机械判定：同一 fail_reason 每次归一化出同一指纹，
+# 于是 evolve --apply 能对同一条目 occ 自增，而不是每批新建一条。
+SIG_RE = re.compile(r"^-\s*指纹[：:]\s*(\S+)\s*$")
+
+# 现象 / 关联 行前缀（用于回填指纹时定位插入点）。
+_PHEN_RE = re.compile(r"^-\s*现象[：:]\s*(.*)$")
+_RELATED_RE = re.compile(r"^-\s*关联[：:]")
 
 # lessons.md 超过该行数即应归档（与 SKILL.md §3.1 一致）。
 ARCHIVE_THRESHOLD = 150
@@ -107,6 +120,7 @@ class Lesson:
     body: List[str] = field(default_factory=list)  # 正文原始行（保序、原样，用于 round-trip）
     start: int = 0          # 在原文件中的起始行号（1-based，指向标题行）
     end: int = 0            # 结束行号（不含；1-based 的 [start, end) 区间）
+    sig: str = ""           # 复现指纹（v3.6.0；正文无「- 指纹：」行时为空串）
 
     @property
     def title(self) -> str:
@@ -119,7 +133,7 @@ class Lesson:
             "id": self.id, "date": self.date, "seq": self.seq,
             "category": self.category, "priority": self.priority,
             "status": self.status, "occ": self.occ, "note": self.note,
-            "start": self.start, "end": self.end,
+            "start": self.start, "end": self.end, "sig": self.sig,
         }
 
 
@@ -152,6 +166,23 @@ def _detect_nl(*blocks: str) -> str:
         if b and "\r\n" in b:
             return "\r\n"
     return "\n"
+
+
+# ---------------------------------------------------------------------------
+# §3b 复现指纹（v3.6.0）：把文本归一化成可机械比对的签名
+# ---------------------------------------------------------------------------
+
+def _signature(text: str) -> str:
+    """把现象/根因（或 fail_reason）文本归一化成复现指纹。
+
+    规则：去掉所有空白与标点（``\\W`` 在 Unicode 下并含 CJK 之外的标点/空白）、
+    转小写、截断 80 字符。于是「Wrong password!」与「wrong  password」得到同一
+    指纹，同一 fail_reason 每批复现都能命中同一条目。
+    """
+    if not text:
+        return ""
+    normalized = re.sub(r"\W+", "", text, flags=re.UNICODE)
+    return normalized.lower()[:80]
 
 
 def _has_occ_line(lesson: Lesson) -> bool:
@@ -189,16 +220,22 @@ def parse_lessons(path: str) -> Tuple[str, List[Lesson], str]:
         next_i = heads[k + 1][0] if k + 1 < len(heads) else len(lines)
         body = list(lines[i + 1:next_i])
         occ = 1
+        sig = ""
         for bl in body:
             mo = OCC_RE.match(bl)
             if mo:
                 occ = int(mo.group(1))
                 break
+        for bl in body:
+            ms = SIG_RE.match(bl)
+            if ms:
+                sig = ms.group(1)
+                break
         lessons.append(Lesson(
             id=m.group("id"), date=m.group("date"), seq=int(m.group("seq")),
             category=m.group("category"), priority=m.group("priority"),
             status=m.group("status"), occ=occ, note=m.group("note"),
-            body=body, start=i + 1, end=next_i + 1))
+            body=body, start=i + 1, end=next_i + 1, sig=sig))
 
     first = heads[0][0] if heads else len(lines)
     header_lines = lines[:first]
@@ -375,22 +412,43 @@ def archive(path: str, archive_path: Optional[str] = None, force: bool = False) 
 # ---------------------------------------------------------------------------
 
 def _open_ro(db_path: str):
-    """以 ``mode=ro`` 只读打开 SQLite；文件不存在或打不开返回 ``None``（绝不抛）。"""
-    if not os.path.isfile(db_path):
-        return None
-    try:
-        uri = "file:%s?mode=ro" % db_path.replace("\\", "/")
-        conn = sqlite3.connect(uri, uri=True)
-        conn.row_factory = sqlite3.Row
-        return conn
-    except sqlite3.Error:
-        return None
+    """以**只读**方式打开 SQLite；文件不存在或打不开返回 ``None``（绝不抛）。
+
+    D1 修复：真正的只读打开逻辑集中在 :func:`pipeline_lib.db.open_readonly`
+    （WAL 干净才 ``immutable=1``，否则退回 ``mode=ro``，失败再降级），本函数
+    仅保留薄封装以维持既有调用点与返回语义，避免重复实现再次引入 D1。
+    """
+    return db.open_readonly(db_path)
 
 
 def _empty_mine(batch) -> dict:
     return {"batch": batch, "errors": [], "fail_reasons": [],
             "new_fail_reasons": [], "dup_hits": 0, "deletes": 0,
-            "files_total": 0, "detail": ""}
+            "files_total": 0, "detail": "",
+            "pw_gaps": {"db_only": [], "learned_total": 0,
+                        "db_success_total": 0}}
+
+
+def _pw_gaps(conn) -> dict:
+    """v3.6.0: 密码学习缺口（DB 成功过、但不在 learned 库里的密码）。
+
+    **只读**，DB/learned 不可用一律降级为空结构，绝不抛。
+    """
+    empty = {"db_only": [], "learned_total": 0, "db_success_total": 0}
+    if conn is None:
+        return empty
+    try:
+        from . import pwstats
+        db_counts = pwstats.counts_from_db(conn)
+        learned = pwstats.read_counts(pwstats.learned_path())
+    except Exception:  # noqa: BLE001
+        return empty
+    db_only = []
+    for pw, c in sorted(db_counts.items(), key=lambda kv: -kv[1]):
+        if pw not in learned:
+            db_only.append({"password": pw, "count": c, "in_learned": False})
+    return {"db_only": db_only, "learned_total": len(learned),
+            "db_success_total": sum(db_counts.values())}
 
 
 def mine_from_db(conn, batch: Optional[str] = None) -> dict:
@@ -493,6 +551,9 @@ def mine_from_db(conn, batch: Optional[str] = None) -> dict:
         out["files_total"] = scalar(
             "SELECT COUNT(*) FROM files WHERE batch=?", (b,))
 
+        # -- v3.6.0: 密码学习缺口（DB 成功过但不在 learned 库） --------------
+        out["pw_gaps"] = _pw_gaps(conn)
+
     except sqlite3.Error as exc:
         out["detail"] = "db error: %s" % exc
     return out
@@ -535,6 +596,92 @@ def _latest_code_date(skill_root: str) -> str:
 def _stale_cutoff() -> str:
     """今天 -30 天的 ``YYYYMMDD``（用于 stale_open）。"""
     return time.strftime("%Y%m%d", time.localtime(time.time() - 30 * 86400))
+
+
+# ---------------------------------------------------------------------------
+# §7b 第 10 项辅助：Skill 层「只增不减」编号自检（v3.6.0）
+# 铁律「只补丁，不重写」——提升只追加条目；pitfalls.md 用全局连续编号
+# （每行 `**#N. 标题**`），删条目/重排会立刻造成缺号或重复，必须机械拦截。
+# ---------------------------------------------------------------------------
+_PITFALL_NUM_RE = re.compile(r"^\*\*#(\d+)\.")
+
+
+def _numbered_entry_ids(path: str) -> Optional[List[int]]:
+    """提取 ``**#N.`` 形式的条目编号；文件不存在 → ``None``，无匹配 → ``[]``。"""
+    if not os.path.isfile(path):
+        return None
+    try:
+        text = _read_text(path)
+    except OSError:
+        return []
+    out: List[int] = []
+    for line in text.splitlines():
+        m = _PITFALL_NUM_RE.match(line.lstrip())
+        if m:
+            out.append(int(m.group(1)))
+    return out
+
+
+def _fmt_num_list(nums) -> str:
+    """编号列表紧凑展示（超过 12 个截断）。"""
+    ordered = sorted(nums)
+    head = "、".join(str(n) for n in ordered[:12])
+    return head + ("…(共 %d 个)" % len(ordered) if len(ordered) > 12 else "")
+
+
+def _monotonic_problems(nums: List[int]) -> List[str]:
+    """编号须**无重复**且恰为 ``{1..max}``（连续无缺号）；返回问题描述（空=合格）。"""
+    if not nums:
+        return []
+    seen = set(nums)
+    dup = sorted({n for n in nums if nums.count(n) > 1})
+    missing = [n for n in range(1, max(nums) + 1) if n not in seen]
+    problems: List[str] = []
+    if dup:
+        problems.append("重复编号 #%s" % _fmt_num_list(dup))
+    if missing:
+        problems.append("缺号 #%s" % _fmt_num_list(missing))
+    return problems
+
+
+def _skill_layers_monotonic_check(refs: str) -> dict:
+    """第 10 项（v3.6.0）：Skill 层「只增不减」的机械护栏。
+
+    * ``pitfalls.md``：编号必须**无重复**且恰为 ``{1..max}``；违反 → ``ok=False``
+      （因此 ``evolve --check`` rc=1——删条目/重排即违反「只补丁不重写」铁律）。
+      文件不存在 → ``ok=True, detail="skipped (no pitfalls.md)"``，绝不抛。
+    * ``failure-matrix.md``：做**同样的尝试**。它用的是表格/小节编号而非
+      ``**#N.``，无稳定同类编号 → 明确标注「无稳定编号，跳过」，**不硬做**。
+    """
+    pit = os.path.join(refs, "pitfalls.md")
+    nums = _numbered_entry_ids(pit)
+
+    fm = os.path.join(refs, "failure-matrix.md")
+    fm_nums = _numbered_entry_ids(fm)
+    if fm_nums is None:
+        fm_note = "；failure-matrix.md 不存在"
+    elif not fm_nums:
+        fm_note = "；failure-matrix.md 无稳定 `**#N.` 编号，跳过"
+    else:
+        fm_note = "；failure-matrix.md 编号 %d 条（同规则校验）" % len(fm_nums)
+
+    if nums is None:
+        return _chk("Skill层只增不减", True,
+                    "skipped (no pitfalls.md)" + fm_note, "")
+
+    problems = _monotonic_problems(nums)
+    if fm_nums:
+        problems += ["failure-matrix " + p for p in _monotonic_problems(fm_nums)]
+    if problems:
+        detail = ("pitfalls.md 编号 %d 条，" % len(nums)
+                  + "；".join(problems) + fm_note)
+        hint = ("Skill 层铁律「只补丁不重写」被破坏：缺号=条目被删、重复=被重写；"
+                "请恢复被删条目或把编号改回连续（提升只追加，绝不改既有条目）")
+    else:
+        detail = "pitfalls.md 编号 %d 条，1..%d 连续无重复%s" % (
+            len(nums), (max(nums) if nums else 0), fm_note)
+        hint = ""
+    return _chk("Skill层只增不减", not problems, detail, hint)
 
 
 def health(skill_root: str, root: Optional[str] = None, conn=None) -> dict:
@@ -673,6 +820,49 @@ def health(skill_root: str, root: Optional[str] = None, conn=None) -> dict:
         "lessons-archive.md %s" % ("存在" if archive_exists else "不存在"),
         "lessons.md 已超阈值却没归档：跑 `python pipeline.py evolve --apply`"))
 
+    # 9) 密码库 (v3.6.0) ----------------------------------------------------
+    # 只做「可解析 / 无重复 / count 降序」三项硬检查；「漏学」只作 hint、**不计入
+    # problems**（不阻塞）。import / DB 不可用一律降级为 ok=True, detail="skipped"，
+    # 绝不让自进化健康度因密码库而崩。
+    try:
+        from . import pwstats as _pwstats
+        from . import passwords as _pw_mod
+        lp = _pwstats.learned_path(skill_root)
+        _ph, pw_entries, _pf = _pwstats.parse_learned(lp)
+        pw_list = [e.password for e in pw_entries if e.password]
+        dup_pw = len(pw_list) != len(set(pw_list))
+        cnt_seq = [e.count for e in pw_entries]
+        desc_ok = all(cnt_seq[i] >= cnt_seq[i + 1]
+                      for i in range(len(cnt_seq) - 1))
+        gaps = 0
+        try:
+            if conn is not None:
+                db_counts = _pwstats.counts_from_db(conn)
+                libset = set(_pw_mod.load_library(root=root, workdir=root)) \
+                    if root else set(pw_list)
+                gaps = sum(1 for pw in db_counts if pw not in libset)
+        except Exception:  # noqa: BLE001
+            gaps = 0
+        pw_ok = (not dup_pw) and desc_ok
+        detail = "learned %d 条（重复 %d / 降序 %s）"
+        if gaps:
+            hint = ("%d 个已验证密码未入库，运行 pipeline.py pw-stats --rebuild"
+                    % gaps)
+        else:
+            hint = ""
+        checks.append(_chk(
+            "密码库", pw_ok,
+            detail % (len(pw_entries), 1 if dup_pw else 0,
+                      "是" if desc_ok else "否"),
+            hint))
+    except Exception as exc:  # noqa: BLE001 — 降级：不因密码库崩溃
+        checks.append(_chk("密码库", True, "skipped (%s)" % exc, ""))
+
+    # 10) Skill层只增不减 (v3.6.0) -----------------------------------------
+    # 铁律「只补丁不重写」的机械护栏：pitfalls.md 编号须连续无重复（缺号=被删、
+    # 重复=被重写）→ 有牙齿，违反时 evolve --check rc=1。失败绝不抛。
+    checks.append(_skill_layers_monotonic_check(refs))
+
     ok = all(c["ok"] for c in checks)
     return {"checks": checks, "ok": ok, **counts}
 
@@ -687,27 +877,192 @@ def _default_skill_root() -> str:
     return os.path.dirname(os.path.dirname(os.path.dirname(here)))
 
 
+def _phenomenon_of(lesson: Lesson) -> str:
+    """取条目「现象」文本（供回填指纹用）；没有现象行时退回 id（保证唯一）。"""
+    for line in lesson.body:
+        m = _PHEN_RE.match(line)
+        if m:
+            return m.group(1)
+    return lesson.id
+
+
+def _set_occ_line(lesson: Lesson, new_occ: int) -> None:
+    """把条目的 `- 复现：N 次` 行改写为 ``new_occ``；缺行时在尾部补一行。"""
+    for i, bl in enumerate(lesson.body):
+        if OCC_RE.match(bl):
+            lesson.body[i] = "- 复现：%d 次" % new_occ
+            return
+    idx = len(lesson.body)
+    while idx > 0 and lesson.body[idx - 1].strip() == "":
+        idx -= 1
+    lesson.body.insert(idx, "- 复现：%d 次" % new_occ)
+
+
+def _insert_sig_line(lesson: Lesson, sig: str) -> None:
+    """在 `- 关联：` 之后插入 `- 指纹：<sig>`；无关联行时插在尾部（跳过空行）。"""
+    line = "- 指纹：%s" % sig
+    for i, bl in enumerate(lesson.body):
+        if _RELATED_RE.match(bl):
+            lesson.body.insert(i + 1, line)
+            return
+    idx = len(lesson.body)
+    while idx > 0 and lesson.body[idx - 1].strip() == "":
+        idx -= 1
+    lesson.body.insert(idx, line)
+
+
+def _has_sig_line(lesson: Lesson) -> bool:
+    """该条目正文里是否**显式**写了「- 指纹：」行。"""
+    for line in lesson.body:
+        if SIG_RE.match(line):
+            return True
+    return False
+
+
 def _backfill_occ(path: str) -> List[str]:
-    """给缺「- 复现：N 次」字段的条目补上默认值（写前备份）。"""
+    """补全缺字段：`- 复现：N 次`（默认 1）**以及** `- 指纹：<sig>`（v3.6.0）。
+
+    指纹由条目的「现象」文本归一化而来；老条目没有指纹时顺带回填，让后续
+    ``bump_occ`` 能机械匹配。写前备份。
+    """
     try:
         parse_lessons(path)
     except OSError as exc:
         return ["backfill_occ: skipped (%s)" % exc]
     header, lessons, footer = parse_lessons(path)
-    n = 0
+    n_occ = 0
+    n_sig = 0
     for ls in lessons:
-        if _has_occ_line(ls):
-            continue
-        idx = len(ls.body)
-        while idx > 0 and ls.body[idx - 1].strip() == "":
-            idx -= 1
-        ls.body.insert(idx, "- 复现：%d 次" % ls.occ)
-        n += 1
-    if n == 0:
+        if not _has_occ_line(ls):
+            _set_occ_line(ls, ls.occ)
+            n_occ += 1
+        if not _has_sig_line(ls):
+            sig = _signature(_phenomenon_of(ls))
+            if sig:
+                _insert_sig_line(ls, sig)
+                ls.sig = sig
+                n_sig += 1
+    if n_occ == 0 and n_sig == 0:
         return ["backfill_occ: 无需补全"]
     backup = _backup(path)
     _write_text(path, render_lessons(header, lessons, footer))
-    return ["backfill_occ: 补全 %d 条，备份 %s" % (n, backup)]
+    return ["backfill_occ: 补 %d 条 occ + %d 条指纹，备份 %s" % (n_occ, n_sig, backup)]
+
+
+def bump_occ(path: str, sig: str, n: int = 1) -> dict:
+    """按指纹找到条目：``occ += n``，重写 `- 复现：N 次` 行（写前备份）。
+
+    返回值::
+
+        {'matched':bool,'id':str,'old_occ':int,'new_occ':int,
+         'crossed':bool,   # 从 <2 跨到 >=2 且 priority in ('P0','P1')
+         'backup':str}
+
+    未匹配 → ``matched=False`` 且**不动文件**。
+    """
+    result = {"matched": False, "id": "", "old_occ": 0, "new_occ": 0,
+              "crossed": False, "backup": None}
+    if not sig:
+        return result
+    try:
+        header, lessons, footer = parse_lessons(path)
+    except OSError:
+        return result
+
+    target = None
+    for ls in lessons:
+        if ls.sig and ls.sig == sig:
+            target = ls
+            break
+    if target is None:
+        return result
+
+    old = target.occ
+    new = old + int(n)
+    _set_occ_line(target, new)
+    target.occ = new
+    crossed = (old < 2 <= new) and target.priority in ("P0", "P1")
+
+    backup = _backup(path)
+    _write_text(path, render_lessons(header, lessons, footer))
+    result.update(matched=True, id=target.id, old_occ=old, new_occ=new,
+                  crossed=crossed, backup=backup)
+    return result
+
+
+# fail_reason → 机器草稿优先级映射（写死；依据 SKILL.md §3.1 优先级定义：
+# P0=丢数据/整批失败；P1=大批次产出错误；P2=效率/体验）。
+_P0_TOKENS = ("CORRUPT", "LOST", "DATA", "MISSING")
+_P1_TOKENS = ("WRONG_PASSWORD", "PASSWORD", "EXTRACT", "FAIL")
+
+
+def _priority_for_fail(fail_reason: str) -> str:
+    """按 fail_reason 关键词映射机器草稿优先级（见上方依据注释）。"""
+    up = (fail_reason or "").upper()
+    if any(t in up for t in _P0_TOKENS):
+        return "P0"
+    if any(t in up for t in _P1_TOKENS):
+        return "P1"
+    return "P2"
+
+
+def draft_lesson(path: str, fail_reason: str, count: int,
+                 sample: str = "") -> dict:
+    """为「从未记录过的 fail_reason」自动追加一条机器草稿条目。
+
+    类别固定 ``bug``，优先级按 ``_priority_for_fail`` 映射，状态 ``open``，
+    ``- 复现：count 次``，并写入 ``- 指纹：_signature(fail_reason)``（**这是机械
+    累计的关键**：下一批同一 fail_reason 会因同指纹命中本条目而 occ 自增，
+    而不是再新建）。根因与处置必须写明是机器草稿、需人补充。
+
+    返回 ``{'id','appended':bool,'skipped_reason'}``；已存在同指纹 → ``appended=False``。
+    """
+    result = {"id": "", "appended": False, "skipped_reason": ""}
+    sig = _signature(fail_reason)
+    if not sig:
+        result["skipped_reason"] = "empty signature"
+        return result
+    try:
+        header, lessons, footer = parse_lessons(path)
+    except OSError as exc:
+        result["skipped_reason"] = "cannot read lessons: %s" % exc
+        return result
+
+    for ls in lessons:
+        if ls.sig and ls.sig == sig:
+            result["id"] = ls.id
+            result["skipped_reason"] = "same signature already recorded"
+            return result
+
+    date = time.strftime("%Y%m%d")
+    same_day = [ls.seq for ls in lessons if ls.date == date]
+    seq = (max(same_day) + 1) if same_day else 1
+    new_id = "LES-%s-%02d" % (date, seq)
+
+    phenomenon = "自动采集：本批出现 %s ×%d 次" % (fail_reason, int(count))
+    if sample:
+        phenomenon += "（样例：%s）" % sample
+    body = [
+        "- 现象：%s" % phenomenon,
+        "- 根因：待定位（机器草稿，需人工/助手补写）",
+        "- 处置：待办（机器草稿）",
+        "- 关联：%s" % fail_reason,
+        "- 指纹：%s" % sig,
+        "- 复现：%d 次" % int(count),
+    ]
+    if lessons and lessons[-1].body and lessons[-1].body[-1].strip() != "":
+        lessons[-1].body.append("")
+
+    new = Lesson(id=new_id, date=date, seq=seq, category="bug",
+                 priority=_priority_for_fail(fail_reason), status="open",
+                 occ=int(count), note="", body=body, start=0, end=0, sig=sig)
+
+    backup = _backup(path)
+    lessons.append(new)
+    _write_text(path, render_lessons(header, lessons, footer))
+    result.update(id=new_id, appended=True)
+    result["backup"] = backup
+    return result
 
 
 def evolve(root: Optional[str] = None, skill_root: Optional[str] = None,
@@ -715,8 +1070,16 @@ def evolve(root: Optional[str] = None, skill_root: Optional[str] = None,
            force: bool = False) -> dict:
     """总入口：健康度 + 本批候选素材 + 待提升清单 → 一份可读结果 dict。
 
-    ``apply=True`` 时执行**机械动作**（补 occ 字段 + 归档），但**绝不自动改
-    Skill 层正文、绝不自动把 open 改成 promoted**——提升判据必须由人/AI 补丁式写。
+    ``apply=True`` 时执行**机械动作**（v3.6.0 扩展）：
+
+      a. ``_backfill_occ``：补 `- 复现：N 次` 与 `- 指纹：<sig>`；
+      b. 对 ``mine['fail_reasons']`` 每项按指纹 ``bump_occ``（命中自增）或
+         ``draft_lesson``（未命中则落一条机器草稿，自带同一指纹）；
+      c. ``archive``：把 promoted/resolved 归档到 ``lessons-archive.md``。
+
+    但**绝不自动改 Skill 层正文、绝不自动把 open 改成 promoted**——提升判据
+    必须由人/AI 补丁式写。``apply=False``（含 ``evolve --check``）为**纯只读**，
+    不写盘。所有写盘动作写前必备份到 ``references/.backup/``。
     """
     if not skill_root:
         skill_root = _default_skill_root()
@@ -741,6 +1104,33 @@ def evolve(root: Optional[str] = None, skill_root: Optional[str] = None,
         applied: List[str] = []
         if apply:
             applied.extend(_backfill_occ(lessons_path))
+
+            # v3.6.0 (Part B2): 机械累计复现次数 —— 对每个本批 fail_reason，
+            # 用其指纹去找已有条目：命中则 occ 自增，未命中则落一条机器草稿
+            # （草稿自带同一指纹，下一批复现即自增，而不是再新建）。
+            for fr in (mine.get("fail_reasons") or []):
+                reason = fr.get("fail_reason")
+                cnt = int(fr.get("count") or 0)
+                if not reason:
+                    continue
+                sig = _signature(reason)
+                if not sig:
+                    continue
+                b = bump_occ(lessons_path, sig, n=cnt)
+                if b.get("matched"):
+                    applied.append(
+                        "bump_occ: %s occ %d->%d%s"
+                        % (b["id"], b["old_occ"], b["new_occ"],
+                           " (crossed)" if b.get("crossed") else ""))
+                else:
+                    d = draft_lesson(lessons_path, reason, cnt)
+                    if d.get("appended"):
+                        applied.append("draft_lesson: %s <- %s x%d"
+                                       % (d["id"], reason, cnt))
+                    else:
+                        applied.append("draft_lesson: skip %s (%s)"
+                                       % (reason, d.get("skipped_reason", "")))
+
             r = archive(lessons_path, force=force)
             applied.append(
                 "archive: moved=%d%s"

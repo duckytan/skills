@@ -364,6 +364,29 @@ def generate_report(pipe) -> str:
         if mine.get("detail"):
             L.append("  - note：%s" % mine["detail"])
 
+        # v3.6.0 Part A/B: 本批密码自学习明细 + 密码学习缺口。
+        pw_rows = q("SELECT file_id, message FROM events WHERE batch=?"
+                    " AND action='PW_LEARNED' ORDER BY id", (batch,))
+        if pw_rows:
+            L.append("- 本批密码自学习（%d 条，解压成功入库）：" % len(pw_rows))
+            for r in pw_rows[:12]:
+                L.append("    - #%s %s" % (r["file_id"] or "-", r["message"]))
+        pw_gaps = (mine.get("pw_gaps") or {})
+        db_only = pw_gaps.get("db_only") or []
+        if db_only:
+            L.append("- ⚠ 密码学习缺口：%d 个已验证成功密码未入 learned 库"
+                     "（运行 `pipeline.py pw-stats --rebuild` 回填）：%s"
+                     % (len(db_only),
+                        "、".join("%s×%d" % (g["password"], g["count"])
+                                  for g in db_only[:10])))
+
+        # v3.6.0 Part B: 本批自动执行的机械动作（occ 自增 / 机器草稿 / 归档）。
+        applied = ev.get("applied") or []
+        if applied:
+            L.append("- 自进化机械动作（evolve --apply）：")
+            for a in applied:
+                L.append("    - %s" % a)
+
         cands = ev.get("candidates") or []
         if cands:
             L.append("- 待提升教训（P0 或复现 ≥2）：")

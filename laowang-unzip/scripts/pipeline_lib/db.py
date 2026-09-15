@@ -10,6 +10,10 @@ Design rules enforced here:
   may UPDATE ``files.status`` directly.
 * Single writer: the pipeline is strictly single-threaded, so one connection
   suffices; WAL keeps read-only queries (status/report) non-blocking.
+* Single read-only opener: every read-only consumer (``pw-stats`` / ``evolve`` /
+  ``doctor``) MUST go through :func:`open_readonly`, which is WAL-aware and never
+  materialises ``-shm`` / ``-wal`` for a clean WAL (defect D1).  Do NOT open a
+  ``mode=ro`` URI directly anywhere else.
 """
 
 from __future__ import annotations
@@ -141,6 +145,88 @@ CREATE INDEX IF NOT EXISTS ix_events_batch ON events(batch);
 
 def now_iso() -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+
+
+def _connect_readonly(abs_path_uri: str, immutable: bool):
+    """按需拼 ``immutable=1`` 打开只读 URI；打不开/非库返回 ``None``（绝不抛）。
+
+    ``sqlite3.connect`` 对「非 SQLite 文件」是**惰性**的——连接会成功，直到首个
+    查询才报错。这里做一次极轻量的 ``sqlite_master`` 校验，确保返回的连接确实
+    指向一个可读的 SQLite 库；失败即关闭并返回 ``None``。
+
+    Args:
+        abs_path_uri: 已把反斜杠换成 ``/`` 的绝对路径（URI 用）。
+        immutable: ``True`` 时追加 ``&immutable=1``。
+
+    Returns:
+        已设置 ``row_factory`` 且通过校验的只读连接；否则 ``None``。
+    """
+    suffix = "&immutable=1" if immutable else ""
+    uri = "file:%s?mode=ro%s" % (abs_path_uri, suffix)
+    conn = None
+    try:
+        conn = sqlite3.connect(uri, uri=True)
+        conn.row_factory = sqlite3.Row
+        conn.execute("SELECT count(*) FROM sqlite_master").fetchone()
+        return conn
+    except sqlite3.Error:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:  # noqa: BLE001
+                pass
+        return None
+
+
+def open_readonly(db_path: str):
+    """以**只读**方式打开 SQLite —— 全仓唯一的只读打开入口（缺陷 D1 修复）。
+
+    只读承诺背景：``pw-stats`` / ``evolve`` / ``doctor`` 等命令对外承诺「绝不写
+    用户工作区」，但以 ``mode=ro`` 打开一个 ``journal_mode=WAL`` 的库时，SQLite
+    仍会物化 ``-shm`` / ``-wal`` 影子文件（即便没有任何写入），从而在用户生产
+    目录里凭空多出两个文件（缺陷 D1，P0）。
+
+    对策——**按 WAL 是否干净分流**：
+
+    * WAL **干净**（``<db>-wal`` 不存在或 0 字节）：追加 ``immutable=1`` 打开，
+      SQLite 不再创建/触碰 ``-shm``、``-wal``（只读承诺成立）；
+    * WAL **非空**（有活跃写者 / 脏关库）：退回普通 ``mode=ro``，以便读取最新
+      已提交数据（此时可能产生 ``-shm``，但**数据正确性优先于零副作用**）；
+    * ``immutable=1`` 打开失败（老 SQLite / 特殊文件系统）：降级重试 ``mode=ro``。
+
+    本函数**绝不抛异常**：文件不存在、路径非法、库损坏等一律返回 ``None``，由
+    调用方降级为「空统计 / 空挖掘结果」。
+
+    Args:
+        db_path: SQLite 数据库文件路径；可为空串/``None``。
+
+    Returns:
+        已设置 ``row_factory = sqlite3.Row`` 的 ``sqlite3.Connection``；
+        无法以只读方式打开时返回 ``None``。
+    """
+    try:
+        if not db_path:
+            return None
+        db_path = os.fspath(db_path)
+        if not os.path.isfile(db_path):
+            return None
+        abs_uri = os.path.abspath(db_path).replace("\\", "/")
+        # WAL 是否干净：不存在或 0 字节即「干净」。拿不准（getsize 失败）时按
+        # 非干净处理，退回 mode=ro 以保证读到最新已提交数据。
+        wal_clean = True
+        try:
+            wal_path = db_path + "-wal"
+            wal_clean = (not os.path.isfile(wal_path)) or \
+                os.path.getsize(wal_path) == 0
+        except OSError:
+            wal_clean = False
+        if wal_clean:
+            conn = _connect_readonly(abs_uri, immutable=True)
+            if conn is not None:
+                return conn
+        return _connect_readonly(abs_uri, immutable=False)
+    except Exception:  # noqa: BLE001 —— 只读入口绝不抛，异常一律降级 None
+        return None
 
 
 class Database:

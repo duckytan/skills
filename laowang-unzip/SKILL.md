@@ -8,7 +8,7 @@ description: >-
   详细判据见 references/，接口约定见 references/scripts-api.md，完整设计见 references/design-v2.1.md。
 ---
 
-# 伪装压缩包批量整理（通用版 v3）
+# 伪装压缩包批量整理（通用版 v3 · skill 3.6.0）
 
 > ## ⚠️ 平台：Windows 专用（Q1 拍板 2026-09-09）
 > 本 skill 的**删除与回收站语义只在 Windows 上完整成立**：
@@ -89,6 +89,11 @@ python pipeline.py add-password "<密码>" --root <处理根>
 
 # 入库 + 立刻拿新密码去试所有密码失败的包；命中的自动重新排队（PW_HIT_RETRY）
 python pipeline.py add-password "<密码>" --test --root <处理根> [--sevenzip <7z路径>]
+
+# v3.6.0：看密码库（按成功解压次数降序）；校正/回填自学习层；机械自检
+python pipeline.py pw-stats [--top N] [--json] [--root <处理根>]
+python pipeline.py pw-stats --rebuild --root <处理根>   # 只写 assets/passwords.learned.txt，绝不写 DB
+python pipeline.py pw-stats --verify                    # rc 0=OK
 ```
 
 - 文件按需创建，**一条一行、UTF-8、自动去重**（重复执行不会写第二条）。
@@ -157,8 +162,11 @@ CLI 入口 `python pipeline.py evolve`：
 | 提升决策 + 判据正文 | —（`--apply` **绝不**自动改 Skill 层正文） | ★ 补丁式写 pitfalls / failure-matrix / SKILL.md |
 | 条目状态 `open→promoted` | —（`--apply` **绝不**自动改状态） | ★ 处置到位后手工改那一行 |
 | 归档 promoted/resolved | `archive`（超 150 行自动；`--force` 强制；**写前必备份**） | 决定何时执行 |
-| 健康度自检 | `health`（8 项检查；接进 `doctor` 第 7 项**仅提示**、报告第十一节；**收尾闸口用 `evolve --check`**） | — |
+| 健康度自检 | `health`（10 项检查，含第 10 项「Skill层只增不减」编号连续性护栏；接进 `doctor` 第 7 项**仅提示**、报告第十一节；**收尾闸口用 `evolve --check`**） | — |
 | 本批候选素材挖掘 | `mine_from_db`（**只读**：errors / fail_reasons / 新错误形态） | 判断"哪些值得记成教训" |
+| 复现次数自增 | `bump_occ`（按 `- 指纹：<sig>` 匹配同一条目 occ += 本批次数） | —（同一根因判定由指纹机械完成） |
+| 新形态落草稿 | `draft_lesson`（未记录过的 fail_reason 自动落 `open` 草稿，根因/处置留待人工） | ★ 补写草稿的根因/处置 |
+| 收尾自动触发 | `run` 收尾自动跑 `evolve --apply`（`--no-evolve` 跳过；异常只告警） | — |
 | 版本 vs 代码一致性 | `health` 的 `changelog_vs_code`（比对 CHANGELOG 日期与 `scripts/**/*.py` 最新 mtime） | 决定版本号并写条目 |
 
 ### 3.2 自我迭代协议（遇到问题后的标准动作）
@@ -166,6 +174,9 @@ CLI 入口 `python pipeline.py evolve`：
 > **触发**：修了 bug / 用户纠正了 AI 的做法与判断 / 出现新的错误形态 / 改了判据。
 > **硬约束：任何一次修 bug 之后，未走完 ①–⑤ 视为任务未完成。**
 > 机械动作只兜底，判据正文与提升决策必须人/AI 补丁式写——「有牙齿」不等于「无人」。
+> **v3.6.0：机械动作已自动化。** `run` 收尾会自动执行一次 `evolve --apply`
+> （`--no-evolve` 可跳过），因此「复现次数自增 / 新错误形态落机器草稿 / 归档」都不再
+> 依赖人记得敲命令；**人只负责补写根因/处置与提升决策**（`open → promoted` 与判据正文）。
 
 1. **定位根因（禁止拍脑袋）**：先用探针/最小复现把根因钉死（改哪一行、什么条件下触发）。
    拿不准的写进条目写作「根因（待定）」并列备选假设，别假装已知。
@@ -179,11 +190,17 @@ CLI 入口 `python pipeline.py evolve`：
    （`bug`→pitfalls 追加编号 / `limit`→failure-matrix 补枚举 / `ops`→SKILL.md §3 判据列 /
    `user`→SKILL.md §5），然后把条目状态改成 `promoted`（手工改；`evolve --apply` 不代劳）。
    **只补丁，不重写**——正式文档是实测判据权威。
+   - **硬约束①（破格必须显式记录）**：凡**破格提升**（不满足「P0 或 `occ>=2`」而**人工**
+     提升的条目）**必须在条目内显式写明破格理由**；不得靠**虚标 P0** 换取即时提升。
+   - **硬约束②（定级须第二方复核）**：条目的**优先级定级必须经第二方（QA 或用户）复核**，
+     不得由写教训的人**单方拍定**，更不得为**凑提升条件**而虚标 P0。
 5. **记版本 + 闸口归零**：`CHANGELOG.md` 顶部加一条版本条目（含 commit hash 位），
    然后跑 `python pipeline.py evolve --check`：返回 0 才算本轮自进化闭环完成（非 0 看提示补漏）。
 
-机械治理一条命令：`python pipeline.py evolve --apply`（补 `- 复现：N 次` + 归档
-promoted/resolved；**写前自动备份**到 `references/.backup/`；不改正文、不改状态）。
+机械治理一条命令：`python pipeline.py evolve --apply`（补 `- 复现：N 次` / `- 指纹：<sig>`
++ 按指纹对同一条目 **occ 自增** + 为新形态落**机器草稿** + 归档 promoted/resolved；
+**写前自动备份**到 `references/.backup/`；不改正文、不改状态）。**v3.6.0 起 `run` 收尾会
+自动跑一遍它**（`--no-evolve` 跳过），失败只告警、绝不影响批次与返回码。
 
 ## 4. 配置全表（config.py 默认值，全部可被 `config.local.json` 覆盖）
 
@@ -290,6 +307,38 @@ root 未知时另按序搜索指针文件：`./pipeline/` → `./` → `<skill>/
 
 `doctor` 第 6 项会把上述来源按合并顺序列出并标注是否存在，可直接用来排查"密码没被加载"。
 
+### 5.1 密码库优先级 = 成功解压次数降序（v3.6.0 自学习层）
+
+**规则**：库里每个密码都带一个「成功解压次数」，试解时**次数多的排前面、优先尝试**。
+用得越多 → 排序越准 → 试解越快，这是一个闭环自优化。
+
+- **自学习层文件**：`assets/passwords.learned.txt`（**机器维护、UTF-8/LF**）。
+  格式（注释行 `#` 开头；数据行 **TAB 分隔 4 列**，落盘按 count 降序）：
+  ```
+  # 格式： <成功次数>\t<密码>\t<最近成功日期 YYYY-MM-DD>\t<来源标签,逗号分隔>
+  188	上老王论坛当老王	2026-09-15	LIBRARY,INHERITED
+  ```
+  **谁写它**：① 每次解压成功（`is_extracted=1`）后由 `scheduler._learn_password`
+  自动 +1（幂等：同一 `file_id` 只记一次，靠 `PW_LEARNED` 事件守卫；`--dry-run`
+  **不写**）；② `python pipeline.py pw-stats --rebuild` 用 DB 口径**单调**校正
+  （只升不降，绝不覆盖更高的已有值）。**人不要手改**它——手动加密码仍走
+  `add-password`（写 `assets/passwords.local.txt`）。
+- **合并顺序（label）**：`external → local(skill) → learned → local(root) →
+  workdir password.txt → builtin`；合并去重后按次数**降序**重排（同次数保持原相对序）。
+- **显式信号仍优先于库**：候选来源顺序 `NONE → INHERITED → TRAIL_BRACKET →
+  文件名/目录名抠码 → LIBRARY` **保持不变**。即：**只有 LIBRARY 段内部按次数排序**，
+  文件名里写明的密码永远先于库里"更热门"的密码试——否则一个高产密码会盖过当前
+  包自己名字里给的答案（刻意决定，勿改）。理由：显式名/父包信号是**本包**的高置信
+  证据，库只是**先验**。
+- **运维命令**：
+  - `python pipeline.py pw-stats`：按优先级打印合并后的库（序号/次数/来源/密码）+ 统计；
+  - `python pipeline.py pw-stats --rebuild`：把 DB 里成功过的密码回填/校正进 learned
+    （**只写 learned 文件，绝不写 DB**）；历史批次后建议跑一次补齐；
+  - `python pipeline.py pw-stats --verify`：机械自检（可解析 / 无重复 / count 降序 /
+    合并库不丢密码），rc 0=OK。
+- `doctor` 第 6 项与 `evolve` 健康度第 9 项（「密码库」）会盘点 learned 层；DB 里
+  成功过却未入库的密码会作**提示**（hint），不阻塞。
+
 密码命中即明文落库（`password` + `password_source`）。判密码对错**只能用 `7z t`**（rc=0 且含
 `Everything is Ok`），`7z l` 对 zip 错密码也 rc=0（文件名未加密），是假成功（pitfalls #14）。
 
@@ -355,7 +404,8 @@ laowang-unzip/
 ├── README.md / LICENSE / CHANGELOG.md
 ├── assets/
 │   ├── passwords.txt           ← 20 条内置种子密码（只读发布物）
-│   └── passwords.local.txt     ← 用户个人密码库（git-ignored，优先合并）
+│   ├── passwords.local.txt     ← 用户个人密码库（git-ignored，优先合并）
+│   └── passwords.learned.txt   ← ★ 自学习密码库（机器维护，按成功次数降序；v3.6.0）
 ├── references/
 │   ├── design-v2.1.md          ← 完整设计文档（DDL / 伪代码 / 全部判据的出处）
 │   ├── scripts-api.md          ← ★ 实现契约 v2：已对齐实际 13 模块代码 + 7 条验收指标
@@ -367,11 +417,12 @@ laowang-unzip/
 │   └── .backup/                ← 每次写 lessons.md 前的自动备份（evolve append/archive）
 └── scripts/                    ← 实现代码（冒烟 31 项 + 回归 24/24 + carve 10 + open-db 5 通过）
     ├── pipeline.py             ← CLI：run/doctor/status/resolve-dup/clean-junk/purge-recycle/
-    │                              retry-failed/report/init-db/**evolve**（自进化环）
+    │                              retry-failed/report/init-db/**evolve**（自进化环）/**pw-stats**（密码库）
     ├── cli.py                  ← 别名入口（与 pipeline.py 等价）
     ├── init_db.py              ← 显式建库
     ├── tests/                  ← 单元测试（unittest：test_header_carve / test_evolve / …）
-    └── pipeline_lib/           ← 14 个模块文件（`__init__` + 13 个功能模块）：config / db /
+    └── pipeline_lib/           ← 15 个模块文件（`__init__` + 14 个功能模块）：config / db /
                                  fsutil(平台适配) / hasher / header / junk / passwords / sz /
-                                 space / recycle / scheduler / report / **evolve**(自进化引擎)
+                                 space / recycle / scheduler / report / **evolve**(自进化引擎) /
+                                 **pwstats**(密码自学习层，v3.6.0)
 ```

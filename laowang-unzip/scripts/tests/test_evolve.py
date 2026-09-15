@@ -34,6 +34,7 @@ import pipeline                                              # noqa: E402
 from pipeline_lib import evolve as E                         # noqa: E402
 
 REAL_LESSONS = os.path.join(SKILL_ROOT, "references", "lessons.md")
+REAL_PITFALLS = os.path.join(SKILL_ROOT, "references", "pitfalls.md")
 TODAY = time.strftime("%Y%m%d")
 TODAY_DASH = time.strftime("%Y-%m-%d")
 
@@ -505,6 +506,29 @@ class CliTests(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertIn("不健康", buf.getvalue())
 
+    def test_cli_check_pitfalls_gap_exit1(self):
+        """第 10 项必须**有牙齿**：pitfalls 编号缺号 → evolve --check rc=1。"""
+        sk = self._healthy_skill()
+        with open(os.path.join(sk, "references", "pitfalls.md"), "w",
+                  encoding="utf-8", newline="") as fh:
+            fh.write("**#1. a**\n**#3. c**\n")          # 缺 #2
+        buf = io.StringIO()
+        with mock.patch.object(pipeline, "SKILL_DIR", sk), \
+                contextlib.redirect_stderr(buf):
+            rc = pipeline.main(["evolve", "--check", "--root", self.root])
+        self.assertEqual(rc, 1)
+        self.assertIn("Skill层只增不减", buf.getvalue())
+
+    def test_cli_check_continuous_pitfalls_exit0(self):
+        """第 10 项不得把健康环境判成不健康：编号连续 → rc=0。"""
+        sk = self._healthy_skill()
+        with open(os.path.join(sk, "references", "pitfalls.md"), "w",
+                  encoding="utf-8", newline="") as fh:
+            fh.write("**#1. a**\n**#2. b**\n")
+        with mock.patch.object(pipeline, "SKILL_DIR", sk):
+            rc = pipeline.main(["evolve", "--check", "--root", self.root])
+        self.assertEqual(rc, 0)
+
     def test_cli_json_parses(self):
         sk = self._healthy_skill()
         buf = io.StringIO()
@@ -570,6 +594,364 @@ class ReportIntegrationTests(unittest.TestCase):
         txt = _read(path)
         self.assertIn("## 十一、自省", txt)
         self.assertIn("未处置的候选教训不得标记批次收尾", txt)
+
+
+class SignatureTests(unittest.TestCase):
+    """v3.6.0: _signature normalises whitespace/punctuation to one fingerprint."""
+
+    def test_whitespace_and_punct_same(self):
+        self.assertEqual(E._signature("Wrong password!"),
+                         E._signature("wrong   password"))
+
+    def test_case_insensitive(self):
+        self.assertEqual(E._signature("WRONG_PASSWORD"), E._signature("wrong_password"))
+
+    def test_cjk_kept(self):
+        self.assertEqual(E._signature("解压 失败。"), "解压失败")
+
+    def test_empty(self):
+        self.assertEqual(E._signature(""), "")
+
+    def test_truncated_80(self):
+        self.assertLessEqual(len(E._signature("x" * 200)), 80)
+
+
+class BumpOccTests(unittest.TestCase):
+    def _lesson(self, occ, pri="P1", sig="abc"):
+        return ["### [LES-20260101-01] bug %s open" % pri,
+                "- 现象：现象描述",
+                "- 根因：根因描述",
+                "- 处置：处置描述",
+                "- 关联：rel",
+                "- 指纹：%s" % sig,
+                "- 复现：%d 次" % occ]
+
+    def test_bump_hit(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "references", "lessons.md")
+            _write_lessons(p, [self._lesson(3)])
+            r = E.bump_occ(p, "abc", n=2)
+            self.assertTrue(r["matched"])
+            self.assertEqual(r["old_occ"], 3)
+            self.assertEqual(r["new_occ"], 5)
+            self.assertIsNotNone(r["backup"])
+            _h, lessons, _f = E.parse_lessons(p)
+            self.assertEqual(lessons[0].occ, 5)
+
+    def test_bump_miss_does_not_touch_file(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "references", "lessons.md")
+            _write_lessons(p, [self._lesson(3)])
+            before = _read(p)
+            r = E.bump_occ(p, "nope")
+            self.assertFalse(r["matched"])
+            self.assertEqual(_read(p), before)
+
+    def test_bump_crossed_on_1_to_2_p1(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "references", "lessons.md")
+            _write_lessons(p, [self._lesson(1, pri="P1")])
+            r = E.bump_occ(p, "abc", n=1)
+            self.assertTrue(r["crossed"])
+
+    def test_bump_not_crossed_when_p2(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "references", "lessons.md")
+            _write_lessons(p, [self._lesson(1, pri="P2")])
+            self.assertFalse(E.bump_occ(p, "abc", n=1)["crossed"])
+
+
+class DraftLessonTests(unittest.TestCase):
+    def test_draft_appends_and_parses_back(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "references", "lessons.md")
+            _write_lessons(p, [])
+            r = E.draft_lesson(p, "WRONG_PASSWORD", 3)
+            self.assertTrue(r["appended"])
+            _h, lessons, _f = E.parse_lessons(p)
+            self.assertEqual(len(lessons), 1)
+            ls = lessons[0]
+            self.assertEqual(ls.occ, 3)
+            self.assertEqual(ls.priority, "P1")
+            self.assertEqual(ls.status, "open")
+            self.assertEqual(ls.sig, E._signature("WRONG_PASSWORD"))
+            joined = "\n".join(ls.body)
+            self.assertIn("机器草稿", joined)
+
+    def test_draft_same_signature_not_duplicated(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "references", "lessons.md")
+            _write_lessons(p, [])
+            E.draft_lesson(p, "FAIL_X", 1)
+            r2 = E.draft_lesson(p, "FAIL_X", 5)
+            self.assertFalse(r2["appended"])
+            _h, lessons, _f = E.parse_lessons(p)
+            self.assertEqual(len(lessons), 1)
+
+    def test_draft_priority_mapping(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "references", "lessons.md")
+            _write_lessons(p, [])
+            self.assertEqual(E._priority_for_fail("ARCHIVE_CORRUPT"), "P0")
+            self.assertEqual(E._priority_for_fail("WRONG_PASSWORD"), "P1")
+            self.assertEqual(E._priority_for_fail("OUTPUT_ZERO_ROOTS"), "P2")
+
+    def test_draft_then_bump_accumulates(self):
+        """核心闭环：草稿自带指纹 → 下一批同 fail_reason occ 自增。"""
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "references", "lessons.md")
+            _write_lessons(p, [])
+            E.draft_lesson(p, "WRONG_PASSWORD", 1)
+            r = E.bump_occ(p, E._signature("WRONG_PASSWORD"), n=2)
+            self.assertTrue(r["matched"])
+            self.assertEqual(r["new_occ"], 3)
+
+
+class FingerprintRoundtripTests(unittest.TestCase):
+    def test_backfill_keeps_roundtrip(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "references", "lessons.md")
+            _write_lessons(p, [_block("LES-20260101-01", "bug", "P1", "open",
+                                      occ=None)])
+            E._backfill_occ(p)
+            h, lessons, f = E.parse_lessons(p)
+            self.assertTrue(E._has_occ_line(lessons[0]))
+            self.assertEqual(E.render_lessons(h, lessons, f), _read(p))
+
+    def test_real_lessons_roundtrip_after_backfill(self):
+        """护栏：回填指纹后，真实文件的 parse→render 仍字节无损。"""
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "lessons.md")
+            shutil.copy2(REAL_LESSONS, p)
+            E._backfill_occ(p)
+            h, lessons, f = E.parse_lessons(p)
+            self.assertEqual(E.render_lessons(h, lessons, f), _read(p))
+
+
+class ApplyReadOnlyTests(unittest.TestCase):
+    def _skill(self, d):
+        sk = os.path.join(d, "skill")
+        refs = os.path.join(sk, "references")
+        _write_lessons(os.path.join(refs, "lessons.md"),
+                       [_block("LES-%s-01" % TODAY, "bug", "P1", "open", occ=1)])
+        with open(os.path.join(sk, "CHANGELOG.md"), "w", encoding="utf-8") as fh:
+            fh.write("# Changelog\n\n## v9.9.9 (%s) — t\n" % TODAY_DASH)
+        return sk
+
+    def test_apply_false_writes_nothing(self):
+        with tempfile.TemporaryDirectory() as d:
+            sk = self._skill(d)
+            lp = os.path.join(sk, "references", "lessons.md")
+            before = _read(lp)
+            before_mtime = os.path.getmtime(lp)
+            with mock.patch.object(E, "mine_from_db",
+                                   return_value=dict(
+                                       _empty_mine_for_test("B",
+                                                            [{"fail_reason": "WRONG_PASSWORD",
+                                                              "count": 2}]))):
+                E.evolve(root=None, skill_root=sk, batch="B", apply=False)
+            self.assertEqual(_read(lp), before)
+            self.assertEqual(os.path.getmtime(lp), before_mtime)
+            self.assertFalse(os.path.exists(
+                os.path.join(sk, "references", "lessons-archive.md")))
+
+
+class HealthPasswordLibTests(unittest.TestCase):
+    def _skill_with_learned(self, d, content):
+        sk = os.path.join(d, "skill")
+        refs = os.path.join(sk, "references")
+        blocks = [_block("LES-%s-%02d" % (TODAY, i), "bug", "P1", "open", occ=1)
+                  for i in range(1, 6)]
+        _write_lessons(os.path.join(refs, "lessons.md"), blocks)
+        arc = [_block("LES-20260101-%02d" % i, "bug", "P1", "resolved", occ=1)
+               for i in range(1, 21)]
+        _write_lessons(os.path.join(refs, "lessons-archive.md"), arc)
+        with open(os.path.join(sk, "CHANGELOG.md"), "w", encoding="utf-8") as fh:
+            fh.write("# Changelog\n\n## v9.9.9 (%s) — t\n" % TODAY_DASH)
+        assets = os.path.join(sk, "assets")
+        os.makedirs(assets, exist_ok=True)
+        with open(os.path.join(assets, "passwords.learned.txt"), "w",
+                  encoding="utf-8", newline="") as fh:
+            fh.write(content)
+        return sk
+
+    def test_health_password_lib_present(self):
+        content = ("# h\n5\tabc\t2026-01-01\tLIBRARY\n"
+                   "2\txy\t2026-01-02\tFILE_NAME\n")
+        with tempfile.TemporaryDirectory() as d:
+            sk = self._skill_with_learned(d, content)
+            h = E.health(sk)
+            self.assertTrue(_check(h, "密码库")["ok"])
+
+    def test_health_password_lib_duplicate_fails_but_no_raise(self):
+        content = ("# h\n5\tabc\t2026-01-01\tA\n5\tabc\t2026-01-02\tB\n")
+        with tempfile.TemporaryDirectory() as d:
+            sk = self._skill_with_learned(d, content)
+            h = E.health(sk)                       # must not raise
+            self.assertFalse(_check(h, "密码库")["ok"])
+
+    def test_health_password_lib_not_descending_fails(self):
+        content = ("# h\n1\tlow\t2026-01-01\tA\n9\thigh\t2026-01-02\tB\n")
+        with tempfile.TemporaryDirectory() as d:
+            sk = self._skill_with_learned(d, content)
+            h = E.health(sk)
+            self.assertFalse(_check(h, "密码库")["ok"])
+
+
+class MinePwGapsTests(unittest.TestCase):
+    def _db(self, d):
+        conn = sqlite3.connect(os.path.join(d, "a.db"))
+        conn.executescript(
+            "CREATE TABLE files(id INTEGER PRIMARY KEY, path TEXT, batch TEXT,"
+            " fail_reason TEXT, dup_of_id INTEGER, is_extracted INTEGER,"
+            " password TEXT);"
+            "CREATE TABLE events(id INTEGER PRIMARY KEY, file_id INTEGER, batch TEXT,"
+            " action TEXT, level TEXT, message TEXT);"
+            "CREATE TABLE batches(batch TEXT PRIMARY KEY, started_at TEXT,"
+            " finished_at TEXT);")
+        conn.execute("INSERT INTO batches VALUES('A','x','x')")
+        rows = [
+            (1, "/a", "A", "NONE", None, 1, "knownpw"),
+            (2, "/b", "A", "NONE", None, 1, "knownpw"),
+            (3, "/c", "A", "NONE", None, 1, "otherpw"),
+            (4, "/d", "A", "NONE", None, 0, "ignored"),
+        ]
+        conn.executemany("INSERT INTO files VALUES(?,?,?,?,?,?,?)", rows)
+        conn.commit()
+        return conn
+
+    def test_pw_gaps_reports_db_only(self):
+        with tempfile.TemporaryDirectory() as d:
+            conn = self._db(d)
+            lp = os.path.join(d, "learned.txt")
+            with open(lp, "w", encoding="utf-8", newline="") as fh:
+                fh.write("9\tknownpw\t2026-01-01\tLIBRARY\n")
+            try:
+                with mock.patch.object(E.pwstats, "learned_path",
+                                       return_value=lp):
+                    m = E.mine_from_db(conn, "A")
+            finally:
+                conn.close()
+            gaps = m["pw_gaps"]
+            self.assertEqual(gaps["learned_total"], 1)
+            self.assertEqual(gaps["db_success_total"], 3)
+            self.assertEqual([g["password"] for g in gaps["db_only"]], ["otherpw"])
+            self.assertFalse(gaps["db_only"][0]["in_learned"])
+
+    def test_pw_gaps_none_conn(self):
+        m = E.mine_from_db(None, "A")
+        self.assertEqual(m["pw_gaps"],
+                         {"db_only": [], "learned_total": 0,
+                          "db_success_total": 0})
+
+    def test_pw_gaps_missing_columns_degrade(self):
+        with tempfile.TemporaryDirectory() as d:
+            conn = sqlite3.connect(os.path.join(d, "empty.db"))
+            try:
+                m = E.mine_from_db(conn, "A")
+            finally:
+                conn.close()
+            self.assertEqual(m["pw_gaps"]["db_only"], [])
+
+
+class SkillLayersMonotonicTests(unittest.TestCase):
+    """Check #10「Skill层只增不减」——pitfalls.md 编号连续性护栏（v3.6.0）。
+
+    铁律「只补丁、不重写」的机械手段：删条目=缺号、重写/重排=重复，必须拦截。
+    """
+
+    def _skill(self, d, pitfalls_text=None, fm_text=None):
+        sk = os.path.join(d, "skill")
+        refs = os.path.join(sk, "references")
+        os.makedirs(refs, exist_ok=True)
+        _write_lessons(os.path.join(refs, "lessons.md"),
+                       [_block("LES-20260101-01", "bug", "P1", "open", occ=1)])
+        if pitfalls_text is not None:
+            with open(os.path.join(refs, "pitfalls.md"), "w",
+                      encoding="utf-8", newline="") as fh:
+                fh.write(pitfalls_text)
+        if fm_text is not None:
+            with open(os.path.join(refs, "failure-matrix.md"), "w",
+                      encoding="utf-8", newline="") as fh:
+                fh.write(fm_text)
+        return sk
+
+    def test_continuous_numbers_ok(self):
+        with tempfile.TemporaryDirectory() as d:
+            sk = self._skill(d, pitfalls_text=(
+                "## A.\n\n**#1. one**\nx\n\n**#2. two**\ny\n\n**#3. three**\nz\n"))
+            c = _check(E.health(sk), "Skill层只增不减")
+            self.assertTrue(c["ok"], c["detail"])
+            self.assertIn("1..3", c["detail"])
+
+    def test_missing_number_fails(self):
+        with tempfile.TemporaryDirectory() as d:
+            sk = self._skill(d, pitfalls_text=(
+                "**#1. one**\n**#2. two**\n**#4. four**\n"))   # #3 缺失
+            c = _check(E.health(sk), "Skill层只增不减")
+            self.assertFalse(c["ok"])
+            self.assertIn("缺号", c["detail"])
+            self.assertIn("3", c["detail"])
+
+    def test_duplicate_number_fails(self):
+        with tempfile.TemporaryDirectory() as d:
+            sk = self._skill(d, pitfalls_text=(
+                "**#1. one**\n**#2. two**\n**#2. two-again**\n"))
+            c = _check(E.health(sk), "Skill层只增不减")
+            self.assertFalse(c["ok"])
+            self.assertIn("重复", c["detail"])
+
+    def test_no_pitfalls_file_skipped_no_raise(self):
+        with tempfile.TemporaryDirectory() as d:
+            sk = self._skill(d)                       # 无 pitfalls.md
+            c = _check(E.health(sk), "Skill层只增不减")   # 必须不抛
+            self.assertTrue(c["ok"])
+            self.assertIn("skipped", c["detail"])
+
+    def test_failure_matrix_without_stable_numbering_skipped(self):
+        with tempfile.TemporaryDirectory() as d:
+            sk = self._skill(d, pitfalls_text="**#1. one**\n",
+                             fm_text="| # | enum |\n|---|---|\n| 1 | NONE |\n")
+            c = _check(E.health(sk), "Skill层只增不减")
+            self.assertTrue(c["ok"])
+            self.assertIn("failure-matrix", c["detail"])
+            self.assertIn("跳过", c["detail"])
+
+    def test_failure_matrix_with_numbering_is_checked(self):
+        with tempfile.TemporaryDirectory() as d:
+            sk = self._skill(d, pitfalls_text="**#1. one**\n",
+                             fm_text="**#1. a**\n**#3. c**\n")   # #2 缺失
+            c = _check(E.health(sk), "Skill层只增不减")
+            self.assertFalse(c["ok"])
+            self.assertIn("failure-matrix", c["detail"])
+
+    def test_real_pitfalls_continuous_ok(self):
+        self.assertTrue(os.path.isfile(REAL_PITFALLS))
+        c = _check(E.health(SKILL_ROOT), "Skill层只增不减")
+        self.assertTrue(c["ok"], c["detail"])
+
+    def test_real_pitfalls_copy_with_gap_fails(self):
+        """真实 pitfalls.md 的副本删掉 #3 → 缺号 → ok=False（咬得住删条目）。"""
+        with tempfile.TemporaryDirectory() as d:
+            sk = self._skill(d)
+            dst = os.path.join(sk, "references", "pitfalls.md")
+            shutil.copy2(REAL_PITFALLS, dst)
+            kept = [ln for ln in _read(dst).splitlines(True)
+                    if not ln.startswith("**#3.")]
+            with open(dst, "w", encoding="utf-8", newline="") as fh:
+                fh.write("".join(kept))
+            c = _check(E.health(sk), "Skill层只增不减")
+            self.assertFalse(c["ok"])
+            self.assertIn("缺号", c["detail"])
+            self.assertIn("3", c["detail"])
+
+
+def _empty_mine_for_test(batch, fail_reasons):
+    """Minimal mine dict for read-only tests."""
+    return {"batch": batch, "errors": [], "fail_reasons": fail_reasons,
+            "new_fail_reasons": [], "dup_hits": 0, "deletes": 0,
+            "files_total": 0, "detail": "",
+            "pw_gaps": {"db_only": [], "learned_total": 0, "db_success_total": 0}}
 
 
 if __name__ == "__main__":

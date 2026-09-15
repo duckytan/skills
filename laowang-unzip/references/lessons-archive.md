@@ -99,3 +99,11 @@
 ## 2026-09-15 批次（【new】目录，本机实测）
 - 复现：1 次
 
+### [LES-20260915-06] bug P1 promoted
+- 现象：pw-stats / evolve / doctor --root <用户区> 这些自称「只读、绝不写用户工作区」的命令，在用户生产 DB 目录里新建了 archive.db-shm(32768B) 与 archive.db-wal(0B)（目录文件数 118543→118545），而 archive.db 的 md5 未变——纯粹的读副作用，直接违反只读承诺。
+- 根因：以 mode=ro 打开一个 journal_mode=WAL 的数据库时，SQLite 仍会物化 -shm/-wal 影子文件：只读 URI 只约束主库文件本身，并不约束其所在目录的写入。
+- 处置：在 pipeline_lib/db.py 新增全仓唯一只读入口 open_readonly(db_path)：WAL 干净（<db>-wal 不存在或 0 字节）时追加 immutable=1，SQLite 不再创建/触碰 -shm/-wal；WAL 非空时退回普通 mode=ro 以读最新已提交数据；immutable 打开/校验失败降级重试 mode=ro；文件缺失/非库/目录一律返回 None、绝不抛。evolve._open_ro 与 pipeline._readonly_db_counts 改为调用它、删除各自重复实现。回归 tests/test_readonly_open.py（10 例）。
+- 关联：SKILL.md §3.1 只读承诺；pw-stats / evolve / doctor；pitfalls #48。破格提升：本条 occ=1 且 P1，不满足「P0 或 occ≥2」的机械判据，系人工判断提升（只读契约被打破 + 已追加 pitfalls #48）；破格理由必须显式记录，不得靠虚标 P0 换取提升。
+- 指纹：pwstatsevolvedoctorroot用户区这些自称只读绝不写用户工作区的命令在用户生产db目录里新建了archivedbshm32768b与archi
+- 复现：1 次
+

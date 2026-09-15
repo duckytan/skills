@@ -286,3 +286,30 @@ carve 对 SFX 是纯多余步骤且会把数据切坏（首部签名偏移未必
 ③ **stdout 不回显**：PowerShell 工具跑命令不回显 stdout，结果必须 `Set-Content` 写文件再用 Read 读，
    别指望直接在工具输出里看。
 关联：LES-20260911-04；#41（PowerShell 复核幻影）；pitfalls 沙箱视图。
+
+
+**#46. 自学习密码库（learned）是 TAB 4 列格式，别当"逐行密码"读（v3.6.0）**
+`assets/passwords.learned.txt` 的数据行是 `<count>\t<pw>\t<last_date>\t<sources>`；
+任何按"一行一个密码"的朴素读法都会把整行（含次数/日期/来源）当成密码候选——试解必全灭。
+正确做法：`passwords._load_file_into` 对 `label=="learned"` 走 `pwstats.parse_learned`；
+`describe_sources` 的 `learned` 层必须这样读，其余层才按行读。
+关联：pwstats.py / passwords.py `_load_file_into`；SKILL.md §5.1。
+
+**#47. 库内排序 ≠ 来源排序：改候选来源顺序会让流行密码"盖过"文件名显式密码（v3.6.0）**
+需求「按成功次数排序、优先尝试」只应作用于 **LIBRARY 段内部**。若把 `prioritize` 施于整个候选列表
+（含 `TRAIL_BRACKET`/`FILE_NAME`/`DIR_NAME`/`INHERITED`），一个高产密码会排在文件名里写明的密码之前——
+把"本包高置信证据"降级为"库先验"，属回归。铁律：候选来源顺序 `NONE → INHERITED → TRAIL_BRACKET →
+名称抠码 → LIBRARY` **不变**；只让 LIBRARY 段内部按次数降序。
+关联：passwords.py `load_library`/`strategy`；SKILL.md §5.1。
+
+**#48. 只读命令也会写用户目录：WAL 库的 `-shm`/`-wal` 影子文件（缺陷 D1，v3.6.0）**
+现象：`pw-stats` / `evolve` / `doctor --root <用户区>` 自称"只读、绝不写用户工作区"，却在用户生产 DB
+目录里生成 `archive.db-shm`(32768B) + `archive.db-wal`(0B)（目录文件数 118543→118545），`archive.db`
+本身 md5 未变——纯粹的读副作用。
+根因：`mode=ro` 只约束**主库文件**，不约束其**所在目录**；以 `mode=ro` 打开 `journal_mode=WAL` 的库时
+SQLite 仍需物化 `-shm`/`-wal` 影子文件。
+处置：只读打开一律走唯一入口 `pipeline_lib.db.open_readonly`——WAL **干净**（`<db>-wal` 不存在或 0 字节）
+追加 `immutable=1`（不再触碰影子文件）；WAL **非空**退回 `mode=ro`（保证读到最新已提交数据）；
+`immutable=1` 打开/校验失败降级重试 `mode=ro`；缺失/非库/目录 → `None`、绝不抛。
+回归：`tests/test_readonly_open.py`（WAL 干净无影子 / 非空读最新 / 降级 / 缺失·垃圾·目录→None / 两处委托）。
+关联：db.py `open_readonly`；evolve.py `_open_ro`；pipeline.py `_readonly_db_counts`；LES-20260915-06。
