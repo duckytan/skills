@@ -9,7 +9,7 @@ description: >-
   详细判据见 references/，接口约定见 references/scripts-api.md，完整设计见 references/design-v2.1.md。
 ---
 
-# 伪装压缩包批量整理（通用版 v3 · skill 3.7.0）
+# 伪装压缩包批量整理（通用版 v3 · skill 3.7.1）
 
 > ## ⚠️ 平台：Windows 专用（Q1 拍板 2026-09-09）
 > 本 skill 的**删除与回收站语义只在 Windows 上完整成立**：
@@ -223,6 +223,11 @@ CLI 入口 `python pipeline.py evolve`：
 + 按指纹对同一条目 **occ 自增** + 为新形态落**机器草稿** + 归档 promoted/resolved；
 **写前自动备份**到 `references/.backup/`；不改正文、不改状态）。**v3.6.0 起 `run` 收尾会
 自动跑一遍它**（`--no-evolve` 跳过），失败只告警、绝不影响批次与返回码。
+**v3.7.1：fail_reason 三分类**——机器草稿只对 **MINEABLE**（真失败）形态生成；
+**BENIGN**（正常终态：`NOT_ARCHIVE`/`DUP_*`/`NONE` 等）**永不建稿、永不 bump**
+（apply 时输出 `skip_benign: <REASON> xN (正常终态，不建草稿)`）；**UNCLASSIFIED**
+（未知形态）落草稿但标注「待判」、默认 P2、**不计入闸口阻断**。据此
+`NOT_ARCHIVE` 等正常终态不会再把 `--check` 闸口卡红（LES-20260915-09）。
 
 ## 4. 配置全表（config.py 默认值，全部可被 `config.local.json` 覆盖）
 

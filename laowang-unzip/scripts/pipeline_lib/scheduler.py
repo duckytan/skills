@@ -1000,7 +1000,15 @@ class Pipeline:
         miner's dedup set.
         """
         roots = []
-        ext_dir = parent_row.get("extract_output_dir") if parent_row else None
+        # parent_row 可能是 sqlite3.Row（无 .get）也可能是 dict —— 统一走下标
+        # 访问 + 容错（v3.7.1：修复 AttributeError: 'sqlite3.Row' object has
+        # no attribute 'get'，该崩溃会直接打断整个批次）。
+        ext_dir = None
+        if parent_row is not None:
+            try:
+                ext_dir = parent_row["extract_output_dir"]
+            except (KeyError, IndexError, TypeError):
+                ext_dir = None
         if ext_dir and fsutil.isdir(ext_dir):
             roots.append(ext_dir)
         own = row["dir_path"]

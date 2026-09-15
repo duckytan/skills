@@ -775,10 +775,36 @@ def _print_batch_evolution(ev: dict) -> None:
     else:
         print("[1/6] 本批错误/告警聚合：无")
 
-    # 2) fail_reason 频次；新形态用 !! 标记
+    # 2) fail_reason 三分类（v3.7.1）：真失败 / 正常终态（不建草稿）/ 待判
+    #    !! 只给**相对数据库历史首次出现**的 mineable 形态（基线修正 E2）。
     frs = mine.get("fail_reasons") or []
+    mineable = mine.get("mineable_fail_reasons") or {}
+    benign = mine.get("benign_fail_reasons") or {}
+    unclassified = mine.get("unclassified_fail_reasons") or {}
     new_set = set(mine.get("new_fail_reasons") or [])
-    if frs:
+    if mineable or benign or unclassified:
+        print("[2/6] 本批 fail_reason 频次（!! = 相对数据库历史的新形态）：")
+        print("   真失败（值得建教训）：")
+        if mineable:
+            for reason, cnt in mineable.items():
+                mark = "!!" if reason in new_set else "  "
+                print("     %s %s ×%d" % (mark, reason, cnt))
+        else:
+            print("     （无）")
+        print("   正常终态（不建草稿）：")
+        if benign:
+            for reason, cnt in benign.items():
+                print("       %s ×%d" % (reason, cnt))
+        else:
+            print("     （无）")
+        print("   待判（未分类，按良性处理，不阻塞闸口）：")
+        if unclassified:
+            for reason, cnt in unclassified.items():
+                print("       %s ×%d" % (reason, cnt))
+        else:
+            print("     （无）")
+    elif frs:
+        # 向后兼容：mine 来自旧结构（无三分类键）时退回旧展示。
         print("[2/6] 本批 fail_reason 频次（!! = 新形态）：")
         for f in frs[:12]:
             mark = "!!" if f.get("fail_reason") in new_set else "  "
@@ -1294,13 +1320,29 @@ def _print_evolve_report(res: dict) -> None:
     print("\n[本批候选素材] batch=%s" % (mine.get("batch") or "-"))
     for e in (mine.get("errors") or [])[:10]:
         print("  - %-5s %s ×%d" % (e.get("level"), e.get("action"), e.get("count")))
+    mineable = mine.get("mineable_fail_reasons") or {}
+    benign = mine.get("benign_fail_reasons") or {}
+    unclassified = mine.get("unclassified_fail_reasons") or {}
     frs = mine.get("fail_reasons") or []
-    if frs:
+    if mineable or benign or unclassified:
+        if mineable:
+            print("  fail_reason(真失败)：%s"
+                  % "、".join("%s×%d" % (k, v)
+                              for k, v in list(mineable.items())[:10]))
+        if benign:
+            print("  fail_reason(正常终态，不建草稿)：%s"
+                  % "、".join("%s×%d" % (k, v)
+                              for k, v in list(benign.items())[:10]))
+        if unclassified:
+            print("  fail_reason(待判/未分类，仅提示)：%s"
+                  % "、".join("%s×%d" % (k, v)
+                              for k, v in list(unclassified.items())[:10]))
+    elif frs:
         print("  fail_reason: %s"
               % "、".join("%s×%d" % (f["fail_reason"], f["count"]) for f in frs[:10]))
     nfr = mine.get("new_fail_reasons") or []
     if nfr:
-        print("  ★ 新错误形态: %s" % "、".join(nfr))
+        print("  ★ 新错误形态（相对数据库历史）：%s" % "、".join(nfr))
     if mine.get("detail"):
         print("  note: %s" % mine["detail"])
 

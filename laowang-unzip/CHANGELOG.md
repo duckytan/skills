@@ -1,5 +1,46 @@
 # Changelog
 
+## v3.7.1 (2026-09-16) — 自进化环三分类修复 + 调度器崩溃修复
+
+**背景**：批 2026-09-15 跑完后，自进化环把正常终态 NOT_ARCHIVE ×142 当真失败采集成
+bug 草稿，且 `--check` 闸口因 open 草稿卡红（详见 LES-20260915-09）。同时工程师在
+实现 fail_reason 三分类途中被 429 限流，留下未测试的半成品（evolve.py 分类函数已在，
+但调度器一处真实崩溃与全部测试/文档未完成）。
+
+### E1 — fail_reason 三分类（核心修复，evolve.py）
+- 新增 `classify_fail_reason(reason)`：把 fail_reason 分为三类——
+  **MINEABLE**（真失败，可采教训：CORRUPT / WRONG_* / FAIL* / LOST / MISSING /
+  DATA_LOST / DATA_LOSS 等）、**BENIGN**（正常终态，永不建稿：NOT_ARCHIVE / DUP_* /
+  NONE 等，`BENIGN_EXACT_FAIL_REASONS` + `BENIGN_FAIL_PATTERNS`）、
+  **UNCLASSIFIED**（待判，草稿标注「待判」且不卡闸口）。
+- `mine_from_db` 分三列输出（`mineable_fail_reasons` / `benign_fail_reasons` /
+  `unclassified_fail_reasons`）；`new_fail_reasons` 只在 MINEABLE 中找新形态。
+- `draft_lesson` 对 benign 拒绝建稿（含字节级幂等护栏）；UNCLASSIFIED 草稿标注
+  `（待判）` 且 priority 默认 P2、不计入闸口阻断。
+- `evolve(apply=True)` 对纯良性批次输出 `skip_benign: <REASON> xN (正常终态，不建草稿)`，
+  绝不产草稿、绝不 bump。
+- `_print_batch_evolution` / `_print_evolve_report`（pipeline.py）分三列展示：
+  真失败 / 正常终态 / 待判，`!!` 只标 DB 历史未见的新失败形态。
+
+### E2 — 调度器真实崩溃修复（scheduler.py ~L1003）
+- `AttributeError: 'sqlite3.Row' object has no attribute 'get'`：TXT 密码挖掘路径中
+  `parent_row.get("extract_output_dir")` 在 sqlite3.Row 上必然崩溃，会直接打断整个批次
+  （批 2026-09-15 恢复跑实锤触发）。改为下标访问 + KeyError/IndexError/TypeError 容错。
+
+### E3 — 回归测试（tests/test_evolve.py，全模块 73 例）
+- 新增 4 个测试类 ~22 个用例：真失败/良性/待判三分类判定、benign 拒稿 + 字节级幂等、
+  category 推导与显式覆盖、mine 三列切分、DB 历史基线（new_fail_reasons 不误报）、
+  纯良性批次 0 草稿 0 卡闸、真失败仍建稿（occ 聚合、category=bug）。
+- 测试基线约定：断言条数前先过 evolve 的状态归档（promoted/resolved 条目会移入
+  lessons-archive.md，`archive: moved=N`）。
+
+### 数据侧结论（lessons.md 补写 4 条）
+- LES-20260915-09 误判 → resolved（本条目即修复记录）；LES-20260915-10
+  UNKNOWN_BINARY → resolved（SKIP 属保守正确，语义应归"跳过"）；
+  LES-20260915-11 ARCHIVE_CORRUPT×6 实为**分卷成员 mp4 未被卷组聚合**（P1 open）；
+  LES-20260915-12 UNCLASSIFIED×2 实为**无扩展名 7z 包输出目录与源文件同名冲突**
+  （P1 open，两步修复方案已写明）。
+
 ## v3.7.0 (2026-09-15) — 垃圾库（自学习）+ 空目录清理 + 广告目录词配置化
 
 **背景（用户原话）**：能不能建一个广告文件库，里面包含所有我们遇到过的广告文件、垃圾文件、
