@@ -20,6 +20,8 @@ Usage (all paths derive from the working ROOT):
     python pipeline.py purge-recycle [--root DIR] [--dry-run]
     python pipeline.py retry-failed [--root DIR] [--batch B] [run options]
     python pipeline.py report [--root DIR] [--batch B]
+    python pipeline.py evolve [--root DIR] [--apply] [--check] [--json]
+    python pipeline.py pw-stats [--root DIR] [--rebuild] [--verify] [--top N] [--json]
 
 Root resolution priority (SKILL.md §4.1):
     --root (alias --workdir)  >  $DAE_ROOT  >  config.local.json  >  interactive
@@ -54,10 +56,11 @@ from pipeline_lib import audit as audit_mod                # noqa: E402
 from pipeline_lib import evolve as evolve_mod              # noqa: E402
 from pipeline_lib import fsutil                            # noqa: E402
 from pipeline_lib import passwords as passwords_mod        # noqa: E402
+from pipeline_lib import pwstats as pwstats_mod            # noqa: E402
 from pipeline_lib import recycle as recycle_mod            # noqa: E402
 from pipeline_lib import scheduler as scheduler_mod        # noqa: E402
 from pipeline_lib import sz as sz_mod                      # noqa: E402
-from pipeline_lib.db import Database                       # noqa: E402
+from pipeline_lib.db import Database, open_readonly          # noqa: E402
 from pipeline_lib.scheduler import Pipeline, PipelineConfig  # noqa: E402
 
 
@@ -157,6 +160,9 @@ def add_run_opts(p: argparse.ArgumentParser) -> argparse.ArgumentParser:
                         "(0 disables). Default: %d" % C.MTIME_FRESH_SEC)
     p.add_argument("--max-depth", type=int, default=None,
                    help="max nesting depth. Default: %d" % C.MAX_DEPTH)
+    p.add_argument("--no-evolve", action="store_true",
+                   help="skip the automatic self-evolution pass that runs after "
+                        "the batch (SKILL.md §3.2; evolve is ON by default)")
     return p
 
 
@@ -326,6 +332,23 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--occ", type=int, default=1,
                    help="new lesson: occurrence count (default 1) (--new)")
     p.set_defaults(func=cmd_evolve)
+
+    p = sub.add_parser("pw-stats",
+                       help="password library stats + self-learning layer ops "
+                            "(SKILL.md §5; Part A v3.6.0)")
+    add_common(p)
+    p.add_argument("--rebuild", action="store_true",
+                   help="reconcile learned counts with the DB's successful "
+                        "extractions (counts only ever go UP); writes ONLY "
+                        "assets/passwords.learned.txt — never the DB")
+    p.add_argument("--verify", action="store_true",
+                   help="mechanical self-check of the learned library "
+                        "(exit 0 = OK, 1 = problem)")
+    p.add_argument("--top", type=int, default=0,
+                   help="show only the top N entries (0 = all)")
+    p.add_argument("--json", action="store_true",
+                   help="emit a machine-readable JSON blob")
+    p.set_defaults(func=cmd_pw_stats)
     return ap
 
 
@@ -647,7 +670,8 @@ def cmd_collect(args) -> int:
 
 
 def cmd_run(args) -> int:
-    pipe = Pipeline(build_config(args))
+    cfg = build_config(args)
+    pipe = Pipeline(cfg)
     summary = pipe.run()
     print("batch %s finished in %ds (sweeps: %d)" %
           (summary["batch"], summary["seconds"], summary["sweep_rounds"]))
@@ -663,7 +687,98 @@ def cmd_run(args) -> int:
                  % summary["deferred_fresh"])
             warn("⚠ %d file(s) skipped: download mtime too fresh — re-run "
                  "later to pick them up." % summary["deferred_fresh"])
+    # v3.6.0 Part B1: the self-evolution loop is no longer a manual-only step.
+    # After the batch, run evolve (apply=True) so occ auto-increments and the
+    # promotion candidates surface without anyone remembering to type a command.
+    # Dry-run runs get this too: evolve's apply only touches the SKILL's own
+    # references/ (lessons.md + its .backup), never the user's data/DB, so it is
+    # safe even under --dry-run.
+    if not getattr(args, "no_evolve", False):
+        _auto_evolve(cfg, summary.get("batch"))
     return 0
+
+
+def _auto_evolve(cfg, batch) -> None:
+    """收尾自动跑 evolve(apply=True)。**整段 try/except**：evolve 出任何异常
+    只 warn，绝不改变 run 的返回码、绝不中断批次。
+    """
+    try:
+        ev = evolve_mod.evolve(root=cfg.workdir, skill_root=SKILL_DIR,
+                               batch=batch, apply=True, force=False)
+    except Exception as exc:  # noqa: BLE001 — 收尾自省绝不影响批次
+        warn("⚠ 收尾自进化环执行失败（不影响批次/退出码）: %r" % exc)
+        warn("[!] post-batch self-evolution skipped: %r" % exc)
+        return
+    _print_batch_evolution(ev)
+
+
+def _print_batch_evolution(ev: dict) -> None:
+    """打印收尾自进化结果（顺序即用户最后看到的六件事）。"""
+    mine = ev.get("mine", {}) or {}
+    print("\n== 收尾自进化（self-evolution, batch=%s）==" % (mine.get("batch") or "-"))
+
+    # 1) 本批错误/告警聚合
+    errs = mine.get("errors") or []
+    if errs:
+        print("[1/6] 本批错误/告警聚合：")
+        for e in errs[:10]:
+            print("   - %-5s %s ×%d"
+                  % (e.get("level"), e.get("action"), e.get("count")))
+    else:
+        print("[1/6] 本批错误/告警聚合：无")
+
+    # 2) fail_reason 频次；新形态用 !! 标记
+    frs = mine.get("fail_reasons") or []
+    new_set = set(mine.get("new_fail_reasons") or [])
+    if frs:
+        print("[2/6] 本批 fail_reason 频次（!! = 新形态）：")
+        for f in frs[:12]:
+            mark = "!!" if f.get("fail_reason") in new_set else "  "
+            print("   %s %s ×%d" % (mark, f.get("fail_reason"), f.get("count")))
+    else:
+        print("[2/6] 本批 fail_reason 频次：无")
+
+    # 3) 自动动作结果
+    applied = ev.get("applied") or []
+    if applied:
+        print("[3/6] 自动动作（occ 自增 / 机器草稿 / 归档）：")
+        for a in applied:
+            print("   - %s" % a)
+    else:
+        print("[3/6] 自动动作：无")
+
+    # 4) 待提升清单
+    cands = ev.get("candidates") or []
+    if cands:
+        print("[4/6] 待提升清单（P0 或 occ≥2）：")
+        for c in cands:
+            print("   - %s %s %s (occ=%d)"
+                  % (c.get("id"), c.get("category"), c.get("priority"),
+                     c.get("occ", 0)))
+    else:
+        print("[4/6] 待提升清单：无")
+
+    # 5) 健康度一行
+    h = ev.get("health", {}) or {}
+    checks = h.get("checks", []) or []
+    passed = sum(1 for c in checks if c.get("ok"))
+    print("[5/6] 健康度：%d/%d 通过 — %s"
+          % (passed, len(checks), "合格" if h.get("ok") else "欠账"))
+
+    # 6) 若有 P0 待提升条目 → 醒目区块（“真的在运作”的最后一道可见提醒）
+    p0 = [c for c in cands if c.get("priority") == "P0"]
+    if p0:
+        warn("=" * 64)
+        warn("!! 自进化环发现 %d 条 P0 教训已达提升阈值，需补丁式写入 Skill 层"
+             "（详见 references/lessons.md）" % len(p0))
+        for c in p0:
+            warn("!!   - %s %s %s (occ=%d)"
+                 % (c.get("id"), c.get("category"), c.get("priority"),
+                    c.get("occ", 0)))
+        warn("!! self-evolution: %d P0 lesson(s) crossed the promotion "
+             "threshold — patch the Skill layer (see references/lessons.md)."
+             % len(p0))
+        warn("=" * 64)
 
 
 def cmd_status(args) -> int:
@@ -890,6 +1005,7 @@ _EVOLVE_CHECK_LABELS = {
     "stale_open": "超期 open",
     "changelog_vs_code": "改码未记版本",
     "archive_file": "无 archive",
+    "密码库": "密码库欠账",
 }
 
 
@@ -982,6 +1098,177 @@ def cmd_evolve(args) -> int:
         return 1
 
     _print_evolve_report(res)
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# pw-stats (Part A v3.6.0): password library stats + self-learning ops
+# ---------------------------------------------------------------------------
+
+def _passwords_in_file(path: str, label: str) -> list:
+    """提取某个库文件的密码列表（learned 走 TAB 格式解析，其余按行）。"""
+    if not path or not os.path.isfile(path):
+        return []
+    if label == "learned":
+        try:
+            _h, entries, _f = pwstats_mod.parse_learned(path)
+            return [e.password for e in entries if e.password]
+        except Exception:  # noqa: BLE001
+            return []
+    out = []
+    try:
+        with open(path, "r", encoding="utf-8-sig", errors="ignore") as fh:
+            for line in fh:
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    out.append(line)
+    except OSError:
+        return []
+    return out
+
+
+def _db_path_for(root) -> str:
+    if not root:
+        return ""
+    return os.path.join(root, C.PIPELINE_DIRNAME, C.DB_DIRNAME, C.DB_FILENAME)
+
+
+def _readonly_db_counts(root) -> dict:
+    """以**只读**方式打开 DB 并汇总成功次数；不可用 → ``{}``（绝不抛）。
+
+    D1 修复：改走唯一的只读入口 :func:`pipeline_lib.db.open_readonly`——WAL
+    干净时用 ``immutable=1``，不再在用户生产目录物化 ``-shm``/``-wal``。
+    """
+    db_path = _db_path_for(root)
+    if not db_path:
+        return {}
+    conn = open_readonly(db_path)
+    if conn is None:
+        return {}
+    try:
+        return pwstats_mod.counts_from_db(conn)
+    except Exception:  # noqa: BLE001 —— 统计失败一律降级为空
+        return {}
+    finally:
+        try:
+            conn.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _pwstats_rows(passwords_file, workdir, root):
+    """合并库（已按优先级排序）+ 每条的 count/source 标签。"""
+    lib = passwords_mod.load_library(passwords_file, workdir=workdir, root=root)
+    counts = dict(pwstats_mod.read_counts(pwstats_mod.learned_path()))
+    db_counts = _readonly_db_counts(root)
+    for k, v in db_counts.items():
+        counts[k] = max(counts.get(k, 0), int(v))
+
+    label_of = {}
+    for label, path in passwords_mod.describe_sources(passwords_file, workdir,
+                                                      root):
+        for pw in _passwords_in_file(path, label):
+            label_of.setdefault(pw, label)
+
+    rows = [{"password": pw, "count": int(counts.get(pw, 0)),
+             "source": label_of.get(pw, "learned")} for pw in lib]
+    return rows, counts, db_counts
+
+
+def _pwstats_verify(root) -> tuple:
+    """机械自检：可解析 / 无重复 / count 降序 / 合并库不丢密码。返回 ``(ok, msgs)``。"""
+    msgs = []
+    learned = pwstats_mod.learned_path()
+    try:
+        _h, entries, _f = pwstats_mod.parse_learned(learned)
+    except Exception as exc:  # noqa: BLE001
+        return False, ["① learned 解析失败：%r" % exc]
+    msgs.append("① learned 可解析：%d 条" % len(entries))
+
+    pws = [e.password for e in entries if e.password]
+    if len(pws) != len(set(pws)):
+        return False, msgs + ["② 失败：learned 存在重复密码"]
+    msgs.append("② 无重复密码")
+
+    counts = [e.count for e in entries]
+    desc_ok = all(counts[i] >= counts[i + 1] for i in range(len(counts) - 1))
+    if not desc_ok:
+        return False, msgs + ["③ 失败：数据行未按 count 降序（优先级未生效）"]
+    msgs.append("③ count 严格降序（优先级生效）")
+
+    lib = set(passwords_mod.load_library(root=root, workdir=root))
+    src_pws = set()
+    for label, path in passwords_mod.describe_sources(None, workdir=root,
+                                                      root=root):
+        src_pws |= set(_passwords_in_file(path, label))
+    missing = src_pws - lib
+    if missing:
+        return False, msgs + ["④ 失败：合并库丢失密码 %s"
+                              % "、".join(sorted(missing)[:10])]
+    msgs.append("④ 合并库未丢密码（%d 条来源密码全在）" % len(src_pws))
+    return True, msgs
+
+
+def cmd_pw_stats(args) -> int:
+    """密码库统计 / 自学习层运维（Part A v3.6.0）。
+
+    * 无参数：打印合并后按优先级排序的库 + 统计 + learned 路径；
+    * ``--top N``：只显示前 N 条；
+    * ``--rebuild``：``counts_from_db`` + ``rebuild_counts``（**只写 learned 文件**）；
+    * ``--verify``：机械自检（rc 0/1）；
+    * ``--json``：机器可读输出。
+    """
+    root = None
+    try:
+        root, _local = resolve_root(args)
+    except ValueError:
+        root = None
+    learned = pwstats_mod.learned_path()
+    pw_file = getattr(args, "passwords", None)
+
+    rebuild_result = None
+    if getattr(args, "rebuild", False):
+        db_counts = _readonly_db_counts(root)
+        rebuild_result = pwstats_mod.rebuild_counts(learned, db_counts)
+        if not getattr(args, "json", False) and not getattr(args, "verify", False):
+            print("pw-stats --rebuild: before_total=%d after_total=%d "
+                  "updated=%d added=%d written=%s"
+                  % (rebuild_result["before_total"], rebuild_result["after_total"],
+                     rebuild_result["updated"], rebuild_result["added"],
+                     rebuild_result["written"]))
+
+    if getattr(args, "verify", False):
+        ok, msgs = _pwstats_verify(root)
+        for m in msgs:
+            print(m)
+        print("OK" if ok else "FAIL")
+        return 0 if ok else 1
+
+    rows, counts, db_counts = _pwstats_rows(pw_file, root, root)
+    learned_entries = pwstats_mod.parse_learned(learned)[1]
+    learned_total = len([e for e in learned_entries if e.password])
+    db_success_total = len(db_counts)
+
+    if getattr(args, "json", False):
+        payload = {
+            "learned_path": learned,
+            "total": len(rows),
+            "learned_total": learned_total,
+            "db_success_total": db_success_total,
+            "rebuild": rebuild_result,
+            "entries": rows,
+        }
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 0
+
+    shown = rows
+    if getattr(args, "top", 0) and args.top > 0:
+        shown = rows[:args.top]
+    for i, r in enumerate(shown, 1):
+        print("%4d  %7d  %-10s  %s" % (i, r["count"], r["source"], r["password"]))
+    print("共 %d 条（自学习 %d 条 / DB 已验证成功 %d 条）"
+          % (len(rows), learned_total, db_success_total))
+    print("learned: %s" % learned)
     return 0
 
 

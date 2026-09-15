@@ -31,12 +31,24 @@ from . import hasher
 from . import header
 from . import junk as junk_mod
 from . import passwords as pw_mod
+from . import pwstats
 from . import recycle as recycle_mod
 from . import space as space_mod
 from . import sz as sz_mod
 from .db import Database
 
 REPAIR_ORIGINS = {"CARVED", "MAGIC_PATCHED", "CONCATENATED", "RENAMED"}
+
+
+def _emit(msg: str) -> None:
+    """Print a status line, degrading non-ASCII to ASCII when stdout can't."""
+    try:
+        print(msg)
+    except UnicodeEncodeError:
+        try:
+            print(msg.encode("ascii", "replace").decode("ascii"))
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def delete_allowed(src_dir: str, path: str) -> bool:
@@ -152,7 +164,17 @@ class Pipeline:
             self.db = Database(cfg.db_path)
             self._archive_ghost_batches()
             self.db.prune_events(C.EVENTS_KEEP_BATCHES)   # P1-3 retention
-            self.library = pw_mod.load_library(cfg.passwords_file, workdir=cfg.workdir, root=cfg.workdir)
+            # v3.6.0 Part A: seed the library's ordering with DB-truth success
+            # counts (read-only).  Failure to read degrades to the learned file
+            # only — initialisation order is deliberately NOT reshuffled for it.
+            try:
+                db_counts = pwstats.counts_from_db(self.db.conn)
+            except Exception:  # noqa: BLE001
+                db_counts = {}
+            self.library = pw_mod.load_library(cfg.passwords_file,
+                                               workdir=cfg.workdir,
+                                               root=cfg.workdir,
+                                               counts=db_counts)
             return self._run_locked(initial_ids)
         finally:
             if self.db is not None:
@@ -725,6 +747,12 @@ class Pipeline:
                       % (stat.total_files, stat.non_archive))
         db.bump_batch(cfg.batch, "n_extracted")
 
+        # -- 7.5 password library self-learning (Part A, v3.6.0) ----------------
+        # Success has just landed in the DB (is_extracted=1).  Record the winning
+        # password so future batches try the most successful passwords first.
+        # Idempotent (a PW_LEARNED event is the credential) and dry-run safe.
+        self._learn_password(fid, password, hit[1] if hit else "")
+
         # -- 8a. enqueue extraction products (recursive; 套娃 continues here) ----
         for p in fsutil.real_list_files(out_dir):
             self._upsert_child(p, row, origin="EXTRACTED")
@@ -736,6 +764,62 @@ class Pipeline:
                           "fully done: output verified, children terminal")
             self._maybe_delete_source(fid, stat=stat)
         self._on_terminal(fid)
+
+    # ------------------------------------------------------------------
+    def _learn_password(self, fid: int, password: str, source: str) -> None:
+        """Part A (v3.6.0): record a successful password into the learned library.
+
+        Iron rules (QA-verified):
+          * **dry-run writes NOTHING** — ``record_success`` is never called when
+            ``cfg.dry_run`` (only a dry marker event is emitted).
+          * **idempotent** — a prior ``file_id`` + ``PW_LEARNED`` event is the
+            credential; a second call (e.g. retry-failed re-extracting the same
+            row) is a no-op, so counts never double-increment.
+          * the empty password (the ``NONE`` fast path) is never learned.
+          * **NEVER raises** — learning must not be able to crash a batch.
+        """
+        db, cfg = self.db, self.cfg
+        try:
+            if not password:
+                return
+            if cfg.dry_run:
+                db.event(fid, C.ACTION_PW_LEARNED,
+                         "dry-run: password learning skipped", batch=cfg.batch)
+                return
+            guard = db.conn.execute(
+                "SELECT 1 FROM events WHERE file_id=? AND action=? LIMIT 1",
+                (fid, C.ACTION_PW_LEARNED)).fetchone()
+            if guard:
+                return
+
+            src = source or "UNKNOWN"
+            try:
+                was_in_library = password in pw_mod.library_password_set(
+                    cfg.passwords_file, workdir=cfg.workdir, root=cfg.workdir)
+            except Exception:  # noqa: BLE001 — be conservative, no false "new"
+                was_in_library = True
+
+            r = pwstats.record_success(pwstats.learned_path(), password, src)
+            if not r.get("written"):
+                _emit("⚠ 密码学习写入失败（已忽略）：%s"
+                      % (r.get("detail") or "unknown"))
+                return
+
+            db.event(fid, C.ACTION_PW_LEARNED,
+                     "password learned: '%s' source=%s count=%d (new=%s)"
+                     % (password, src, r.get("new_count", 0),
+                        bool(r.get("is_new"))),
+                     batch=cfg.batch)
+
+            if r.get("is_new") or not was_in_library:
+                _emit("🔑 新密码入库: '%s' (来源 %s) 累计 %d 次 "
+                      "-> assets/passwords.learned.txt"
+                      % (password, src, r.get("new_count", 0)))
+        except Exception as exc:  # noqa: BLE001 — never break a batch over this
+            try:
+                _emit("⚠ 密码学习异常（已忽略）：%r" % exc)
+            except Exception:  # noqa: BLE001
+                pass
 
     # ------------------------------------------------------------------
     def _fail_unsafe_path(self, fid: int, root_dir: str,

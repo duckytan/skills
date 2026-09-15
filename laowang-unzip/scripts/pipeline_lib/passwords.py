@@ -8,8 +8,13 @@ Candidate order (cheap & specific first):
 3. ``BRACKET`` / ``DIR_NAME`` / ``FILE_NAME`` — codes scraped from names, e.g.
    「（5656456）」 or 「解压码：维生素」 or 「口令：abc123」 or 「密码=xyz789」
    (v1 pitfall 13: full-width brackets!)
-4. ``LIBRARY``         — the bundled passwords.txt + the user's own
-                          ``<workdir>/password.txt`` if present
+4. ``LIBRARY``         — the **merged, count-sorted** library: the self-learned
+                          layer (``<skill>/assets/passwords.learned.txt``) +
+                          the bundled passwords.txt + the user's own
+                          ``<workdir>/password.txt`` etc.  v3.6.0: entries are
+                          ordered by *successful-extraction count* (most
+                          successful tried first); the **source order below**
+                          only breaks ties.
 5. ``TXT_MINED``       — LAST RESORT (§fix⑥): when 1-4 all fail, mine
                           already-extracted ``.txt`` docs (a 密码.txt that came
                           out of a friend/parent archive, or any line carrying a
@@ -20,6 +25,14 @@ Candidate order (cheap & specific first):
    tried right after ``INHERITED`` (user rule, 2026-09-13).  See
    ``scrape_trailing_password``.
 
+v3.6.0 decision — the count-based sort ONLY reorders the ``LIBRARY`` segment;
+it does NOT change the source order above.  Explicit name/parent signals
+(``TRAIL_BRACKET`` / ``FILE_NAME`` / ``DIR_NAME`` / ``INHERITED``) stay ahead of
+the library because they are per-archive, high-confidence evidence, whereas the
+library is a *prior*.  Reordering sources would let a very popular password
+shadow a password the current filename literally spells out — a regression.
+So ``prioritize`` is applied inside ``load_library`` only.
+
 Judging a password is ONLY ever done via ``7z t`` — never ``7z l`` (v1
 pitfall 14: ``7z l`` succeeds on encrypted headers and lies to you).
 """
@@ -28,10 +41,11 @@ from __future__ import annotations
 
 import os
 import re
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from . import config as C
 from . import fsutil
+from . import pwstats
 
 # P0-2 (SKILL.md §5): brackets may wrap ANY code — Chinese, symbols, spaces —
 # so the only excluded characters are the bracket characters themselves.
@@ -86,14 +100,26 @@ BUILTIN_PASSWORDS = os.path.join(SKILL_ROOT, "assets", "passwords.txt")
 # User-maintained local lib(s), merged BEFORE the seeds; never committed.
 LOCAL_SKILL_PASSWORDS = os.path.join(SKILL_ROOT, "assets", "passwords.local.txt")
 LOCAL_ROOT_PASSWORDS = ".pipeline" + os.sep + "passwords.local.txt"
+# v3.6.0: machine-maintained self-learning layer.  Written by the pipeline when
+# an archive is successfully extracted (see scheduler._learn_password) and by
+# ``pipeline.py pw-stats --rebuild``; count-sorted (most successful first).
+LEARNED_SKILL_PASSWORDS = os.path.join(SKILL_ROOT, "assets",
+                                       "passwords.learned.txt")
 
 
 def describe_sources(passwords_file: Optional[str] = None,
                      workdir: Optional[str] = None,
                      root: Optional[str] = None) -> list:
-    """Return ``[(label, path)]`` in merge priority order (for doctor output)."""
+    """Return ``[(label, path)]`` in merge priority order (for doctor output).
+
+    v3.6.0 merge order (label ``learned`` added)::
+
+        external -> local(skill) -> learned -> local(root .pipeline)
+        -> workdir password.txt -> builtin
+    """
     out = [("external", passwords_file or "")]
     out.append(("local", LOCAL_SKILL_PASSWORDS))
+    out.append(("learned", LEARNED_SKILL_PASSWORDS))
     if root:
         out.append(("local", os.path.join(root, LOCAL_ROOT_PASSWORDS)))
     if workdir:
@@ -102,39 +128,91 @@ def describe_sources(passwords_file: Optional[str] = None,
     return out
 
 
+def _load_file_into(path: str, ordered: List[str], seen: set,
+                    learned: bool = False) -> None:
+    """Merge one library file into ``ordered`` (order-preserving, deduplicated).
+
+    ``learned=True`` parses the TAB-separated self-learning format via
+    ``pwstats.parse_learned`` (a naive line read would treat
+    ``"188\\t上老王论坛当老王\\t..."`` as a single "password").  Missing files and
+    read errors are silently ignored.
+    """
+    if not path or not os.path.isfile(path):
+        return
+    if learned:
+        try:
+            _h, entries, _f = pwstats.parse_learned(path)
+        except Exception:  # noqa: BLE001 — a broken learned file must not break us
+            return
+        for e in entries:
+            pw = e.password
+            if pw and pw not in seen:
+                seen.add(pw)
+                ordered.append(pw)
+        return
+    try:
+        with open(path, "r", encoding="utf-8-sig", errors="ignore") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if line not in seen:
+                    seen.add(line)
+                    ordered.append(line)
+    except OSError:
+        pass
+
+
 def load_library(passwords_file: Optional[str] = None,
                  workdir: Optional[str] = None,
-                 root: Optional[str] = None) -> List[str]:
-    """Merge the password libraries in priority order (first hit wins later).
+                 root: Optional[str] = None,
+                 counts: Optional[Dict[str, int]] = None,
+                 prioritize_by_count: bool = True) -> List[str]:
+    """Merge the password libraries in priority order, then sort by success count.
 
     Merge order (each deduplicated, order-preserving):
       1. ``--passwords`` external file
       2. ``<skill>/assets/passwords.local.txt``   (user lib, not in git)
-      3. ``<root>/.pipeline/passwords.local.txt`` (per-root user lib, SKILL.md §5)
-      4. ``<root>/password.txt``                  (convenience working lib)
-      5. ``<skill>/assets/passwords.txt``         (read-only community seeds)
+      3. ``<skill>/assets/passwords.learned.txt`` (self-learned, count-sorted)
+      4. ``<root>/.pipeline/passwords.local.txt`` (per-root user lib, SKILL.md §5)
+      5. ``<root>/password.txt``                  (convenience working lib)
+      6. ``<skill>/assets/passwords.txt``         (read-only community seeds)
+
+    v3.6.0: when ``prioritize_by_count`` is true the merged list is re-sorted
+    **descending by successful-extraction count** (``pwstats.prioritize``); counts
+    come from the learned file, overridden by ``counts`` (the DB-truth dict from
+    ``pwstats.counts_from_db``) when supplied.  Equal counts keep their merged
+    order, so the whole feature degrades gracefully to the old behaviour when no
+    counts are known.  Passing ``counts=None`` still works (learned file only).
     """
     ordered: List[str] = []
-    seen = set()
+    seen: set = set()
+    for label, path in describe_sources(passwords_file, workdir, root):
+        _load_file_into(path, ordered, seen, learned=(label == "learned"))
 
-    def _load(path: str) -> None:
-        if not path or not os.path.isfile(path):
-            return
-        try:
-            with open(path, "r", encoding="utf-8-sig", errors="ignore") as fh:
-                for line in fh:
-                    line = line.strip()
-                    if not line or line.startswith("#"):
-                        continue
-                    if line not in seen:
-                        seen.add(line)
-                        ordered.append(line)
-        except OSError:
-            pass
+    if not prioritize_by_count:
+        return ordered
 
-    for _label, path in describe_sources(passwords_file, workdir, root):
-        _load(path)
-    return ordered
+    merged: Dict[str, int] = dict(pwstats.read_counts(LEARNED_SKILL_PASSWORDS))
+    if counts:
+        for k, v in counts.items():
+            try:
+                merged[k] = int(v)      # DB 口径覆盖同名键
+            except (TypeError, ValueError):
+                continue
+    return pwstats.prioritize(ordered, merged)
+
+
+def library_password_set(passwords_file: Optional[str] = None,
+                         workdir: Optional[str] = None,
+                         root: Optional[str] = None) -> set:
+    """Unsorted set of every password in the (merged) library.
+
+    Used by the scheduler to answer "was this password already known?" without
+    caring about order.  Reuses the exact ``_load_file_into`` logic — no copy.
+    """
+    return set(load_library(passwords_file, workdir=workdir, root=root,
+                            prioritize_by_count=False))
 
 
 def scrape_from_names(names: List[str], source_tag: str) -> List[tuple]:

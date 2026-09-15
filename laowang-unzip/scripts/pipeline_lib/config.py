@@ -67,6 +67,9 @@ ACTION_CRASH_RECOVER = "CRASH_RECOVER"
 ACTION_RENAME = "RENAME"
 ACTION_PW_HIT_RETRY = "PW_HIT_RETRY"   # add-password --test hit -> requeued
 ACTION_COLLECT = "COLLECT"             # 成品归集 move/copy of a leaf content file
+# v3.6.0 Part A: a winning password was recorded into the self-learning library.
+# Doubles as the idempotency credential (one PW_LEARNED event per file_id).
+ACTION_PW_LEARNED = "PW_LEARNED"
 
 # ---------------------------------------------------------------------------
 # fail_reason enum (§7.1, 25 values)

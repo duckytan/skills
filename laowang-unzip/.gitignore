@@ -3,4 +3,8 @@ __pycache__/
 # 个人密码库：含真实密码，绝不入库/推送
 *.local.txt
 passwords.local.txt
+# 自学习密码库：机器维护、随本机使用增长，绝不入库（v3.6.0）
+assets/passwords.learned.txt
 references/.backup/
+# QA 变异测试前的原始文件快照（本机复核用，绝不入库）
+scripts/.qa-backup-*/
