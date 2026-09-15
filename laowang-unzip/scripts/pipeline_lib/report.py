@@ -223,6 +223,23 @@ def generate_report(pipe) -> str:
         L.append("（无 — 本批没有需要人工处理的项）")
     L.append("")
 
+    # -- 七·附、遗留的 carved 派生包（需你确认后清） ------------------------
+    L.append("## 七·附、遗留的 carved 派生包（需你确认后清）")
+    L.append("")
+    orphans = getattr(pipe, "orphan_carved", [])
+    if orphans:
+        L.append("⚠ 以下 carved / patched / concat 派生包仍留在盘上，但其父源"
+                 "已不在盘上（源已删而派生包残留）。**本工具不会自动删除 —— "
+                 "请人工确认后再清理**，避免误删仍含未导出内容的包。")
+        L.append("")
+        L.append("| # | 残留派生包路径 |")
+        L.append("|---|---|")
+        for i, op in enumerate(orphans, 1):
+            L.append("| %d | %s |" % (i, op))
+    else:
+        L.append("（无 — 未发现父源已删但派生包残留的情况）")
+    L.append("")
+
     # -- 八、本批自动执行了什么（可追溯性） -----------------------------------
     L.append("## 八、本批自动执行了什么（可追溯性）")
     L.append("")

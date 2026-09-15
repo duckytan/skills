@@ -179,3 +179,18 @@
 - 根因：那是 1.6GB `mdat` 里的短签名（gzip/bzip2/MZ 之类）统计噪声——坑 #35 的具象实例。
 - 处置：读 `mvhd` 盒算时长（faststart 文件 moov 在头部），主视频 72 分钟**完整、单段**，确认无第二段，撤回挖取。判据已固化：视频文件"疑似嵌包"必须先用时长/盒结构反证它本身就是完整视频，再决定是否 carve。
 - 关联：#35；#42 ③
+
+## 2026-09-15 批次（【new】目录，本机实测）
+
+### [LES-20260915-01] bug P1 open（本机 `--dry-run` 并非非破坏 + 删除为永久）
+- 现象：在 DuckyPC 沙箱跑 `run --src 【new】 --dry-run`，文档(§2.1/§4.3)写"只扫描不解压不删"，但实测**既解压（在源目录生成 `_carved.7z/.rar/.zip` 产品 + `_carved/` 内容子目录）又删源文件**（女生宿舍楼…tar 被删）。干跑窗口 23:51–00:01 内生成全部 carved 产物即证。
+- 根因（待定，两种可能）：① 本机安装的 skill 版本 dry-run 未真正抑制 extract/delete 主循环；② 沙箱 safe-delete 钩子拦截删除，使"dry-run 不删"的开关在钩子层失效。无论哪种，**不能把本机 dry-run 当安全只读**。
+- 处置（运维铁律）：本机跑 laowang-unzip 前，把 `--dry-run` 也当"会动盘"对待；删前必用 AskUserQuestion 等显式确认。另：本机 `delete_file` 走 `EXTERNAL`(rc=2) = 钩子硬删除，**回收站实测仅 22.96MB（删完 14GB 源文件没进回收站）**，即删除永久不可回收——与 SKILL.md §6 "Windows 进回收站可还原" 在本沙箱不符。删前务必用户拍板。
+- 关联：SKILL.md §2.1/§4.3/§6；user 记忆 safe-delete 钩子 FAIL_CLOSED=硬删除
+
+### [LES-20260915-02] bug P1 open（_maybe_delete_source 只删源、不删 carved 派生包）
+- 现象：【new】解压后，12 个 `_carved/` 内容目录在，但 7 个 `_carved.7z/.rar/.zip` 中间包残留（约 7.4GB）。设计文档 design-v2.1.md:837 写"假 mp4 + 割出的 zip 都算源，两个一起删"，但代码没实现。
+- 根因（实读 scheduler.py 确认）：`_maybe_delete_source`(scheduler.py:1040) 只把 `row["path"]` + 同 `volume_group` 兄弟加入 `paths`(1119-1128) 去删；carved 派生包在 DB 里是 `origin="CARVED"` 的子行(REPAIR_ORIGINS, scheduler.py:39)，check#10(1083-1086) 仅校验它"没 FAILED"，**从不把它加入删除集合**。故源删了、carved 包留下。
+- 连带：dry-run 泄漏(LES-20260915-01)使正式 run 0 秒短路，删除阶段根本没触发；本次 14 个源是手动 fsutil 补删的，carved 包连手动补删列表都没进（派生行不在原始源清单）。
+- 处置（待优化）：① `_maybe_delete_source` 删除集合应并入 origin∈REPAIR_ORIGINS 且位于源同目录的派生包；② dry-run 真正非破坏（block extract）；③ 起 run 时 DB↔磁盘对账，源仍在盘就重验不信任 done 标志；④ 末轮"残留扫描"：父源已删而 carved 包还在→报告并(用户授权后)清；⑤ 跑完断言"无孤儿 carved 包"。现有 scripts/tests/test_audit.py 已注册 origin=CARVED 子行，可加回归测试。
+- 关联：LES-20260915-01；design-v2.1.md:813-838
