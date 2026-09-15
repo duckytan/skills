@@ -51,6 +51,7 @@ SKILL_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 from pipeline_lib import config as C                       # noqa: E402
 from pipeline_lib import audit as audit_mod                # noqa: E402
+from pipeline_lib import evolve as evolve_mod              # noqa: E402
 from pipeline_lib import fsutil                            # noqa: E402
 from pipeline_lib import passwords as passwords_mod        # noqa: E402
 from pipeline_lib import recycle as recycle_mod            # noqa: E402
@@ -295,6 +296,36 @@ def build_parser() -> argparse.ArgumentParser:
                        help="environment check: 7z, python, root, db, password libs")
     add_common(p)
     p.set_defaults(func=cmd_doctor)
+
+    p = sub.add_parser("evolve",
+                       help="self-evolution: lessons health check + candidate mining "
+                            "+ mechanical curation (SKILL.md §3.1/§3.2)")
+    add_common(p)
+    p.add_argument("--batch", default=None,
+                   help="batch label to mine (default: latest batch in the db)")
+    p.add_argument("--json", action="store_true",
+                   help="emit a machine-readable JSON blob (for CI / tooling)")
+    p.add_argument("--check", action="store_true",
+                   help="gate mode: exit 1 when the self-evolution loop is unhealthy, "
+                        "exit 0 (quiet) when healthy")
+    p.add_argument("--apply", action="store_true",
+                   help="run mechanical actions (backfill `- 复现：N 次` + archive). "
+                        "Backs up first; never edits Skill-layer prose, never flips "
+                        "open -> promoted")
+    p.add_argument("--force", action="store_true",
+                   help="with --apply: archive even when lessons.md is under threshold")
+    p.add_argument("--new", nargs=2, metavar=("CAT", "PRI"),
+                   help="append a new lesson of category CAT (bug|ops|limit|user) and "
+                        "priority PRI (P0|P1|P2); pair with --phenomenon/--root-cause/"
+                        "--fix/--related/--occ")
+    p.add_argument("--phenomenon", default="", help="new lesson: 现象 text (--new)")
+    p.add_argument("--root-cause", dest="root_cause", default="",
+                   help="new lesson: 根因 text (--new)")
+    p.add_argument("--fix", default="", help="new lesson: 处置 text (--new)")
+    p.add_argument("--related", default="", help="new lesson: 关联 text (--new)")
+    p.add_argument("--occ", type=int, default=1,
+                   help="new lesson: occurrence count (default 1) (--new)")
+    p.set_defaults(func=cmd_evolve)
     return ap
 
 
@@ -845,6 +876,115 @@ def cmd_init_db(args) -> int:
     return 0
 
 
+def _evolve_lessons_path() -> str:
+    return os.path.join(SKILL_DIR, "references", "lessons.md")
+
+
+# health() 检查名 → doctor 里给人看的短标签（顺序即 checks 顺序）。
+_EVOLVE_CHECK_LABELS = {
+    "lessons_md_exists": "缺 lessons.md",
+    "lessons_lines_vs_threshold": "行数超阈值",
+    "entries_parseable": "解析灾难",
+    "missing_occ_field": "缺 occ",
+    "promotion_due": "待提升",
+    "stale_open": "超期 open",
+    "changelog_vs_code": "改码未记版本",
+    "archive_file": "无 archive",
+}
+
+
+def _print_evolve_report(res: dict) -> None:
+    """打印人类可读的「自进化环报告」（默认输出）。"""
+    h = res.get("health", {}) or {}
+    print("== 自进化环报告 ==")
+    print("lessons.md : %d 行 / open %d / 待提升 %d / 合格：%s"
+          % (h.get("lessons_lines", 0), h.get("open_count", 0),
+             h.get("promotion_due", 0), "是" if h.get("ok") else "否"))
+
+    print("\n[健康度检查]")
+    for c in h.get("checks", []):
+        print("  %s %-26s %s" % ("OK  " if c.get("ok") else "FAIL",
+                                 c.get("name", "?"), c.get("detail", "")))
+        if not c.get("ok") and c.get("hint"):
+            print("       hint: %s" % c["hint"])
+
+    print("\n[待提升清单]")
+    cands = res.get("candidates", []) or []
+    if cands:
+        for c in cands:
+            print("  - %s %s %s (occ=%d)" % (c["id"], c["category"],
+                                             c["priority"], c["occ"]))
+    else:
+        print("  （无）")
+
+    mine = res.get("mine", {}) or {}
+    print("\n[本批候选素材] batch=%s" % (mine.get("batch") or "-"))
+    for e in (mine.get("errors") or [])[:10]:
+        print("  - %-5s %s ×%d" % (e.get("level"), e.get("action"), e.get("count")))
+    frs = mine.get("fail_reasons") or []
+    if frs:
+        print("  fail_reason: %s"
+              % "、".join("%s×%d" % (f["fail_reason"], f["count"]) for f in frs[:10]))
+    nfr = mine.get("new_fail_reasons") or []
+    if nfr:
+        print("  ★ 新错误形态: %s" % "、".join(nfr))
+    if mine.get("detail"):
+        print("  note: %s" % mine["detail"])
+
+    if res.get("applied"):
+        print("\n[已执行机械动作]")
+        for a in res["applied"]:
+            print("  - %s" % a)
+
+    print("\n下一步：按 SKILL.md §3.2 自我迭代协议处置待提升教训；"
+          "未处置的候选教训不得标记批次收尾。")
+
+
+def cmd_evolve(args) -> int:
+    """自进化环 CLI（SKILL.md §3.1/§3.2）：健康度自检 + 候选挖掘 + 机械治理。
+
+    默认打印人类可读报告（exit 0）；``--check`` 为闸口模式（不健康 exit 1）；
+    ``--json`` 输出机器可读结果；``--apply`` 执行机械动作（补 occ + 归档，写前备份）；
+    ``--new CAT PRI`` 追加一条新教训。
+    """
+    root = None
+    try:
+        root, _local = resolve_root(args)
+    except ValueError:
+        root = None
+
+    # --new：追加一条新教训（不读取 db） -----------------------------------
+    if getattr(args, "new", None):
+        cat, pri = args.new
+        les = evolve_mod.append_lesson(
+            _evolve_lessons_path(), category=cat, priority=pri,
+            phenomenon=args.phenomenon, root_cause=args.root_cause,
+            fix=args.fix, related=args.related, occ=args.occ)
+        print("appended lesson %s -> references/lessons.md" % les.id)
+        return 0
+
+    res = evolve_mod.evolve(root=root, skill_root=SKILL_DIR,
+                            batch=getattr(args, "batch", None),
+                            apply=getattr(args, "apply", False),
+                            force=getattr(args, "force", False))
+
+    if getattr(args, "json", False):
+        print(json.dumps(res, ensure_ascii=False, indent=2))
+        return 0
+
+    if getattr(args, "check", False):
+        if res.get("ok"):
+            return 0                       # 合格 → 安静退出 0
+        bad = [c["name"] for c in res.get("health", {}).get("checks", [])
+               if not c.get("ok")]
+        print("evolve --check: 自进化环不健康 -> %s" % ", ".join(bad),
+              file=sys.stderr)
+        return 1
+
+    _print_evolve_report(res)
+    return 0
+
+
 def cmd_doctor(args) -> int:
     """Environment check (SKILL.md quick-start step ①): 7z / python / root /
     db writability / password libraries.  Exit 1 when a critical item fails."""
@@ -892,6 +1032,36 @@ def cmd_doctor(args) -> int:
         print("   - %-10s %s %s" % (label, path,
                                      "" if os.path.isfile(path) else "(absent)"))
     print("   = %d unique candidate password(s) loaded" % len(pw_lib))
+
+    # 7) 自进化环健康度（SKILL.md §3.1/§3.2）——**只提示，默认不计入 problems**。
+    #    职责分离：doctor 回答「环境+代码能不能开工」，`evolve --check` 回答
+    #    「自进化有没有欠账、本批能不能收尾」——欠账不该阻止开工（否则 doctor
+    #    在真实 skill 上恒 exit 1，失败信号被脱敏）。唯一例外：entries_parseable
+    #    为 False 属代码级故障（lessons.md 解析灾难，会让后续归档全部失效）→ 才计入。
+    try:
+        ev = evolve_mod.evolve(root=root, skill_root=SKILL_DIR)
+        h = ev.get("health", {}) or {}
+        failed = [c for c in h.get("checks", []) if not c.get("ok")]
+        parse_bad = any(c["name"] == "entries_parseable" and not c["ok"]
+                        for c in h.get("checks", []))
+        if not failed:
+            print("7) 自进化环  : OK（lessons %d 行 / open %d / 待提升 %d）"
+                  % (h.get("lessons_lines", 0), h.get("open_count", 0),
+                     h.get("promotion_due", 0)))
+        else:
+            labels = " / ".join(_EVOLVE_CHECK_LABELS.get(c["name"], c["name"])
+                                for c in failed)
+            if parse_bad:
+                print("7) 自进化环  : %d 项欠账（%s）— 其中「解析灾难」计入 problems"
+                      "（doctor exit 1），请先修复 lessons.md 格式；其余仅提示，"
+                      "收尾闸口用 evolve --check" % (len(failed), labels))
+            else:
+                print("7) 自进化环  : %d 项欠账（%s）— 仅提示，不影响本次退出码；"
+                      "批次收尾闸口请用 evolve --check" % (len(failed), labels))
+        if parse_bad:
+            problems.append("自进化环解析灾难: lessons.md 无法解析出合规条目")
+    except Exception as exc:  # 自省失败绝不能让 doctor 崩
+        print("7) 自进化环  : SKIPPED (%s)" % exc)
 
     print("\nresult: %s" % ("OK — environment ready"
                            if not problems else "PROBLEMS: " + "; ".join(problems)))

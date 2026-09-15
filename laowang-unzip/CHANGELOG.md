@@ -1,5 +1,60 @@
 # Changelog
 
+## v3.5.0 (2026-09-15) — 自进化环机械化（§3.2 自我迭代协议 + evolve 引擎 / CLI / health 自检 / 报告第十一节）
+
+**背景：自进化环此前只是「纸面约定」，已实证失效**
+- `lessons.md` 已 196 行 > 自定阈值 150，却**从未归档**（`lessons-archive.md` 不存在）→ 规则没人执行。
+- 提升规则写「复现 ≥2 次或 P0 才提升」，但条目里**根本没有复现次数字段**，靠人肉记忆 → 无法机械判定。
+- 第 0/11 步只是**祈使句**，跳过也无人发现，**零闸口**；`doctor` 只查环境，不查 skill 自身健康度。
+- 没有任何工具能从 `events` 表自动挖掘「本批出现了什么新错误形态」，全靠人回想。
+
+**新增模块 `scripts/pipeline_lib/evolve.py`（自进化引擎，纯标准库，绝不抛异常）**
+- **解析/渲染**：`parse_lessons` / `render_lessons` **字节级无损 round-trip**（护栏：真实
+  `lessons.md` 23 条解析后渲染**逐字节一致**，未来归档动作不可能悄悄损坏既有条目）；
+  `Lesson` 数据模型（id/date/seq/category/priority/status/occ/note/body/start/end）。
+- **判定**：`promotion_candidates`（`open` 且 `P0` 或 `occ>=2`）；`- 复现：N 次` 缺字段默认 1，
+  `OCC_RE` 可解析显式值。
+- **治理**：`append_lesson`（自动编号 `LES-YYYYMMDD-NN` + 写前备份）、`archive`（超 150 行搬
+  promoted/resolved 到 `lessons-archive.md`，**写前必备份**；`force` 强制）；`ARCHIVE_THRESHOLD=150`。
+- **只读挖掘**：`mine_from_db`（`sqlite3` `mode=ro` 打开；聚合本批 errors / fail_reasons、
+  识别「本批出现、其它批次从未出现」的新错误形态；表/列缺失一律降级、不抛）。
+- **健康度**：`health()` 八项检查（lessons 存在 / 行数 vs 阈值 / 条目可解析 / 缺复现字段 /
+  待提升 / 超期 open / CHANGELOG vs 代码 mtime / 归档文件存在性），全项不抛异常。
+- **总入口**：`evolve()` = health + mine + candidates；`apply=True` **只做机械动作**（补 occ + 归档），
+  **绝不自动改 Skill 层正文、绝不自动把 `open` 改成 `promoted`**（提升判据必须人/AI 补丁式写）。
+
+**CLI / doctor / 报告**
+- `pipeline.py` 新增 `evolve` 子命令：`--json`（机器可读，供未来接 CI）、`--check`（**闸口**：
+  不健康 exit 1、健康安静 exit 0）、`--apply`、`--force`、`--new CAT PRI`；默认打印人类可读
+  「自进化环报告」（健康度检查表 + 待提升清单 + 本批候选素材 + 下一步）。
+- `cmd_doctor` 新增第 7 项「自进化环」：打印欠账项（行数超阈值 / 缺 occ / 无 archive 等）。
+  **仅提示、默认不计入 `problems`、不影响 doctor 退出码**（职责分离：doctor 答「能不能开工」，
+  `evolve --check` 答「自进化有没有欠账、本批能不能收尾」——欠账不该阻止开工，否则真实 skill 上
+  doctor 恒 exit 1、失败信号被脱敏）。**唯一例外**：`entries_parseable` 为 False（lessons.md 解析灾难 /
+  格式崩坏，会让后续归档全部失效）→ 才计入 `problems` 使 doctor exit 1；接入异常不影响既有 6 项与 exit 语义。
+  （QA 复审修正：初版设计会把全部健康欠账计入 `problems`，导致 doctor 恒 exit 1，已改为上述「只提示 + 解析灾难例外」。）
+- `report.py` 追加**第十一节「自省」**（skill 健康度 + 本批候选素材 errors/fail_reasons/新错误形态
+  + 待提升清单），**整段包 try/except，绝不让报告生成失败**；第七节收尾提示加「★ 本批自省」一条。
+
+**文档**
+- `SKILL.md`：第 11 步改为**硬流程**（`evolve --batch` 必跑；`evolve --check` 非 0 则本批**不得标记收尾**）；
+  新增 **§3.2「自我迭代协议」** 5 步强制流程 + 给 AI 的硬约束（**未走完 ①–⑤ 视为任务未完成**）；
+  §3.1 补「谁来做」机械/人工边界表；第 0 步补 `evolve --json`；§9 文件地图补 `evolve.py` /
+  `lessons-archive.md` / `.backup/`。
+- `README.md` 自进化条目补机械闸口说明。
+
+**测试与验证**
+- 新增 `scripts/tests/test_evolve.py` **28 用例**：真实 lessons.md 格式解析（**归档安全：不锁死条数**，
+  按 lessons+archive 合计校验）+ round-trip 字节等价护栏 /
+  occ 缺省与显式 / promotion 规则 / append 序号自增 + 备份 / archive 搬移 + 保留 open + 备份 /
+  health 超阈值·缺 occ·健康夹具 / `mine_from_db` 聚合·新形态·缺表不抛 / CLI `--check` 0/1·`--json`·`--new` /
+  报告含第十一节。
+- 全量 `python -m unittest discover -s tests` **133/133 OK**（基线 105，新增 28）。
+- `py_compile` 全过。
+
+> 待办（交主理人决定）：真实 `references/lessons.md` 现可 `python pipeline.py evolve --apply`
+> 一键补齐「复现」字段并归档（196 行 → 10 条 open），但按约定**未擅自动生产记忆**，留待人工执行。
+
 ## v3.4.1 (2026-09-15) — 补全 P0 闸门对已删行的 MOOT 判定 + reconcile 覆盖 carved/已解出容器（§fix⑧/§fix⑨）
 
 **根因：两处缺陷叠加，导致 2 个容器（合计约 2.2GB）永久残留在磁盘（生产库实测）**
