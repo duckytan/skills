@@ -79,6 +79,26 @@ python pipeline.py run --root <处理根> --src <待处理目录>
 `clean-junk` 确认后清中风险垃圾；`purge-recycle` 手动清回收站；`retry-failed` 重跑失败项；
 `report` 重新生成报告。
 
+### 2.2 加密码 / 密码库运维
+
+用户说"增加一条密码：xxx"时**不要手改内置种子**（`assets/passwords.txt` 是只读发布物），走子命令：
+
+```bash
+# 只入库（追加到 assets/passwords.local.txt：随 skill 的个人库、git-ignored、优先级最高）
+python pipeline.py add-password "<密码>" --root <处理根>
+
+# 入库 + 立刻拿新密码去试所有密码失败的包；命中的自动重新排队（PW_HIT_RETRY）
+python pipeline.py add-password "<密码>" --test --root <处理根> [--sevenzip <7z路径>]
+```
+
+- 文件按需创建，**一条一行、UTF-8、自动去重**（重复执行不会写第二条）。
+- `--test` 覆盖 db 里 `status=FAILED` 且 `fail_reason ∈ {WRONG_PASSWORD, PASSWORD_NOT_FOUND}` 的行，
+  逐条 `7z t`；命中 → 转 `QUEUED` 并记 `PW_HIT_RETRY` 事件，下一次 `run` / `retry-failed` 即解压。
+- 不想用命令也可以手工建 `assets/passwords.local.txt`（或按处理根隔离的
+  `<root>/.pipeline/passwords.local.txt`），逐行写密码即可——合并优先级见 §5。
+- 该密码生效于**下一次试解**；已 FAILED 的包不会再自动重试，要么 `--test`，要么 `retry-failed`。
+- 另有**自动兜底**：标准来源全找不到时会去已解压的 `.txt` 里挖密码（§5 第 7 条），无需手工加。
+
 ## 3. 主工作流（10 步 + 首尾两个自进化挂点，单线程，禁止并发）
 
 每一步的完整伪代码见 `references/design-v2.1.md` §3.3；接口签名见 `references/scripts-api.md`。
