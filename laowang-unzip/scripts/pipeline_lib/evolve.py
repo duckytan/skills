@@ -42,6 +42,9 @@ from . import pwstats
 
 __all__ = [
     "LESSON_RE", "OCC_RE", "SIG_RE", "ARCHIVE_THRESHOLD", "MIN_ENTRIES",
+    "MINEABLE_FAIL_PATTERNS", "BENIGN_FAIL_PATTERNS",
+    "BENIGN_EXACT_FAIL_REASONS", "JUDGEMENT_FAIL_REASONS",
+    "classify_fail_reason",
     "Lesson", "parse_lessons", "render_lessons", "promotion_candidates",
     "append_lesson", "archive", "mine_from_db", "health", "evolve",
     "bump_occ", "draft_lesson", "_signature",
@@ -408,6 +411,85 @@ def archive(path: str, archive_path: Optional[str] = None, force: bool = False) 
 
 
 # ---------------------------------------------------------------------------
+# §6b fail_reason 机械分类（v3.7.1 缺陷修复 E1/E2/E3）
+# ---------------------------------------------------------------------------
+# 背景（首次实战暴露的误判）：v3.6.0 的收尾自进化把**本批所有** fail_reason 都当
+# 失败挖掘，于是 ``NOT_ARCHIVE``（"这文件不是压缩包"，本就是正常终态，全网关 DB 里
+# 已出现 7544 次、每批都有）被误报成 `!!新形态`，并生成一条 `bug` 教训草稿，又因
+# occ=12 ≥ 2 立刻成为提升候选，把 ``evolve --check`` 卡成 rc=1 —— **假问题阻塞了
+# 批次收尾验收**。三个独立缺陷：
+#   E1 挖掘范围过宽：把正常终态也当失败挖；
+#   E2 "新形态"基线错误：拿教训库指纹当基线，而非数据库历史；
+#   E3 类别硬编码 + 闸口连带：草稿类别写死 bug，非缺陷变成 bug 教训并卡闸口。
+#
+# 对策：用**机械可判**的子串规则把 fail_reason 分成「真失败」与「正常终态」两类
+# （另有第三档「待判/未分类」仅供审计展示）。判据写死、大小写不敏感。
+MINEABLE_FAIL_PATTERNS = ("CORRUPT", "WRONG_", "FAIL", "LOST", "MISSING",
+                          "DATA_LOSS")
+BENIGN_FAIL_PATTERNS = ("NOT_ARCHIVE", "_RESOLVED", "VERIFIED", "JUNK_CLEANED",
+                        "DUP_KEEP_NEW_OLD_MISSING", "DUPLICATE", "SKIPPED")
+# 精确良性白名单（**在子串匹配之前**判定）：某些「正常终态」的名字恰好包含一个
+# 宽泛的 mineable 子串 —— 唯一实例 `DUP_KEEP_NEW_OLD_MISSING ⊃ "MISSING"`。若不
+# 先拦截，它会被「真失败优先」误判成 mineable，正是本缺陷要修的那类假草稿。
+# ``NONE`` 是流水线的「无失败」标记（生产库 8000+ 行），必须精确归良性，否则每批
+# 都会在「待判」里刷屏。
+BENIGN_EXACT_FAIL_REASONS = ("DUP_KEEP_NEW_OLD_MISSING", "NONE")
+# 「待判」形态：既非明确真失败、也非已识别的正常终态。UNKNOWN_BINARY 需要人工确认
+# 类型（可能是未知私有格式，也可能真有问题），故按 mineable 走（会落一条草稿供人补），
+# 但草稿类别标 `ops` 并在正文注明「待判（需人工确认，非必然代码缺陷）」——**不直接当 bug**。
+JUDGEMENT_FAIL_REASONS = ("UNKNOWN_BINARY",)
+
+
+def _fail_family(reason: Optional[str]) -> Tuple[str, str]:
+    """把 fail_reason 归入 ``mineable`` / ``benign`` / ``unclassified``。
+
+    返回 ``(family, matched)``。``classify_fail_reason`` 把 ``unclassified`` 折叠成
+    ``benign``（默认保守），但 ``mine_from_db`` 需要把「未分类」单列以便审计，故保留三分。
+    """
+    up = (reason or "").strip().upper()
+    if not up:
+        return "benign", ""
+    if up in BENIGN_EXACT_FAIL_REASONS:
+        return "benign", up
+    for p in MINEABLE_FAIL_PATTERNS:
+        if p in up:
+            return "mineable", p
+    for p in JUDGEMENT_FAIL_REASONS:
+        if p in up:
+            return "mineable", p
+    for p in BENIGN_FAIL_PATTERNS:
+        if p in up:
+            return "benign", p
+    return "unclassified", ""
+
+
+def classify_fail_reason(reason: str) -> str:
+    """把 fail_reason 机械分成 ``'mineable'``（真失败）或 ``'benign'``（正常终态）。
+
+    判定顺序（写死，勿随意调整）：
+
+      1. 空 / ``None`` → ``'benign'``（无形态即不建草稿）；
+      2. **精确**良性白名单（:data:`BENIGN_EXACT_FAIL_REASONS`）→ ``'benign'``。这条
+         必须排在子串匹配之前，否则 ``DUP_KEEP_NEW_OLD_MISSING`` 会被其中的
+         ``'MISSING'`` 抢判成 mineable（见常量注释）；
+      3. **真失败优先**（含子串，大小写不敏感）：命中 :data:`MINEABLE_FAIL_PATTERNS`
+         或 :data:`JUDGEMENT_FAIL_REASONS` → ``'mineable'``。真失败优先是为了让
+         ``CORRUPT_CARVED_..._RESOLVED`` 这类复合名不被 ``'_RESOLVED'`` 误判为良性；
+      4. 命中 :data:`BENIGN_FAIL_PATTERNS` → ``'benign'``；
+      5. 都不匹配（未分类，如 ``SOME_NEW_THING``）→ ``'benign'``（**默认不建草稿**，
+         保守优先：宁可漏建一条教训，也绝不制造一条假教训去堵住收尾闸口）。
+
+    典型判定（均有回归测试）：``WRONG_PASSWORD``/``ARCHIVE_CORRUPT``/
+    ``CORRUPT_CARVED``/``VOLUME_MISSING`` → mineable；``NOT_ARCHIVE``/
+    ``DUP_RESOLVED_KEEP_OLD``/``JUNK_CLEANED``/``STUCK_*_RESOLVED_*``/
+    ``ZERO_ROOTS_FALSE_ALARM_DISK_VERIFIED``/``DUP_KEEP_NEW_OLD_MISSING`` → benign；
+    ``UNKNOWN_BINARY`` → mineable（**待判**，见 :data:`JUDGEMENT_FAIL_REASONS`；
+    需人工确认类型，故会落一条 `ops` 草稿而非 bug 结论）。
+    """
+    return "mineable" if _fail_family(reason)[0] == "mineable" else "benign"
+
+
+# ---------------------------------------------------------------------------
 # §6 只读 DB 挖掘：本批候选教训素材
 # ---------------------------------------------------------------------------
 
@@ -423,7 +505,11 @@ def _open_ro(db_path: str):
 
 def _empty_mine(batch) -> dict:
     return {"batch": batch, "errors": [], "fail_reasons": [],
-            "new_fail_reasons": [], "dup_hits": 0, "deletes": 0,
+            "new_fail_reasons": [],
+            # v3.7.1 §6b: fail_reason 三分类 + 历史批次基线计数。
+            "mineable_fail_reasons": {}, "benign_fail_reasons": {},
+            "unclassified_fail_reasons": {}, "history_batches": 0,
+            "dup_hits": 0, "deletes": 0,
             "files_total": 0, "detail": "",
             "pw_gaps": {"db_only": [], "learned_total": 0,
                         "db_success_total": 0}}
@@ -454,14 +540,23 @@ def _pw_gaps(conn) -> dict:
 def mine_from_db(conn, batch: Optional[str] = None) -> dict:
     """**只读**挖掘本批候选教训素材（表/列不存在时降级为空结构，绝不抛）。
 
-    返回::
+    返回（v3.7.1 新增三分类与历史基线键，原有键全部保留、向后兼容）::
 
         {'batch': b,
          'errors':        [{'action':..,'level':..,'count':..,'sample':..}, ...],
-         'fail_reasons':  [{'fail_reason':..,'count':..}, ...],
-         'new_fail_reasons': [...],   # 本批出现、其它批次从未出现的 fail_reason
+         'fail_reasons':  [{'fail_reason':..,'count':..}, ...],   # 本批全部（不分良莠）
+         'new_fail_reasons': [...],   # 相对**数据库历史**首次出现的非正常终态形态
+         'mineable_fail_reasons':   {reason: count, ...},  # 真失败（值得建教训）
+         'benign_fail_reasons':     {reason: count, ...},  # 已识别的正常终态（不建草稿）
+         'unclassified_fail_reasons': {reason: count, ...},# 未分类（默认按良性处理，仅审计）
+         'history_batches': int,      # 用来算基线的历史批次总数（不含当前批）
          'dup_hits': int, 'deletes': int, 'files_total': int,
          'detail': str}               # 降级/异常说明（正常时为空串）
+
+    「新形态」（缺陷 E2 修复）：一个 reason 算新，当且仅当它在本批之前的**任何批次**
+    里都没出现过（只统计 ``batch != 当前批`` 的行；当前批自身不算历史），且它不是已
+    识别的正常终态（:func:`classify_fail_reason` != benign）。历史基线不可得时宁可
+    少报：``new_fail_reasons`` 降级为 ``[]`` 并在 ``detail`` 写明原因。
     """
     out = _empty_mine(batch)
     if conn is None:
@@ -531,8 +626,28 @@ def mine_from_db(conn, batch: Optional[str] = None) -> dict:
             out["detail"] += "fail_reasons query failed: %s; " % exc
         out["fail_reasons"] = [{"fail_reason": f, "count": c} for f, c in frs]
 
-        # -- 新错误形态：本批出现、其它批次从未出现 -----------------------
-        others = set()
+        # -- v3.7.1 §6b: fail_reason 三分类（真失败 / 正常终态 / 待判） ----------
+        # 只对 mineable 走后续的 occ 累计 / 机器草稿；benign 永不建草稿；unclassified
+        # 默认按良性处理但单列出来供审计（不作为 problems、不阻塞闸口）。
+        mineable: dict = {}
+        benign: dict = {}
+        unclassified: dict = {}
+        for f, c in frs:
+            fam = _fail_family(f)[0]
+            if fam == "mineable":
+                mineable[f] = c
+            elif fam == "benign":
+                benign[f] = c
+            else:
+                unclassified[f] = c
+        out["mineable_fail_reasons"] = mineable
+        out["benign_fail_reasons"] = benign
+        out["unclassified_fail_reasons"] = unclassified
+
+        # -- 基线修正（缺陷 E2）：以**数据库历史**（当前批之前的所有批次）为基线，
+        #    而非教训库指纹。「新形态」= 相对数据库历史首次出现的**非正常终态**形态。
+        others: set = set()
+        others_ok = True
         try:
             for r in fetch(
                     "SELECT DISTINCT fail_reason FROM files"
@@ -540,8 +655,20 @@ def mine_from_db(conn, batch: Optional[str] = None) -> dict:
                     " AND (batch IS NULL OR batch<>?)", (b,)):
                 others.add(r[0])
         except sqlite3.Error as exc:
+            others_ok = False
             out["detail"] += "new_fail_reasons query failed: %s; " % exc
-        out["new_fail_reasons"] = [f for f, _ in frs if f not in others]
+        out["history_batches"] = int(scalar(
+            "SELECT COUNT(DISTINCT batch) FROM files"
+            " WHERE batch IS NOT NULL AND batch<>?", (b,), 0) or 0)
+        if others_ok:
+            out["new_fail_reasons"] = [
+                f for f, _ in frs
+                if f not in others and _fail_family(f)[0] != "benign"]
+        else:
+            # 宁可少报，不可虚报：历史基线不可得时绝不臆造「新形态」。
+            out["new_fail_reasons"] = []
+            out["detail"] += ("new_fail_reasons degraded to [] "
+                              "(history baseline unavailable); ")
 
         # -- 计数字段 -----------------------------------------------------
         out["dup_hits"] = scalar(
@@ -997,7 +1124,10 @@ _P1_TOKENS = ("WRONG_PASSWORD", "PASSWORD", "EXTRACT", "FAIL")
 
 
 def _priority_for_fail(fail_reason: str) -> str:
-    """按 fail_reason 关键词映射机器草稿优先级（见上方依据注释）。"""
+    """按 fail_reason 关键词映射机器草稿优先级（见上方依据注释）。
+
+    ``UNKNOWN_BINARY`` 不含任何 P0/P1 token → 落 P2（"待判"、需人工确认，非必然缺陷）。
+    """
     up = (fail_reason or "").upper()
     if any(t in up for t in _P0_TOKENS):
         return "P0"
@@ -1006,18 +1136,45 @@ def _priority_for_fail(fail_reason: str) -> str:
     return "P2"
 
 
-def draft_lesson(path: str, fail_reason: str, count: int,
-                 sample: str = "") -> dict:
-    """为「从未记录过的 fail_reason」自动追加一条机器草稿条目。
+def _category_for_fail(fail_reason: str, explicit: Optional[str] = None) -> str:
+    """推导机器草稿的 ``category``（v3.7.1：**不再无条件写死 ``bug``**）。
 
-    类别固定 ``bug``，优先级按 ``_priority_for_fail`` 映射，状态 ``open``，
-    ``- 复现：count 次``，并写入 ``- 指纹：_signature(fail_reason)``（**这是机械
-    累计的关键**：下一批同一 fail_reason 会因同指纹命中本条目而 occ 自增，
+    * 显式传入 ``explicit`` → 以显式为准（向后兼容，供人/CLI 覆盖）；
+    * ``WRONG_PASSWORD`` / ``CORRUPT`` / ``LOST`` / ``DATA`` → ``bug``（代码/数据缺陷）；
+    * ``UNKNOWN_BINARY`` → ``ops``：需人工确认类型，**不当 bug 结论**（"待判"）；
+    * 其它 mineable → ``ops``（未知归运维待办，保守）。
+    """
+    if explicit:
+        return explicit
+    up = (fail_reason or "").upper()
+    if any(t in up for t in ("WRONG_PASSWORD", "CORRUPT", "LOST", "DATA")):
+        return "bug"
+    # UNKNOWN_BINARY 及其它：归 ops（不是已确认的代码缺陷）。
+    return "ops"
+
+
+def draft_lesson(path: str, fail_reason: str, count: int,
+                 sample: str = "", category: Optional[str] = None,
+                 priority: Optional[str] = None) -> dict:
+    """为「真失败」的 fail_reason 自动追加一条机器草稿条目。
+
+    类别由 :func:`_category_for_fail` 推导（``category`` 显式传入时以其为准），
+    优先级由 ``_priority_for_fail`` 推导（``priority`` 显式传入时以其为准），
+    状态 ``open``，``- 复现：count 次``，并写入 ``- 指纹：_signature(fail_reason)``
+    （**这是机械累计的关键**：下一批同一 fail_reason 会因同指纹命中本条目而 occ 自增，
     而不是再新建）。根因与处置必须写明是机器草稿、需人补充。
 
-    返回 ``{'id','appended':bool,'skipped_reason'}``；已存在同指纹 → ``appended=False``。
+    **良性守卫（纵深防御，v3.7.1）**：``classify_fail_reason(fail_reason) == 'benign'``
+    时**直接返回且绝不写文件**——即使调用方漏判，正常终态（NOT_ARCHIVE / 已裁决查重 /
+    已清垃圾 等）也永远不会产草稿。
+
+    返回 ``{'id','appended','skipped_reason'}``；已存在同指纹 / 良性 / 空指纹 → ``appended=False``。
     """
     result = {"id": "", "appended": False, "skipped_reason": ""}
+    # 1) 良性守卫：正常终态绝不产草稿（不读也不写文件）。
+    if classify_fail_reason(fail_reason) == "benign":
+        result["skipped_reason"] = "benign fail_reason: %s" % fail_reason
+        return result
     sig = _signature(fail_reason)
     if not sig:
         result["skipped_reason"] = "empty signature"
@@ -1039,13 +1196,28 @@ def draft_lesson(path: str, fail_reason: str, count: int,
     seq = (max(same_day) + 1) if same_day else 1
     new_id = "LES-%s-%02d" % (date, seq)
 
+    # 2) 类别 / 优先级按规则推导（显式传入时以其为准）。
+    cat = _category_for_fail(fail_reason, category)
+    pri = priority or _priority_for_fail(fail_reason)
+    up = (fail_reason or "").upper()
+    is_judgement = any(t in up for t in JUDGEMENT_FAIL_REASONS)
+
     phenomenon = "自动采集：本批出现 %s ×%d 次" % (fail_reason, int(count))
     if sample:
         phenomenon += "（样例：%s）" % sample
+    if is_judgement:
+        phenomenon += "（待判：需人工确认类型）"
+    root_cause = "待定位（机器草稿，需人工/助手补写）"
+    if is_judgement:
+        root_cause = "待判：需人工确认是未知私有格式还是真问题（非必然代码缺陷）"
+    fix = "待办（机器草稿）"
+    if is_judgement:
+        fix = "待办：人工确认类型后再决定是否建正式判据（机器草稿）"
+
     body = [
         "- 现象：%s" % phenomenon,
-        "- 根因：待定位（机器草稿，需人工/助手补写）",
-        "- 处置：待办（机器草稿）",
+        "- 根因：%s" % root_cause,
+        "- 处置：%s" % fix,
         "- 关联：%s" % fail_reason,
         "- 指纹：%s" % sig,
         "- 复现：%d 次" % int(count),
@@ -1053,8 +1225,8 @@ def draft_lesson(path: str, fail_reason: str, count: int,
     if lessons and lessons[-1].body and lessons[-1].body[-1].strip() != "":
         lessons[-1].body.append("")
 
-    new = Lesson(id=new_id, date=date, seq=seq, category="bug",
-                 priority=_priority_for_fail(fail_reason), status="open",
+    new = Lesson(id=new_id, date=date, seq=seq, category=cat,
+                 priority=pri, status="open",
                  occ=int(count), note="", body=body, start=0, end=0, sig=sig)
 
     backup = _backup(path)
@@ -1073,8 +1245,11 @@ def evolve(root: Optional[str] = None, skill_root: Optional[str] = None,
     ``apply=True`` 时执行**机械动作**（v3.6.0 扩展）：
 
       a. ``_backfill_occ``：补 `- 复现：N 次` 与 `- 指纹：<sig>`；
-      b. 对 ``mine['fail_reasons']`` 每项按指纹 ``bump_occ``（命中自增）或
-         ``draft_lesson``（未命中则落一条机器草稿，自带同一指纹）；
+      b. 对 ``mine['mineable_fail_reasons']``（**只含真失败**，v3.7.1）每项按指纹
+         ``bump_occ``（命中自增）或 ``draft_lesson``（未命中则落一条机器草稿，自带同一
+         指纹）；``benign_fail_reasons`` / ``unclassified_fail_reasons`` 只写进
+         ``applied`` 说明（``skip_benign`` / ``skip_unclassified``），**不产草稿、不增
+         occ**——正常终态永不自动建草稿；
       c. ``archive``：把 promoted/resolved 归档到 ``lessons-archive.md``。
 
     但**绝不自动改 Skill 层正文、绝不自动把 open 改成 promoted**——提升判据
@@ -1105,12 +1280,14 @@ def evolve(root: Optional[str] = None, skill_root: Optional[str] = None,
         if apply:
             applied.extend(_backfill_occ(lessons_path))
 
-            # v3.6.0 (Part B2): 机械累计复现次数 —— 对每个本批 fail_reason，
-            # 用其指纹去找已有条目：命中则 occ 自增，未命中则落一条机器草稿
-            # （草稿自带同一指纹，下一批复现即自增，而不是再新建）。
-            for fr in (mine.get("fail_reasons") or []):
-                reason = fr.get("fail_reason")
-                cnt = int(fr.get("count") or 0)
+            # v3.7.1 §6b: **只对真失败（mineable）**走 occ 累计 / 机器草稿；正常终态
+            # （benign，如 NOT_ARCHIVE / 已裁决查重 / 已清垃圾）与未分类形态一律**跳过
+            # 并留痕**（不建草稿、不增 occ），杜绝 E1/E3 那类假草稿卡闸口。
+            mineable = mine.get("mineable_fail_reasons") or {}
+            benign = mine.get("benign_fail_reasons") or {}
+            unclassified = mine.get("unclassified_fail_reasons") or {}
+            for reason, cnt in mineable.items():
+                cnt = int(cnt or 0)
                 if not reason:
                     continue
                 sig = _signature(reason)
@@ -1130,6 +1307,12 @@ def evolve(root: Optional[str] = None, skill_root: Optional[str] = None,
                     else:
                         applied.append("draft_lesson: skip %s (%s)"
                                        % (reason, d.get("skipped_reason", "")))
+            for reason, cnt in benign.items():
+                applied.append("skip_benign: %s x%d (正常终态，不建草稿)"
+                               % (reason, int(cnt or 0)))
+            for reason, cnt in unclassified.items():
+                applied.append("skip_unclassified: %s x%d (未分类，按良性处理，不建草稿)"
+                               % (reason, int(cnt or 0)))
 
             r = archive(lessons_path, force=force)
             applied.append(

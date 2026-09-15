@@ -171,3 +171,35 @@
 - 关联：pitfalls #49；fsutil.py §6.6；SKILL.md §6.6；LES-20260915-01（本机删除语义与生产不同）
 - 指纹：目录删除在本沙箱是递归的osrmdir与RemoveDirectoryW对非空目录也返回成功
 - 复现：1 次
+
+### [LES-20260915-09] bug P2 resolved（自进化环把正常终态 NOT_ARCHIVE 误判成 bug 草稿）
+- 现象：批 2026-09-15 跑完后自进化环把 NOT_ARCHIVE ×142（正常"非压缩包，跳过"终态，全库 7544+ 次）当真失败采集成 bug 草稿，且 `--check` 质量闸口因 open 草稿存在而卡红，阻断正常交付。
+- 根因：`evolve.py` 的 `mine_from_db` 只按 fail_reason 计数，没有区分「真失败」（CORRUPT/WRONG_PASSWORD/extract_rc≠0）与「正常终态」（NOT_ARCHIVE/DUP_*/NONE），把后者一并写成草稿。
+- 处置：v3.7.1 引入 fail_reason 三分类——`classify_fail_reason()` 把 reason 分为 MINEABLE（真失败，可采教训）/ BENIGN（正常终态，永不建稿）/ UNCLASSIFIED（待判，草稿标注"待判"不卡闸口）；evolve(apply=True) 对纯良性批次输出 `skip_benign: ...` 且绝不产草稿；报告分三列展示。回归 22 个新用例（tests/test_evolve.py），生产 NOT_ARCHIVE×12 纯良性批次验证 0 草稿 0 卡闸。
+- 关联：pitfalls #50；evolve.py §classify_fail_reason；SKILL.md §3.2
+- 指纹：NOT_ARCHIVE被当成bug草稿且check闸口卡红
+- 复现：142 次
+
+### [LES-20260915-10] ops P2 resolved（UNKNOWN_BINARY=识别不出的二进制，SKIP 是保守正确行为）
+- 现象：自动采集：本批出现 UNKNOWN_BINARY ×6 次（生产全库 624 次）。抽查证据：`【done】\2026-09-15\18xx\风景02.mp4` 等一批 .mp4 声明扩展 mp4 但 `real_type=UNKNOWN`（魔数不匹配任何已知格式，20MB~157MB 不等），状态 SKIPPED。
+- 根因：这些视频文件魔数无法识别（下载不完整/加密容器/私有格式），管线识别不出类型 → 跳过。这是**保守正确**行为，不是缺陷。
+- 处置：确认非 bug，教训定性为 ops 观察：UNKNOWN_BINARY 的语义是「类型未识别而跳过」，后续统计口径应把它归入"跳过"而非"失败"（v3.7.1 三分类中 BENIGN 同理）。若单文件体积巨大或成批出现，可人工抽查一次魔数前 16 字节确认。
+- 关联：LES-20260915-09（三分类）；evolve.py BENIGN_FAIL_PATTERNS
+- 指纹：UNKNOWN_BINARYmp4魔数识别不出被SKIP
+- 复现：6 次
+
+### [LES-20260915-11] bug P1 open（分卷成员 mp4 被当独立 7z 处理，卷组未聚合）
+- 现象：自动采集：本批出现 ARCHIVE_CORRUPT ×6 次（生产全库 35 次）。抽查证据：`【done】\2026-09-15\18xx\风景01.mp4` 共 6 份（1878~1893 各目录一份），real_type=7Z、declared_ext=.mp4、体积清一色整 MB（314572800=300MB、20971520=20MB、157286400=150MB），`extract_rc=None`、`last_error=None` 即**没真正跑过 7z 就 FAILED**。另混有 1 份 `_carved.zip` 真损坏（extract_rc≠0）。
+- 根因：整 MB 尺寸 + 同名成批出现是**分卷成员**的典型指纹；这些 mp4 伪装的 7z 分卷被逐个当成独立包处理，`volume_group` 没有把它们聚合（缺其他卷 → 无法解 → 归为 corrupt），且失败发生在解压前（rc=None）说明卷组判定阶段就已放弃。
+- 处置（待办）：(1) 卷组识别应把「同名同目录、real_type=7Z、整 MB 体积」的成批文件聚合为一个 volume_group 后再判定；(2) 分卷不全时应报 VOLUME_INCOMPLETE 而非 ARCHIVE_CORRUPT，避免误导。影响面：此类场景按整包估算约占该批 20GB+，值得优先修。
+- 关联：scheduler.py volume_group；LES-20260910-01（分卷残骸处置边界）；LES-20260915-12
+- 指纹：风景01mp4整MB体积成批7Z卷FAILED且extract_rc为None
+- 复现：6 次
+
+### [LES-20260915-12] bug P1 open（无扩展名包的输出目录与源文件同名，7z 建目录冲突）
+- 现象：自动采集：本批出现 UNCLASSIFIED ×2 次。实锤证据：`6713777888999`（1.1GB）与 `6717777888999`（3.7GB），real_type=7Z、declared_ext=None（无扩展名裸包），密码已命中 LIBRARY（`上老王论坛当老王`），7z 退出码 2，报错 `Cannot create output directory : 当文件已存在时，无法创建该文件`。
+- 根因：**输出目录规划撞上源文件本身**——无扩展名包的输出目录默认取「文件名同名目录」，而该目录路径正是源文件所在位置（`...\6713777888999\` 已是文件），7z 建目录必然失败。该错误形态此前未纳入 fail_reason 分类表 → 落到 UNCLASSIFIED。
+- 处置（待办，两步）：(1) 调度器为无扩展名包的输出目录加固定后缀（如 `6713777888999_ext\`），从源头消除同名冲突；(2) 把 7z `Cannot create output directory` 映射进 fail_reason 已知错误（如 OUTPUT_DIR_CONFLICT），不再是 UNCLASSIFIED。修复后这两个 3.7GB+1.1GB 的大包可直接重跑，不需要动源文件。
+- 关联：scheduler.py extract_output_dir；evolve.py fail_reason 映射表；LES-20260915-11
+- 指纹：无扩展名7Z包Cannot create output directory当文件已存在时
+- 复现：2 次

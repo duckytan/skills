@@ -954,5 +954,259 @@ def _empty_mine_for_test(batch, fail_reasons):
             "pw_gaps": {"db_only": [], "learned_total": 0, "db_success_total": 0}}
 
 
+# ---------------------------------------------------------------------------
+# v3.7.1 §6b：fail_reason 机械分类（E1/E2/E3 修复的回归护栏）
+# 生产案例：批次 2026-09-15 干跑把 NOT_ARCHIVE ×12（全库 7544 次的正常终态）误判成
+# 「新形态」并落 bug 草稿 LES-20260915-09，occ=12 ≥2 使其成为提升候选，
+# 把 evolve --check 卡成 rc=1。以下用例锁死该行为不再发生。
+# ---------------------------------------------------------------------------
+class FailReasonClassifyTests(unittest.TestCase):
+    def test_real_production_reasons(self):
+        cases = {
+            # 真失败 → mineable
+            "WRONG_PASSWORD": "mineable",
+            "ARCHIVE_CORRUPT": "mineable",
+            "CORRUPT_CARVED": "mineable",
+            "VOLUME_MISSING": "mineable",
+            "DELETE_FAILED": "mineable",
+            # 正常终态 → benign（全部来自生产库实测分布）
+            "NOT_ARCHIVE": "benign",
+            "DUP_RESOLVED_KEEP_OLD": "benign",
+            "DUP_KEEP_NEW_OLD_MISSING": "benign",
+            "JUNK_CLEANED": "benign",
+            "STUCK_SHELL_RESOLVED_CHILDREN_TERMINAL": "benign",
+            "STUCK_CHAIN_RESOLVED_DISK_VERIFIED": "benign",
+            "ZERO_ROOTS_FALSE_ALARM_DISK_VERIFIED": "benign",
+            "NONE": "benign",
+            "SKIPPED": "benign",
+        }
+        for reason, want in cases.items():
+            self.assertEqual(E.classify_fail_reason(reason), want,
+                             msg="fail_reason=%r" % reason)
+
+    def test_empty_none_and_unknown_default_benign(self):
+        self.assertEqual(E.classify_fail_reason(""), "benign")
+        self.assertEqual(E.classify_fail_reason(None), "benign")
+        # 未分类 → 默认良性（宁可漏建一条，绝不造假教训堵闸口）
+        self.assertEqual(E.classify_fail_reason("SOME_NEW_THING"), "benign")
+
+    def test_mineable_wins_over_benign_substring(self):
+        # 复合名同时含 CORRUPT 与 _RESOLVED → 真失败优先
+        self.assertEqual(E.classify_fail_reason("CORRUPT_CARVED_RESOLVED"),
+                         "mineable")
+
+    def test_judgement_reason_is_mineable_but_ops(self):
+        self.assertEqual(E._fail_family("UNKNOWN_BINARY")[0], "mineable")
+        self.assertEqual(E._category_for_fail("UNKNOWN_BINARY"), "ops")
+
+
+class DraftGuardTests(unittest.TestCase):
+    """draft_lesson 的良性守卫（纵深防御）+ 类别推导。"""
+
+    def _write(self, path):
+        _write_lessons(path,
+                       [_block("LES-20260101-01", "bug", "P1", "open", occ=1)])
+
+    def test_benign_reason_refuses_and_writes_nothing(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "lessons.md")
+            self._write(p)
+            before = _read(p)
+            r = E.draft_lesson(p, "NOT_ARCHIVE", 12)
+            self.assertFalse(r["appended"])
+            self.assertIn("benign", r.get("skipped_reason", ""))
+            self.assertEqual(_read(p), before)     # 字节级不变
+
+    def test_category_derivation_and_explicit_override(self):
+        self.assertEqual(E._category_for_fail("WRONG_PASSWORD"), "bug")
+        self.assertEqual(E._category_for_fail("ARCHIVE_CORRUPT"), "bug")
+        self.assertEqual(E._category_for_fail("UNKNOWN_BINARY"), "ops")
+        self.assertEqual(E._category_for_fail("WEIRD_NEW_THING"), "ops")
+        # 显式传入优先（向后兼容）
+        self.assertEqual(E._category_for_fail("WRONG_PASSWORD", "ops"), "ops")
+
+    def test_draft_real_failure_appends_with_derived_category(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "lessons.md")
+            self._write(p)
+            r = E.draft_lesson(p, "WRONG_PASSWORD", 3)
+            self.assertTrue(r["appended"])
+            _h, lessons, _f = E.parse_lessons(p)
+            self.assertEqual(lessons[-1].category, "bug")
+            self.assertEqual(lessons[-1].occ, 3)
+
+    def test_draft_judgement_annotated_as_ops(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "lessons.md")
+            self._write(p)
+            r = E.draft_lesson(p, "UNKNOWN_BINARY", 6)
+            self.assertTrue(r["appended"])
+            _h, lessons, _f = E.parse_lessons(p)
+            self.assertEqual(lessons[-1].category, "ops")
+            self.assertTrue(any("待判" in ln for ln in lessons[-1].body))
+
+
+class MineThreeWayTests(unittest.TestCase):
+    """mine_from_db：三分类 + 数据库历史基线（E1/E2）。"""
+
+    def _db(self, d):
+        path = os.path.join(d, "archive.db")
+        conn = sqlite3.connect(path)
+        conn.executescript(
+            "CREATE TABLE files(id INTEGER PRIMARY KEY, path TEXT, batch TEXT,"
+            " fail_reason TEXT, dup_of_id INTEGER);"
+            "CREATE TABLE events(id INTEGER PRIMARY KEY, file_id INTEGER,"
+            " batch TEXT, action TEXT, level TEXT, message TEXT);"
+            "CREATE TABLE batches(batch TEXT PRIMARY KEY, started_at TEXT,"
+            " finished_at TEXT);")
+        rows = [(1, "/x/a", "A", "WRONG_PASSWORD", None),
+                (2, "/x/b", "A", "WRONG_PASSWORD", None),
+                (3, "/x/c", "A", "NOT_ARCHIVE", None),
+                (4, "/x/d", "A", "NONE", None),
+                (5, "/x/e", "A", "NEW_WEIRD_MODE", None),
+                (6, "/x/f", "A", "ARCHIVE_CORRUPT", None),
+                (7, "/x/g", "A", "ARCHIVE_CORRUPT", None),
+                (8, "/x/h", "A", "ARCHIVE_CORRUPT", None),
+                # 历史批次 B：WRONG_PASSWORD 与 NOT_ARCHIVE 都出现过
+                (9, "/y/a", "B", "WRONG_PASSWORD", None),
+                (10, "/y/b", "B", "NOT_ARCHIVE", None)]
+        conn.executemany("INSERT INTO files VALUES(?,?,?,?,?)", rows)
+        conn.commit()
+        return conn
+
+    def test_mine_splits_three_way(self):
+        with tempfile.TemporaryDirectory() as d:
+            conn = self._db(d)
+            try:
+                m = E.mine_from_db(conn, "A")
+            finally:
+                conn.close()
+            self.assertEqual(m["mineable_fail_reasons"],
+                             {"WRONG_PASSWORD": 2, "ARCHIVE_CORRUPT": 3})
+            self.assertEqual(m["benign_fail_reasons"],
+                             {"NOT_ARCHIVE": 1})   # NONE 在 mine 上游就被排除
+            self.assertEqual(m["unclassified_fail_reasons"],
+                             {"NEW_WEIRD_MODE": 1})
+            self.assertEqual(m["history_batches"], 1)
+
+    def test_mine_new_forms_baseline_uses_db_history(self):
+        with tempfile.TemporaryDirectory() as d:
+            conn = self._db(d)
+            try:
+                m = E.mine_from_db(conn, "A")
+            finally:
+                conn.close()
+            got = set(m["new_fail_reasons"])
+            # WRONG_PASSWORD 在历史批 B 出现过 → 不新；NOT_ARCHIVE/NONE 良性 → 永不报新
+            self.assertNotIn("WRONG_PASSWORD", got)
+            self.assertNotIn("NOT_ARCHIVE", got)
+            self.assertNotIn("NONE", got)
+            # ARCHIVE_CORRUPT（真失败，历史未见）→ 新
+            self.assertIn("ARCHIVE_CORRUPT", got)
+
+    def test_mine_benign_heavy_batch_yields_no_new_forms(self):
+        # 生产案例回归：一批只有 NOT_ARCHIVE ×12 → new_fail_reasons 必须为空
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "archive.db")
+            conn = sqlite3.connect(path)
+            conn.executescript(
+                "CREATE TABLE files(id INTEGER PRIMARY KEY, path TEXT,"
+                " batch TEXT, fail_reason TEXT, dup_of_id INTEGER);")
+            conn.executemany(
+                "INSERT INTO files VALUES(?,?,?,?,?)",
+                [(i, "/x/%d" % i, "T", "NOT_ARCHIVE", None)
+                 for i in range(1, 13)])
+            conn.commit()
+            try:
+                m = E.mine_from_db(conn, "T")
+            finally:
+                conn.close()
+            self.assertEqual(m["new_fail_reasons"], [])
+            self.assertEqual(m["mineable_fail_reasons"], {})
+            self.assertEqual(m["benign_fail_reasons"], {"NOT_ARCHIVE": 12})
+
+
+class EvolveApplyBenignSkipTests(unittest.TestCase):
+    """端到端：evolve(apply=True) 对纯良性批次绝不产草稿、不卡闸口。"""
+
+    def _blk(self, id_, cat, pri, status, sig):
+        # 自带指纹与复现行：_backfill_occ 对它必须是 no-op（否则回填会新增行、
+        # 把 lessons.md 顶过 ARCHIVE_THRESHOLD 触发归档，干扰断言）。
+        return ["### [%s] %s %s %s" % (id_, cat, pri, status),
+                "- 现象：现象描述",
+                "- 根因：根因描述",
+                "- 处置：处置描述",
+                "- 关联：rel",
+                "- 指纹：%s" % sig,
+                "- 复现：1 次"]
+
+    def _fixture(self, d, extra_fail=None):
+        root = os.path.join(d, "root")
+        os.makedirs(os.path.join(root, "pipeline", "db"), exist_ok=True)
+        conn = sqlite3.connect(os.path.join(root, "pipeline", "db",
+                                            "archive.db"))
+        conn.executescript(
+            "CREATE TABLE files(id INTEGER PRIMARY KEY, path TEXT, batch TEXT,"
+            " fail_reason TEXT, dup_of_id INTEGER);"
+            "CREATE TABLE events(id INTEGER PRIMARY KEY, file_id INTEGER,"
+            " batch TEXT, action TEXT, level TEXT, message TEXT);"
+            "CREATE TABLE batches(batch TEXT PRIMARY KEY, started_at TEXT,"
+            " finished_at TEXT);")
+        rows = [(i, "/x/%d" % i, "T", "NOT_ARCHIVE", None)
+                for i in range(1, 13)]
+        if extra_fail:
+            base = 100
+            for j, reason in enumerate(extra_fail):
+                rows.append((base + j, "/x/e%d" % j, "T", reason, None))
+        conn.executemany("INSERT INTO files VALUES(?,?,?,?,?)", rows)
+        conn.commit()
+        conn.close()
+        sk = os.path.join(d, "skill")
+        refs = os.path.join(sk, "references")
+        blocks = [self._blk("LES-%s-%02d" % (TODAY, i), "bug", "P1",
+                            "promoted", "sigp%d" % i) for i in range(1, 7)]
+        blocks += [self._blk("LES-%s-%02d" % (TODAY, i), "ops", "P2",
+                             "open", "sigo%d" % i) for i in range(7, 19)]
+        _write_lessons(os.path.join(refs, "lessons.md"), blocks)
+        arc = [self._blk("LES-20260101-%02d" % i, "bug", "P1", "resolved",
+                         "siga%d" % i) for i in range(1, 11)]
+        _write_lessons(os.path.join(refs, "lessons-archive.md"), arc)
+        with open(os.path.join(sk, "CHANGELOG.md"), "w", encoding="utf-8") as fh:
+            fh.write("# Changelog\n\n## v9.9.9 (%s) — test\n" % TODAY_DASH)
+        return root, sk
+
+    def test_benign_only_batch_no_draft_no_candidate(self):
+        with tempfile.TemporaryDirectory() as d:
+            root, sk = self._fixture(d)
+            res = E.evolve(root=root, skill_root=sk, batch="T", apply=True)
+            applied = " | ".join(res["applied"])
+            self.assertIn("skip_benign: NOT_ARCHIVE x12", applied)
+            self.assertNotIn("draft_lesson:", applied)
+            self.assertNotIn("bump_occ:", applied)
+            self.assertEqual(res["candidates"], [])
+            self.assertTrue(res["ok"])
+            # evolve 会先按状态归档 promoted 条目（moved=6），fixture 剩 12 条
+            # open；纯良性批次不得再新增任何条目。
+            _h, lessons, _f = E.parse_lessons(
+                os.path.join(sk, "references", "lessons.md"))
+            self.assertEqual(len(lessons), 12)      # 没有新增条目
+
+    def test_real_failure_still_drafts(self):
+        with tempfile.TemporaryDirectory() as d:
+            root, sk = self._fixture(d, extra_fail=["ARCHIVE_CORRUPT"] * 3)
+            res = E.evolve(root=root, skill_root=sk, batch="T", apply=True)
+            applied = " | ".join(res["applied"])
+            self.assertIn("skip_benign: NOT_ARCHIVE x12", applied)
+            self.assertIn("draft_lesson:", applied)
+            _h, lessons, _f = E.parse_lessons(
+                os.path.join(sk, "references", "lessons.md"))
+            self.assertEqual(len(lessons), 13)      # 12 open + 1 真失败草稿
+            drafts = [ls for ls in lessons
+                      if "CORRUPT" in "\n".join(ls.body)]
+            self.assertEqual(len(drafts), 1)
+            self.assertEqual(drafts[0].occ, 3)
+            self.assertEqual(drafts[0].category, "bug")
+
+
 if __name__ == "__main__":
     unittest.main()

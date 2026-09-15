@@ -329,3 +329,19 @@ SQLite 仍需物化 `-shm`/`-wal` 影子文件。
 `RemoveDirectoryW`，且 docstring 明确「不继承 OS 的拒绝语义」）。
 回归：`tests/test_prune_empty.py`（41 例，含 `test_never_removes_ancestors_of_content`）。
 关联：fsutil.py §6.6；LES-20260915-08；SKILL.md §6.6；#36（沙箱视图不可信）。
+
+**#50. 自进化环把「正常终态」当 bug 采集成草稿，还会卡红 `--check` 闸口（v3.7.1）**
+现象：批 2026-09-15 收尾后，`evolve --apply` 把 NOT_ARCHIVE ×142（全库 7544+ 次的
+正常「非压缩包，跳过」终态）当真失败写成 bug 草稿；`run` 收尾自进化挂点据「存在
+open 草稿」判定欠账，`evolve --check` 卡红，正常交付被自己的质量闸口拦住。
+根因：`evolve.py` 的 `mine_from_db` 只按 fail_reason 计数，不区分「真失败」
+（CORRUPT / WRONG_PASSWORD / extract_rc≠0）与「正常终态」（NOT_ARCHIVE / DUP_* /
+NONE），把良性计数一并落稿。
+教训：**自动化反馈环必须有信号/噪声分离**——凡是「高频正常终态」，绝不允许进入
+「错误采集 → 草稿 → 闸口」链路，否则质量闸口会被正常业务流量打死（告警疲劳的反面：
+自动化自己制造欠账）。实现上用 `classify_fail_reason()` 三分类
+（MINEABLE / BENIGN / UNCLASSIFIED）：BENIGN 永不建稿不 bump；UNCLASSIFIED 落稿但
+标注「待判」且不计入闸口阻断；只有 MINEABLE 参与教训采集与新形态判定。
+回归：`tests/test_evolve.py`（FailReasonClassifyTests / DraftGuardTests /
+MineThreeWayTests / EvolveApplyBenignSkipTests，~22 例）。
+关联：evolve.py §classify_fail_reason；SKILL.md §3.2；LES-20260915-09；CHANGELOG v3.7.1。
