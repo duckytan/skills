@@ -23,6 +23,8 @@ from __future__ import annotations
 import ctypes
 import errno
 import os
+import unicodedata
+from typing import Optional
 
 from . import config as C
 
@@ -43,6 +45,42 @@ if IS_WINDOWS:  # pragma: no cover - platform specific
     _FOF_NOCONFIRMATION = 0x0010
     _FOF_ALLOWUNDO = 0x0040
     _FOF_NOERRORUI = 0x0400
+
+
+if IS_WINDOWS:  # pragma: no cover - platform specific
+    class _FILETIME(ctypes.Structure):
+        _fields_ = [("dwLowDateTime", ctypes.c_uint32),
+                    ("dwHighDateTime", ctypes.c_uint32)]
+
+    class _WIN32_FIND_DATAW(ctypes.Structure):
+        """WIN32_FIND_DATAW — used for an authoritative emptiness probe."""
+        _fields_ = [
+            ("dwFileAttributes", ctypes.c_uint32),
+            ("ftCreationTime", _FILETIME),
+            ("ftLastAccessTime", _FILETIME),
+            ("ftLastWriteTime", _FILETIME),
+            ("dwVolumeSerialNumber", ctypes.c_uint32),
+            ("nFileSizeHigh", ctypes.c_uint32),
+            ("nFileSizeLow", ctypes.c_uint32),
+            ("nNumberOfLinks", ctypes.c_uint32),
+            ("nFileIndexHigh", ctypes.c_uint32),
+            ("nFileIndexLow", ctypes.c_uint32),
+            ("cFileName", ctypes.c_wchar * 260),
+            ("cAlternateFileName", ctypes.c_wchar * 14),
+        ]
+
+    _k32.FindFirstFileW.argtypes = [ctypes.c_wchar_p,
+                                    ctypes.POINTER(_WIN32_FIND_DATAW)]
+    _k32.FindFirstFileW.restype = ctypes.c_void_p
+    _k32.FindNextFileW.argtypes = [ctypes.c_void_p,
+                                   ctypes.POINTER(_WIN32_FIND_DATAW)]
+    _k32.FindNextFileW.restype = ctypes.c_int
+    _k32.FindClose.argtypes = [ctypes.c_void_p]
+    _k32.FindClose.restype = ctypes.c_int
+    _k32.RemoveDirectoryW.argtypes = [ctypes.c_wchar_p]
+    _k32.RemoveDirectoryW.restype = ctypes.c_int
+    _INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+    _ERROR_FILE_NOT_FOUND = 2
 
 
 if IS_WINDOWS:  # pragma: no cover - platform specific
@@ -374,6 +412,223 @@ def delete_zero_byte_files(dir_path: str) -> int:
         except OSError:
             continue
     return removed
+
+
+# ---------------------------------------------------------------------------
+# Empty-directory pruning (§6.6, v3.7.0)
+# ---------------------------------------------------------------------------
+
+def _norm_name(text: str) -> str:
+    """Full-width -> half-width + lower-case (same normalisation as junk.py)."""
+    try:
+        return unicodedata.normalize("NFKC", text or "").lower()
+    except Exception:  # noqa: BLE001
+        return (text or "").lower()
+
+
+def _under(path: str, ancestor: str) -> bool:
+    p = os.path.abspath(path).lower()
+    a = os.path.abspath(ancestor).lower()
+    return p == a or p.startswith(a + os.sep)
+
+
+def _looks_like_password_dir(path: str) -> bool:
+    """A directory that may carry the extraction password is never removed."""
+    name = _norm_name(os.path.basename(os.path.abspath(path)))
+    if name == _norm_name(C.PASSWORD_FILE_BASENAME):
+        return True
+    return any(_norm_name(w) in name for w in C.PASSWORD_HINT_WORDS)
+
+
+def _dir_is_empty_win32(path: str) -> Optional[bool]:
+    """Authoritative "is this directory empty?" via ``FindFirstFileW``.
+
+    Returns ``True`` / ``False``, or ``None`` when the probe could not run.
+
+    Why a separate Win32 probe and not just ``os.listdir``: measured in the
+    dev sandbox, a safe-delete layer reroutes *directory* removals (both
+    ``os.rmdir`` and ``RemoveDirectoryW``) into a RECURSIVE delete that
+    reports success even on a non-empty directory.  ``rmdir``'s "refuses to
+    remove anything non-empty" property therefore cannot be relied on as the
+    safety net — the emptiness decision has to be made by us, up front, with
+    an API the hooks do not wrap.  ``FindFirstFileW`` is that API: it is
+    reached through ``ctypes`` straight to kernel32 and enumerates the real
+    directory, not a Python-level view of it.
+    """
+    if not IS_WINDOWS:  # pragma: no cover - platform specific
+        return None
+    try:
+        pattern = to_extended(os.path.join(path, "*"))
+        data = _WIN32_FIND_DATAW()
+        ctypes.set_last_error(0)
+        handle = _k32.FindFirstFileW(pattern, ctypes.byref(data))
+        if handle is None or handle == _INVALID_HANDLE_VALUE:
+            err = ctypes.get_last_error()
+            # "no matching file" is the only error that means *empty*; any
+            # other failure (access denied, vanished) fails closed.
+            return err == _ERROR_FILE_NOT_FOUND
+        try:
+            while True:
+                name = data.cFileName
+                if name and name not in (".", ".."):
+                    return False
+                ctypes.set_last_error(0)
+                if not _k32.FindNextFileW(handle, ctypes.byref(data)):
+                    return True
+        finally:
+            _k32.FindClose(handle)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def dir_is_empty(path: str) -> bool:
+    """True only when *path* holds **no** entries at all (hidden ones count).
+
+    Fail-closed by design: unless at least one independent probe positively
+    confirms "empty", the answer is ``False`` — a false negative only costs a
+    skipped cleanup, a false positive would delete real content.
+    """
+    if not isdir(path):
+        return False
+    win = _dir_is_empty_win32(path)
+    if win is not None and not win:
+        return False
+    try:
+        with os.scandir(to_extended(path)) as it:
+            for _entry in it:
+                return False
+    except OSError:
+        return False
+    return True
+
+
+def remove_empty_dir(path: str) -> tuple:
+    """Remove an (already verified empty) directory.  Returns ``(ok, rc)``.
+
+    NOTE — the caller MUST have established emptiness first via
+    :func:`dir_is_empty`: in the dev sandbox a safe-delete layer turns any
+    directory-removal call into a recursive one, so this function inherits no
+    "refuses non-empty" guarantee from the OS.  Emptiness is checked again
+    immediately before the call in :func:`prune_empty_dirs`, which is the only
+    in-tree user of this helper.
+    """
+    if not isdir(path):
+        return True, 2           # already gone
+    ext = to_extended(path)
+    if IS_WINDOWS:  # pragma: no cover - platform specific
+        ok = _k32.RemoveDirectoryW(ext)
+        if ok:
+            return True, 0
+        rc = ctypes.get_last_error()
+        if rc in (2, 3):         # vanished between the check and the call
+            return True, rc
+        return False, rc
+    try:                          # pragma: no cover - POSIX
+        os.rmdir(ext)
+        return True, 0
+    except FileNotFoundError:
+        return True, 2
+    except OSError as exc:
+        return False, exc.errno or -1
+
+
+def _prune_blocked(path: str, root: str, protected) -> bool:
+    if _under(path, root) and os.path.abspath(path).lower() == \
+            os.path.abspath(root).lower():
+        return True              # never the processing root itself
+    for p in protected or ():
+        if _under(path, p):
+            return True
+    return _looks_like_password_dir(path)
+
+
+def _prune_rec(d: str, root: str, protected, dry_run: bool,
+               removed: list, failed: list, max_up: int) -> None:
+    """Post-order depth-first prune: children first, then *d* itself."""
+    try:
+        with os.scandir(to_extended(d)) as it:
+            subs = [os.path.join(d, e.name) for e in it
+                    if _is_dir_entry(e, d)]
+    except OSError:
+        subs = []
+    for sub in subs:
+        _prune_rec(sub, root, protected, dry_run, removed, failed, max_up)
+    if _prune_blocked(d, root, protected):
+        return
+    if not dir_is_empty(d):
+        return
+    if dry_run:
+        removed.append(d)
+        return
+    ok, rc = remove_empty_dir(d)
+    if ok:
+        removed.append(d)
+    else:
+        failed.append((d, rc))
+
+
+def _is_dir_entry(entry, parent: str) -> bool:
+    try:
+        return entry.is_dir(follow_symlinks=False)
+    except OSError:
+        return False
+
+
+def prune_empty_dirs(root: str, protected=(), dry_run: bool = False,
+                     candidates=None, max_up: int = 64) -> tuple:
+    """Remove empty directories under *root*.  Returns ``(removed, failed)``.
+
+    * ``root`` itself is **never** removed, nor is anything under a path in
+      *protected*, nor a directory whose name looks like a password carrier.
+    * ``candidates=None`` → full bottom-up sweep of ``root``.
+    * ``candidates=[...]`` → walk **upward** from each given directory,
+      stopping at the first non-empty / blocked / out-of-root ancestor.  This
+      is the safe mode used at batch end: it only cleans shells that the
+      pipeline itself may have emptied, never pre-existing structure.
+    * ``dry_run=True`` → nothing is touched, the would-be removals are listed.
+
+    A directory is only ever removed when it is genuinely empty (``os.rmdir``
+    semantics), so this can never delete content by accident.
+    """
+    removed: list = []
+    failed: list = []
+    root = os.path.abspath(root)
+    if not isdir(root):
+        return removed, failed
+
+    if candidates is None:
+        _prune_rec(root, root, protected, dry_run, removed, failed, max_up)
+        return removed, failed
+
+    seen = set()
+    for start in candidates:
+        if not start:
+            continue
+        d = os.path.abspath(start)
+        for _ in range(max_up):
+            if d.lower() in seen:
+                break
+            if not _under(d, root):
+                break
+            if _prune_blocked(d, root, protected):
+                break
+            if not dir_is_empty(d):
+                break
+            seen.add(d.lower())
+            if dry_run:
+                removed.append(d)
+            else:
+                ok, rc = remove_empty_dir(d)
+                if ok:
+                    removed.append(d)
+                else:
+                    failed.append((d, rc))
+                    break
+            parent = os.path.dirname(d)
+            if parent == d:
+                break
+            d = parent
+    return removed, failed
 
 
 # ---------------------------------------------------------------------------

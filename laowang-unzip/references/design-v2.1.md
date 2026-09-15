@@ -1085,6 +1085,71 @@ def force_delete_file(abs_path: str) -> int:
 4. 最后 `DIR_PATTERN` 的整个广告目录（**清之前再看一眼里面有没有密码说明**）
 5. `CONTENT_KEYWORD` 和 `TINY_TXT` 最后人工抽查几个再决定
 
+### 6.5 自学习垃圾库（v3.7.0 新增）
+
+§6.1 的规则表是**死**的：没见过就不认识，而广告形态会变（今天 `最新地址.txt`，明天
+`新地址2.txt`）。§6.5 补上**记忆层**——用户确认过的垃圾记下来，下次自动认。
+
+**唯一事实源**：`scripts/pipeline_lib/junklib.py`；受管文件 `assets/junk.learned.txt`
+（格式见该模块 docstring §F；已 gitignore）。
+
+**三种判据（kind）与匹配优先级**
+
+| 顺序 | kind | 记什么 | 为什么 |
+|---|---|---|---|
+| ① | `hash` | 文件内容 md5（≤1MB 才指纹） | 广告最爱改名，内容常常一字不差；按内容认，改名逃不掉 |
+| ② | `name` | 完整文件名（NFKC + 小写归一化后精确相等） | 用户看着这个名字点的头 |
+| ③ | `namepart` | 名称片段（子串匹配，**取最长命中**） | 名字带随机后缀/前缀时的兜底，最具体的判据优先 |
+
+**安全底线（本节的灵魂，违反即返工）**
+
+1. **机器永不自动入册。** 规则表只能「提议」（`files.is_junk` / `junk_rule`）；
+   能落库的只有两条路径：① 用户在 `clean-junk` 里亲口确认的删除；② 用户显式跑 `junk-learn`。
+   *理由*：密码记错只是多试一次；垃圾记错会静默删掉真数据，且一次误判会被记下来、
+   以后每次对同类照删不误——这是所有「自动学习删除」系统的经典死法。
+2. **密码载体永久豁免。** `junk.is_password_carrier()`（名字/目录含 `密码/解压码/提取码`，
+   或文件名就是 `password.txt`）一律不查库、不入册、不删（= §6.2 例外的库侧延伸）。
+3. **入册粒度按确认强度分档。** 批量 `--yes` → 只记 `hash`（不外推到同名文件）；
+   逐条 `y` 或 `junk-learn` → `hash` + `name`；`namepart` **只能**手工加，机器绝不自动生成。
+4. **零风险待遇需要理由。** `LIBRARY:*` 自动删，是因为条目只可能来自用户确认——
+   这一点由 `junk.is_auto_rule()` 单点实现，禁止各处再硬写 `in JUNK_AUTO_RULES`。
+
+**接线**：`scheduler` 在规则表未命中时调 `junklib.lookup_file`；命中记
+`junk_rule='LIBRARY:<KIND>'`，走 §11.2 零风险档；命中清单进批次报告「五之二」节。
+**运维**：`junk-stats`（查看/`--verify`/`--forget KIND:VALUE`）、`junk-learn <path>`。
+
+### 6.6 空目录清理（v3.7.0 新增）
+
+广告目录被删空后只剩一个空壳文件夹。§6.6 自底向上清掉**确实为空**的目录。
+
+**两种模式**
+
+- `candidates=None` → 自底向上全树清扫（`prune-empty` 命令）。
+- `candidates=[...]` → 从给定目录**只向上走**，遇非空/被保护/出根即停。
+  **批次收尾与 `clean-junk` 用这个模式**：候选只来自本次每一次成功删除（源包 + 垃圾）的父目录，
+  因此只清「自己弄空的壳」，绝不动用户原有结构。
+
+**护栏（缺一不可）**
+
+- 永不删处理根本身（`src_dir`）；永不删 `protected` 前缀下的（`pipeline` 目录 + workdir 下的
+  `pipeline/`）；永不删名字像密码载体的目录；
+- **只删确实为空的目录**——而「确实为空」必须由我们自己判，见下；
+- `EMPTY_DIR_PRUNE_ON_FINISH=False` 或 dry-run 批次 → 完全不动；每个动作写 `ACTION_PRUNE` 事件；
+- `prune-empty` **默认干跑**，且**全程不打开数据库**（保持只读语义）；
+- 批次收尾那一段整段 try/except：出错只 warn，**绝不让批次失败**。
+
+**⚠ 判空是本节的唯一数据安全防线（v3.7.0 实测修正）**
+
+初版的安全论证是「`os.rmdir` 拒绝非空目录，所以删不掉东西」——**该论证在本开发沙箱不成立**：
+safe-delete 层把任何目录删除调用（`os.rmdir` **与** Win32 `RemoveDirectoryW`）改写成递归删除，
+对非空目录也**返回成功**，错误不可观测（详见 pitfalls #49 / LES-20260915-08）。故：
+
+1. 判空走**钩子碰不到的 API**：ctypes `FindFirstFileW`（pattern `*` 不返回 `.`/`..`，
+   直连 kernel32）——`fsutil._dir_is_empty_win32`；
+2. 与 `os.scandir` **双通道 fail-closed**：任一说「非空」即不删（`dir_is_empty`）；
+3. `remove_empty_dir` 弃用 `os.rmdir`，改 `RemoveDirectoryW`，docstring 明确
+   「**不继承 OS 的拒绝语义**」——调用方必须先判空。
+
 ---
 
 ## 7. 异常处理矩阵

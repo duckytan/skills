@@ -2,13 +2,14 @@
 name: laowang-unzip
 description: >-
   老王解压（laowang-unzip）——通用版「伪装压缩包」批量整理工作流（v3）：发现 → 头部判定 → 哈希去重 → 修复(carve/magic/拼接/改名) →
-  密码试解 → 就地解压(套娃/分卷/头伪装) → 解完即删(12条check) → 垃圾清理 → 任务报告。
+  密码试解 → 就地解压(套娃/分卷/头伪装) → 解完即删(12条check) → 垃圾清理(规则表 + 自学习垃圾库) →
+  空目录清理 → 任务报告。
   单线程 + SQLite 状态机 + 断点续跑。核心原则：单一事实源、解完即清、判据写死不许拍脑袋、
   删源前12条check全过。触发词："解压 / 清理伪装包 / 整理下载 / 递归解压 / 处理百度网盘下载 / 新下载归类"。
   详细判据见 references/，接口约定见 references/scripts-api.md，完整设计见 references/design-v2.1.md。
 ---
 
-# 伪装压缩包批量整理（通用版 v3 · skill 3.6.0）
+# 伪装压缩包批量整理（通用版 v3 · skill 3.7.0）
 
 > ## ⚠️ 平台：Windows 专用（Q1 拍板 2026-09-09）
 > 本 skill 的**删除与回收站语义只在 Windows 上完整成立**：
@@ -103,6 +104,27 @@ python pipeline.py pw-stats --verify                    # rc 0=OK
   `<root>/.pipeline/passwords.local.txt`），逐行写密码即可——合并优先级见 §5。
 - 该密码生效于**下一次试解**；已 FAILED 的包不会再自动重试，要么 `--test`，要么 `retry-failed`。
 - 另有**自动兜底**：标准来源全找不到时会去已解压的 `.txt` 里挖密码（§5 第 7 条），无需手工加。
+
+### 2.3 垃圾库 / 空目录运维（v3.7.0）
+
+```bash
+# 看垃圾库（你确认过的垃圾条目，按确认次数降序）；--verify 机械自检 rc 0=OK
+python pipeline.py junk-stats [--top N] [--json] [--root <处理根>]
+python pipeline.py junk-stats --verify
+python pipeline.py junk-stats --forget name:最新地址.txt    # 反悔，删掉一条（也支持 hash:<md5>）
+
+# 手工入册：你在文件管理器里亲眼看到某个广告/垃圾文件，把它教给库
+python pipeline.py junk-learn "<文件路径>" [--namepart 广告] [--dry-run] [--root <处理根>]
+
+# 清空文件夹：默认干跑，--apply 才真删；只删确实为空的目录，不打开数据库
+python pipeline.py prune-empty [--apply] [--json] [--root <处理根>]
+```
+
+- 库文件 `assets/junk.learned.txt`，**机器维护、git-ignored**；`clean-junk` 里你确认过的删除
+  会**默认自动入册**（`--no-learn` 可关），删完**顺手收掉自己弄空的文件夹**（`--no-prune` 可关）。
+- **铁律：机器永不自动入册。** 只有「你亲口确认过的删除」或「你显式跑 `junk-learn`」能写入库；
+  规则表自动判定的只能提议。详见 §6.5 与 `references/design-v2.1.md` §6.5。
+- 名字/目录里带「密码/解压码/提取码」的路径**永久豁免**：不查库、不入册、不删。
 
 ## 3. 主工作流（10 步 + 首尾两个自进化挂点，单线程，禁止并发）
 
@@ -239,6 +261,14 @@ root 未知时另按序搜索指针文件：`./pipeline/` → `./` → `<skill>/
 | `IDLE_SWEEPS_TO_END` | `2` | 连续 2 轮空闲扫描才算收敛（另有 `MAX_SWEEP_ROUNDS=10` 硬上限） |
 | `MAX_RETRY` | `1` | TIMEOUT/HANG_KILLED 最多重试 1 次 |
 | `FOUR_GB_SPLIT_SIZE` | `4_000_000_000` | 网盘 4 GB 切断特征值（命中走拼接路径，枚举 `VOLUME_4GB_SPLIT`） |
+| `AD_DIR_KEYWORDS` | `["广告", "推广", "加群"]` | 广告**目录**关键词（v3.7.0 从 `junk.py` 硬编码挪入 config，**用户可自行增删**） |
+| `JUNK_HASH_MAX_BYTES` | `1024 * 1024` | 超过此体积不做内容指纹（垃圾都是小文件） |
+| `JUNK_LIBRARY_KINDS` | `("hash", "name", "namepart")` | 垃圾库三种判据（§6.5） |
+| `JUNK_NAMEPART_MIN_CHARS` | `2` | 名称片段最短长度。**刻意是 2 不是 3**——广告词 `广告/推广/加群` 全两字，3 字下限会把它们全挡掉 |
+| `JUNK_RULE_LIBRARY_PREFIX` | `"LIBRARY:"` | 库命中的 `junk_rule` 前缀，如 `LIBRARY:HASH`；`junk.is_auto_rule()` 据此判零风险 |
+| `EMPTY_DIR_PRUNE_ON_FINISH` | `True` | 批次收尾自动清「本批弄空的壳」；`False` 关闭（§6.6） |
+| `PROTECTED_PRUNE_PREFIXES` | `("pipeline",)` | 空目录清理的受保护前缀（不删 `<src>/pipeline/`） |
+| `ACTION_PRUNE` | `"PRUNE"` | 空目录删除的审计事件动作 |
 
 **固定常量（硬编码在模块内，不经 config）**：轻量头部判定读取窗口 `32768` 字节
 （`header.py`）；极小文本垃圾阈值 `512` 字节（`junk.py`）；carve 扫描上限 **768 MiB** /
@@ -363,6 +393,8 @@ root 未知时另按序搜索指针文件：`./pipeline/` → `./` → `<skill>/
 | **删除语义** | 默认 `SHFileOperationW` + `FOF_ALLOWUNDO` **进回收站**（可还原）；回收失败（如超长路径 `\\?\` 不被 shell API 接受、非固定盘）才回退 `DeleteFileW` 永久删，并落 **`DELETE_MODE=PERMANENT`** 审计事件 | `pipeline_lib/fsutil.py` 唯一含平台分支的模块；非 Windows 降级 `os.remove`/`shutil.rmtree` |
 | 回收站 | `recycle.py` 盘点（解析 `$I*` 元数据：原大小/删除时间/原路径）+ 清理（`$R*` 清 RSH 属性后真删） | `pipeline_lib/recycle.py` + `fsutil` 执行 |
 | 密码库 | 种子 20 条 + 本地合并 | `assets/passwords.txt` 只读，本地库不入 git |
+| 垃圾库 | 规则表（死）+ 自学习库（活，只收用户确认过的），三种判据 hash/name/namepart | `pipeline_lib/junklib.py` 唯一事实源；`assets/junk.learned.txt` git-ignored；**机器永不自动入册**（§6.5） |
+| 空目录清理 | 自底向上只删**确实为空**的目录；批次收尾只从「本批删过的父目录」向上走，不动用户原有结构 | 判空走 ctypes `FindFirstFileW` 双通道 fail-closed（**不依赖 `os.rmdir` 拒绝非空**，见 pitfalls #49）；`EMPTY_DIR_PRUNE_ON_FINISH` 可关 |
 | 白名单 | `PROTECTED_PREFIXES` 由 pipeline 目录与密码库路径自动生成 | 无需手工配置 |
 | 发布 | `LICENSE`(MIT) + `CHANGELOG.md` + 语义化版本 | GitHub 元数据 |
 
@@ -373,11 +405,13 @@ root 未知时另按序搜索指针文件：`./pipeline/` → `./` → `<skill>/
 - **26 个 `FAIL_*` 枚举**（含 `VOLUME_4GB_SPLIT`、v3.1 新增 `UNSAFE_PATH`，config.py 实名核对）
   + 失败→判据→动作主表 → `references/failure-matrix.md`。
 - **魔数速查表**（7z/ZIP/RAR/UA 篡改/头伪装）→ `references/magic-signatures.md`。
-- **45 条实测坑**（7z 挂死、回收站假删、carve 短路/选错签名、深层嵌入漏判、嵌套混淆 zip 恢复……）→ `references/pitfalls.md`。
+- **49 条实测坑**（7z 挂死、回收站假删、carve 短路/选错签名、深层嵌入漏判、嵌套混淆 zip 恢复……）→ `references/pitfalls.md`。
   （#32 收敛循环 / #33 EXTRACTED 冻结四机制 / #34 假 WRONG_PASSWORD（含无后缀变体）/ #35 签名噪声 /
   #36 幻影裁决 / #37 SFX 本体直解 / #38 加密7z无密码判据 / #39 源真MP4→carve产物即噪声 /
   #40 诊断脚本别加 -bse0 / #41 批量去重先验保留方存活 / #42 嵌套混淆zip(EOCD.cdoff→诱饵CD+method99假头) /
-  #43 768MB扫描上限漏判深层包 / #44 残留排查SOP / #45 PowerShell诊断脚本三坑）
+  #43 768MB扫描上限漏判深层包 / #44 残留排查SOP / #45 PowerShell诊断脚本三坑 /
+  #46 learned 是 TAB 4 列别当逐行密码 / #47 库内排序 ≠ 来源排序 / #48 只读命令也会写用户目录 /
+  **#49 本沙箱目录删除是递归的：`os.rmdir`/`RemoveDirectoryW` 对非空目录也返回成功**）
 - **自进化教训库**（历批 open 待办，动批前必读）→ `references/lessons.md`。
 
 ## 8. 已知限制（Known limitations）
@@ -405,24 +439,27 @@ laowang-unzip/
 ├── assets/
 │   ├── passwords.txt           ← 20 条内置种子密码（只读发布物）
 │   ├── passwords.local.txt     ← 用户个人密码库（git-ignored，优先合并）
-│   └── passwords.learned.txt   ← ★ 自学习密码库（机器维护，按成功次数降序；v3.6.0）
+│   ├── passwords.learned.txt   ← ★ 自学习密码库（机器维护，按成功次数降序；v3.6.0）
+│   └── junk.learned.txt        ← ★ 自学习垃圾库（机器维护，按确认次数降序；v3.7.0，git-ignored）
 ├── references/
-│   ├── design-v2.1.md          ← 完整设计文档（DDL / 伪代码 / 全部判据的出处）
+│   ├── design-v2.1.md          ← 完整设计文档（DDL / 伪代码 / 全部判据的出处；§6.5 垃圾库 / §6.6 空目录）
 │   ├── scripts-api.md          ← ★ 实现契约 v2：已对齐实际 13 模块代码 + 7 条验收指标
 │   ├── magic-signatures.md     ← 魔数表 + 头伪装/carve/magic 修复判据
 │   ├── failure-matrix.md       ← 失败枚举 + 12 条删除 check + 7z 输出归类速查
-│   ├── pitfalls.md             ← 实测坑全集（实现前必读，45 条）
+│   ├── pitfalls.md             ← 实测坑全集（实现前必读，49 条）
 │   ├── lessons.md              ← ★ 自进化教训库（Lessons 层，动批前读 open 条目，§3.1/§3.2）
 │   ├── lessons-archive.md      ← 已归档教训（promoted/resolved，由 evolve --apply 生成）
 │   └── .backup/                ← 每次写 lessons.md 前的自动备份（evolve append/archive）
-└── scripts/                    ← 实现代码（冒烟 31 项 + 回归 24/24 + carve 10 + open-db 5 通过）
+└── scripts/                    ← 实现代码（**全量回归 328 例 OK**，`python -m unittest discover -s tests`）
     ├── pipeline.py             ← CLI：run/doctor/status/resolve-dup/clean-junk/purge-recycle/
     │                              retry-failed/report/init-db/**evolve**（自进化环）/**pw-stats**（密码库）
+    │                              / **junk-stats** · **junk-learn**（垃圾库）· **prune-empty**（空目录）
     ├── cli.py                  ← 别名入口（与 pipeline.py 等价）
     ├── init_db.py              ← 显式建库
-    ├── tests/                  ← 单元测试（unittest：test_header_carve / test_evolve / …）
-    └── pipeline_lib/           ← 15 个模块文件（`__init__` + 14 个功能模块）：config / db /
-                                 fsutil(平台适配) / hasher / header / junk / passwords / sz /
-                                 space / recycle / scheduler / report / **evolve**(自进化引擎) /
-                                 **pwstats**(密码自学习层，v3.6.0)
+    ├── tests/                  ← 16 个单元测试文件（unittest：test_junklib / test_prune_empty /
+    │                              test_header_carve / test_evolve / test_readonly_open / …）
+    └── pipeline_lib/           ← 16 个功能模块：config / db / fsutil(平台适配) / hasher / header /
+                                 junk / **junklib**(垃圾自学习层 v3.7.0) / passwords / sz / space /
+                                 recycle / scheduler / report / evolve(自进化引擎) /
+                                 pwstats(密码自学习层 v3.6.0) / audit
 ```

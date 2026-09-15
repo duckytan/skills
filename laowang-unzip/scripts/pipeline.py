@@ -55,6 +55,8 @@ from pipeline_lib import config as C                       # noqa: E402
 from pipeline_lib import audit as audit_mod                # noqa: E402
 from pipeline_lib import evolve as evolve_mod              # noqa: E402
 from pipeline_lib import fsutil                            # noqa: E402
+from pipeline_lib import junk as junk_mod                  # noqa: E402
+from pipeline_lib import junklib as junklib_mod            # noqa: E402
 from pipeline_lib import passwords as passwords_mod        # noqa: E402
 from pipeline_lib import pwstats as pwstats_mod            # noqa: E402
 from pipeline_lib import recycle as recycle_mod            # noqa: E402
@@ -275,7 +277,53 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--yes", action="store_true", help="auto-confirm mid-risk tier")
     p.add_argument("--ask-all", action="store_true",
                    help="confirm even the zero-risk tier")
+    p.add_argument("--no-learn", action="store_true",
+                   help="do NOT add the confirmed files to the junk library "
+                        "(§6.5; learning is on by default: bulk --yes records "
+                        "the content fingerprint only, a per-file 'y' also "
+                        "records the file name)")
+    p.add_argument("--no-prune", action="store_true",
+                   help="do NOT clean up directories left empty by the "
+                        "deletions (§6.6)")
     p.set_defaults(func=cmd_clean_junk)
+
+    p = sub.add_parser("junk-stats",
+                       help="show / verify / forget entries in the self-learning "
+                            "junk library (SKILL.md §6.5, v3.7.0)")
+    add_common(p)
+    p.add_argument("--top", type=int, default=0,
+                   help="show only the top N entries (0 = all)")
+    p.add_argument("--json", action="store_true",
+                   help="emit a machine-readable JSON blob")
+    p.add_argument("--verify", action="store_true",
+                   help="mechanical self-check of the library "
+                        "(exit 0 = OK, 1 = problem)")
+    p.add_argument("--forget", default=None, metavar="KIND:VALUE",
+                   help="drop one entry, e.g. --forget name:最新地址.txt "
+                        "or --forget hash:<md5>")
+    p.set_defaults(func=cmd_junk_stats)
+
+    p = sub.add_parser("junk-learn",
+                       help="add a file to the junk library (only YOU may do "
+                            "this — the machine never learns on its own)")
+    add_common(p)
+    p.add_argument("path", help="a junk file you have confirmed by eye")
+    p.add_argument("--namepart", action="append", default=None, metavar="TEXT",
+                   help="also record a name fragment (>=2 chars, matched as a "
+                        "substring); repeatable. e.g. --namepart 广告")
+    p.add_argument("--dry-run", action="store_true",
+                   help="show what would be recorded, write nothing")
+    p.set_defaults(func=cmd_junk_learn)
+
+    p = sub.add_parser("prune-empty",
+                       help="remove empty directories left behind under --src "
+                            "(§6.6, v3.7.0; dry run unless --apply)")
+    add_common(p)
+    p.add_argument("--apply", action="store_true",
+                   help="really remove them (default is a dry run)")
+    p.add_argument("--json", action="store_true",
+                   help="emit a machine-readable JSON blob")
+    p.set_defaults(func=cmd_prune_empty)
 
     p = sub.add_parser("purge-recycle",
                        help="purge recycle-bin entries created by THIS pipeline")
@@ -864,6 +912,7 @@ def cmd_resolve_dup(args) -> int:
 
 def cmd_clean_junk(args) -> int:
     cfg, db = _open_db(args)
+    learned = 0
     try:
         where = "WHERE status='JUNK_PENDING'" + (" AND batch=?" if args.batch else "")
         params = (args.batch,) if args.batch else ()
@@ -874,10 +923,11 @@ def cmd_clean_junk(args) -> int:
             return 0
         cur_rule = None
         deleted = 0
+        emptied = set()
         for r in rows:
             if r["junk_rule"] != cur_rule:
                 cur_rule = r["junk_rule"]
-                tier = "zero-risk" if cur_rule in C.JUNK_AUTO_RULES else "MID-RISK"
+                tier = "zero-risk" if junk_mod.is_auto_rule(cur_rule) else "MID-RISK"
                 print("\n[%s] rule: %s" % (tier, cur_rule))
             print("  #%d %s (%s)" % (r["id"], r["path"], _hb(r["size_bytes"])))
             if not fsutil.exists(r["path"]):
@@ -886,10 +936,12 @@ def cmd_clean_junk(args) -> int:
                               "junk already gone from disk")
                 deleted += 1
                 continue
-            zero = cur_rule in C.JUNK_AUTO_RULES
+            zero = junk_mod.is_auto_rule(cur_rule)
             approved = (zero and not args.ask_all) or args.yes
+            individual = False
             if not approved and args.ask_all is False and sys.stdin.isatty():
-                approved = input("    delete? [y/N] ").strip().lower() in ("y", "yes")
+                individual = input("    delete? [y/N] ").strip().lower() in ("y", "yes")
+                approved = individual
             if not approved:
                 print("    kept.")
                 continue
@@ -897,6 +949,13 @@ def cmd_clean_junk(args) -> int:
             if not scheduler_mod.delete_allowed(cfg.src_dir, r["path"]):
                 print("    delete refused (outside source root or protected).")
                 continue
+            # §6.5 (v3.7.0): prepare the library entry BEFORE the file is gone.
+            # Only user-confirmed deletions are eligible, and only for files the
+            # rule table does NOT already auto-delete.  A bulk --yes records the
+            # content fingerprint alone; a per-file 'y' also records the name.
+            learn_this = (not args.no_learn) and (not zero) and (args.yes or individual)
+            digest = junklib_mod.content_hash(r["path"], size=r["size_bytes"]) \
+                if learn_this else None
             ok, rc = fsutil.delete_file(r["path"])
             if ok:
                 db.update_fields(r["id"], source_deleted=1, deleted_at=_now(),
@@ -907,9 +966,41 @@ def cmd_clean_junk(args) -> int:
                               bytes_added=r["size_bytes"] or 0)
                 deleted += 1
                 print("    deleted.")
+                emptied.add(os.path.dirname(r["path"]))
+                if learn_this:
+                    for kind, value in (("hash", digest),
+                                        ("name", os.path.basename(r["path"])
+                                         if individual else None)):
+                        if not value:
+                            continue
+                        rec = junklib_mod.record(kind, value, source="CLEAN_JUNK")
+                        if rec.get("written"):
+                            learned += 1
+                            print("    learned: %s=%s (count=%d)%s"
+                                  % (kind, value[:28], rec["new_count"],
+                                     " [new]" if rec["is_new"] else ""))
             else:
                 print("    delete FAILED rc=%s" % rc)
         print("\n%d junk file(s) deleted, rest kept for review." % deleted)
+        if learned:
+            print("%d junk-library entr(ies) recorded — these will be removed "
+                  "automatically next time. Inspect: python pipeline.py "
+                  "junk-stats" % learned)
+        # §6.6 (v3.7.0): a deletion can leave an empty shell behind (typically
+        # an ad folder whose only content just went).  Prune upward from every
+        # directory we emptied — same guards as the batch-end hook.
+        if emptied and not args.no_prune:
+            protected = [os.path.join(cfg.src_dir, p)
+                         for p in C.PROTECTED_PRUNE_PREFIXES]
+            protected.append(cfg.pipeline_dir)
+            removed, failed = fsutil.prune_empty_dirs(
+                cfg.src_dir, protected=protected, candidates=sorted(emptied))
+            for d in removed:
+                print("  empty dir removed: %s" % d)
+            for d, rc in failed:
+                print("  empty dir kept (rc=%s): %s" % (rc, d))
+            if removed:
+                print("%d empty director(ies) cleaned up." % len(removed))
         return 0
     finally:
         db.close()
@@ -941,6 +1032,172 @@ def cmd_purge_recycle(args) -> int:
         return 0 if ok else 1
     finally:
         db.close()
+
+
+def cmd_junk_stats(args) -> int:
+    """§6.5: inspect / verify / forget entries in the self-learning junk library.
+
+    Read-only unless ``--forget`` is given; the only file ever written is
+    ``<skill>/assets/junk.learned.txt`` (never the DB, never the workdir).
+    """
+    target = junklib_mod.junklib_path()
+
+    if args.forget:
+        kind, sep, value = args.forget.partition(":")
+        if not sep or not kind.strip() or not value.strip():
+            print("--forget expects KIND:VALUE — e.g. "
+                  "--forget name:最新地址.txt  /  --forget hash:<md5>")
+            return 2
+        res = junklib_mod.forget(kind, value)
+        if res["removed"]:
+            print("forgot %s=%s  (%d -> %d entries)"
+                  % (kind, value, res["total_before"], res["total_after"]))
+            return 0
+        print("nothing forgotten: %s" % (res.get("detail") or "not found"))
+        return 1
+
+    ok, problems = junklib_mod.verify()
+    st = junklib_mod.stats()
+
+    if args.verify:
+        if ok:
+            print("junk library OK — %d entr(ies), %s" % (st["total"], target))
+            return 0
+        print("junk library has %d problem(s):" % len(problems))
+        for prob in problems:
+            print("  - %s" % prob)
+        return 1
+
+    if args.json:
+        print(json.dumps({
+            "library_path": target,
+            "exists": st["exists"],
+            "total": st["total"],
+            "by_kind": st["by_kind"],
+            "healthy": ok,
+            "problems": problems,
+            "entries": [{"kind": e.kind, "value": e.value, "count": e.count,
+                         "last_date": e.last_date, "sources": e.sources}
+                        for e in junklib_mod.entries_by_count()],
+        }, ensure_ascii=False, indent=2))
+        return 0
+
+    bk = st["by_kind"]
+    print("junk library: %s" % target)
+    print("entries: %d  (hash=%d, name=%d, namepart=%d)"
+          % (st["total"], bk.get("hash", 0), bk.get("name", 0),
+             bk.get("namepart", 0)))
+    print("kinds: hash=内容指纹（改名也认） / name=完整文件名 / namepart=名称片段")
+    print("只有你亲口确认过的条目会出现在这里；机器自动识别的永不入册。")
+    print()
+    print(junklib_mod.format_table(limit=args.top))
+    if problems:
+        print("\n发现 %d 个问题（跑 --verify 看细节）:" % len(problems))
+        for prob in problems[:5]:
+            print("  - %s" % prob)
+    print("\n忘掉某条: python pipeline.py junk-stats --forget KIND:VALUE")
+    print("手工入册: python pipeline.py junk-learn \"<文件路径>\"")
+    return 0
+
+
+def cmd_junk_learn(args) -> int:
+    """§6.5: record a junk file the user has confirmed **by eye**.
+
+    Two hard rules the CLI enforces for you:
+    * a password carrier can never be learned (§6.2 exemption);
+    * only explicitly supplied pieces are recorded — ``--namepart`` is the
+      only way a name fragment enters the library (the machine never guesses).
+    """
+    path = os.path.abspath(args.path)
+    if not os.path.isfile(path):
+        print("not a file: %s" % path)
+        return 2
+    if junk_mod.is_password_carrier(path):
+        print("refused: %s looks like a password carrier (§6.2 exemption)"
+              % path)
+        return 2
+
+    size = fsutil.getsize(path)
+    plan = []
+    digest = junklib_mod.content_hash(path, size=size)
+    if digest:
+        plan.append(("hash", digest))
+    else:
+        print("note: not fingerprinted (unreadable or larger than %s) — the "
+              "name record still applies."
+              % _hb(C.JUNK_HASH_MAX_BYTES))
+    plan.append(("name", os.path.basename(path)))
+    for part in (args.namepart or []):
+        plan.append(("namepart", part))
+
+    print("file: %s (%s)" % (path, _hb(size)))
+    for kind, value in plan:
+        print("  will record  %-9s %s" % (kind, value))
+    if args.dry_run:
+        print("\ndry run: nothing written.")
+        return 0
+
+    recorded = 0
+    for kind, value in plan:
+        rec = junklib_mod.record(kind, value, source="MANUAL")
+        if rec.get("written"):
+            recorded += 1
+            print("  recorded %s=%s (count=%d)%s"
+                  % (kind, value[:40], rec["new_count"],
+                     " [new]" if rec["is_new"] else ""))
+        else:
+            print("  SKIPPED %s=%s — %s"
+                  % (kind, value[:40], rec.get("detail") or "write failed"))
+    print("\n%d entr(ies) recorded. Next batch deletes them automatically."
+          % recorded)
+    print("Inspect: python pipeline.py junk-stats")
+    return 0 if recorded else 1
+
+
+def cmd_prune_empty(args) -> int:
+    """§6.6: remove empty directories left behind under the processing root.
+
+    Default is a **dry run**; ``--apply`` really removes them.  This command is
+    deliberately read-only with respect to the database (it never opens it),
+    so it stays safe on a production root.  A directory is only ever removed
+    when it is genuinely empty, never the processing root itself, never the
+    pipeline directory, and never a path whose name looks like a password
+    carrier.
+    """
+    root, local = resolve_root(args)
+    cfg = PipelineConfig(
+        workdir=root,
+        src_dir=getattr(args, "src", None) or (local or {}).get("src"))
+    protected = [os.path.join(cfg.src_dir, p)
+                 for p in C.PROTECTED_PRUNE_PREFIXES]
+    protected.append(cfg.pipeline_dir)
+
+    removed, failed = fsutil.prune_empty_dirs(
+        cfg.src_dir, protected=protected, dry_run=not args.apply)
+
+    if args.json:
+        print(json.dumps({
+            "src_dir": cfg.src_dir,
+            "applied": bool(args.apply),
+            "removed": removed,
+            "failed": [{"path": d, "rc": rc} for d, rc in failed],
+        }, ensure_ascii=False, indent=2))
+        return 0
+
+    print("scanning empty directories under: %s" % cfg.src_dir)
+    for d in removed:
+        print("  %s %s" % ("removed" if args.apply else "would remove", d))
+    for d, rc in failed:
+        print("  kept (rc=%s): %s" % (rc, d))
+    if not removed and not failed:
+        print("  (none)")
+        return 0
+    if args.apply:
+        print("\n%d empty director(ies) removed." % len(removed))
+    else:
+        print("\n%d empty director(ies) found — dry run, nothing removed. "
+              "Re-run with --apply to remove them." % len(removed))
+    return 0
 
 
 def cmd_retry_failed(args) -> int:

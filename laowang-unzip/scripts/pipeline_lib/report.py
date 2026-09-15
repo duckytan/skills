@@ -177,6 +177,49 @@ def generate_report(pipe) -> str:
     L.append("处理命令：`python pipeline.py clean-junk --batch %s`" % batch)
     L.append("")
 
+    # -- 五之二、垃圾库命中（v3.7.0 §6.5） -----------------------------------
+    lib_hits = list(getattr(pipe, "library_hits", []) or [])
+    lib_rows = q("SELECT junk_rule, COUNT(*) n, SUM(size_bytes) s, MIN(path) p"
+                 " FROM files WHERE batch=? AND is_junk=1"
+                 " AND junk_rule LIKE 'LIBRARY:%' GROUP BY junk_rule", (batch,))
+    try:
+        from . import junklib as junklib_mod
+        lib_stats = junklib_mod.stats()
+        lib_total = lib_stats["total"]
+    except Exception:  # noqa: BLE001 — a report must never fail on this
+        lib_total = 0
+    L.append("### 五之二、自学习垃圾库（你确认过的，自动删）")
+    L.append("")
+    L.append("| junk_rule | 数量 | 体积 | 示例路径 |")
+    L.append("|---|---|---|---|")
+    if lib_rows:
+        for r in lib_rows:
+            L.append("| %s | %d | %s | %s |" % (r["junk_rule"], r["n"],
+                                                _fmt_bytes(r["s"]), r["p"]))
+    else:
+        L.append("| （本批无库命中） | 0 | — | — |")
+    L.append("")
+    L.append("库存条目：%d 条；本批命中并自动删除：%d 个文件。"
+             % (lib_total, len(lib_hits)))
+    L.append("")
+    L.append("> 库里的每一条都来自你亲口确认过的删除（或 `junk-learn` 手工入册），"
+             "机器自己判定的永不入册。查看/反悔：`python pipeline.py junk-stats` / "
+             "`junk-stats --forget KIND:VALUE`。")
+    L.append("")
+
+    # -- 五之三、空目录清理（v3.7.0 §6.6） -----------------------------------
+    pruned = list(getattr(pipe, "prune_removed", []) or [])
+    if pruned:
+        L.append("### 五之三、顺手清掉的空文件夹")
+        L.append("")
+        for p in pruned[:50]:
+            L.append("- `%s`" % p)
+        if len(pruned) > 50:
+            L.append("- …另有 %d 个" % (len(pruned) - 50))
+        L.append("")
+        L.append("> 只删「本批删完后变空」的空壳文件夹；你原有的空目录结构不动。")
+        L.append("")
+
     # -- 六、空间账 ----------------------------------------------------------
     free_start = bstat["free_bytes_start"] if bstat else None
     free_end = bstat["free_bytes_end"] if bstat else None

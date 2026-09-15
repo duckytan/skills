@@ -43,6 +43,42 @@ def _is_password_hint(name_norm: str, dir_norm: str) -> bool:
     return any(w in joined for w in C.PASSWORD_HINT_WORDS)
 
 
+def is_password_carrier(file_path: str) -> bool:
+    """True when the file (or any of its parent dirs) hints a password.
+
+    Public form of the §6.2 exemption, reused by the junk library so that a
+    learned entry can never delete a password carrier.
+    """
+    name_n = normalize(os.path.basename(file_path))
+    dir_n = normalize(os.path.dirname(file_path))
+    return name_n == C.PASSWORD_FILE_BASENAME or _is_password_hint(name_n, dir_n)
+
+
+def is_auto_rule(rule: str) -> bool:
+    """True when *rule* may delete without asking the user (§11.2).
+
+    v3.7.0: a ``LIBRARY:<KIND>`` hit counts as zero-risk **by construction** —
+    the ledger only ever contains entries the user confirmed in person.
+    """
+    if not rule:
+        return False
+    if rule.startswith(C.JUNK_RULE_LIBRARY_PREFIX):
+        return True
+    return rule in C.JUNK_AUTO_RULES
+
+
+def library_rule(kind: str) -> str:
+    """``hash`` -> ``LIBRARY:HASH`` (the value stored in ``files.junk_rule``)."""
+    return "%s%s" % (C.JUNK_RULE_LIBRARY_PREFIX, (kind or "").upper())
+
+
+def library_kind(rule: str) -> str:
+    """Inverse of :func:`library_rule`; ``''`` when not a library rule."""
+    if not rule or not rule.startswith(C.JUNK_RULE_LIBRARY_PREFIX):
+        return ""
+    return rule[len(C.JUNK_RULE_LIBRARY_PREFIX):].lower()
+
+
 def match(file_path: str, real_type: str, size: int,
           content_head: bytes = b"") -> str:
     """Return a ``junk_rule`` name or ``""`` when the file is not junk.
@@ -68,7 +104,7 @@ def match(file_path: str, real_type: str, size: int,
 
     # Rule 8: advertisement directories (skip when the dir also hints passwords).
     for comp in normalize(dir_path).replace("\\", "/").split("/"):
-        if comp and any(w in comp for w in ("广告", "推广", "加群")):
+        if comp and any(w in comp for w in C.AD_DIR_KEYWORDS):
             if not any(w in comp for w in C.PASSWORD_HINT_WORDS):
                 return "DIR_PATTERN"
 

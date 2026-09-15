@@ -313,3 +313,19 @@ SQLite 仍需物化 `-shm`/`-wal` 影子文件。
 `immutable=1` 打开/校验失败降级重试 `mode=ro`；缺失/非库/目录 → `None`、绝不抛。
 回归：`tests/test_readonly_open.py`（WAL 干净无影子 / 非空读最新 / 降级 / 缺失·垃圾·目录→None / 两处委托）。
 关联：db.py `open_readonly`；evolve.py `_open_ro`；pipeline.py `_readonly_db_counts`；LES-20260915-06。
+
+**#49. 目录删除在本开发沙箱里是「递归」的：`os.rmdir` / `RemoveDirectoryW` 对非空目录也返回成功（v3.7.0）**
+现象：给 §6.6 写空目录清理时探针发现——对一个**非空**目录调用 `os.rmdir(sub)` 返回 `None`（成功），
+`sub/a.txt` 一并消失；换 Win32 `RemoveDirectoryW` 同样返回 1（成功），`sub/deep/b.txt` 整棵子树消失，
+`GetLastError` 给出非标准码 14007。
+根因：开发沙箱的 safe-delete 层（`<WorkBuddy>\resources\app.asar.unpacked\cli\vendor\shim\sitecustomize.py`）
+把**任何目录删除调用**改写成「送回收站 / 递归删除」。它虽然用 `_is_dir_empty` 拦非空目录，
+但实测该拦截没有生效（钩子作用在更底层）→ 返回值被伪造成成功，错误不可观测。
+教训：**绝不能把「rmdir 会拒绝非空目录」当作数据安全防线**。目录删除的安全必须由调用方自己保证，
+而且必须用钩子碰不到的通道：
+① 删前判空（唯一防线）；② 判空走 ctypes `FindFirstFileW`（`*` 不返回 `.`/`..`，直连 kernel32）；
+③ 双通道交叉验证（Win32 + `os.scandir`），任一说「非空」即不删（fail-closed）。
+实现：`fsutil._dir_is_empty_win32` / `dir_is_empty` / `remove_empty_dir`（后者弃用 `os.rmdir` 改
+`RemoveDirectoryW`，且 docstring 明确「不继承 OS 的拒绝语义」）。
+回归：`tests/test_prune_empty.py`（41 例，含 `test_never_removes_ancestors_of_content`）。
+关联：fsutil.py §6.6；LES-20260915-08；SKILL.md §6.6；#36（沙箱视图不可信）。

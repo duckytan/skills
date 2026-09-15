@@ -1,5 +1,84 @@
 # Changelog
 
+## v3.7.0 (2026-09-15) — 垃圾库（自学习）+ 空目录清理 + 广告目录词配置化
+
+**背景（用户原话）**：能不能建一个广告文件库，里面包含所有我们遇到过的广告文件、垃圾文件、
+空白文件夹、各种可以删除的没用的文件（或文件夹），下次再解压出来，再完成解压后，
+顺手把这些文件也删了，这样我们就能得到干净的内容。
+
+### Part A — 自学习垃圾库（新模块 `scripts/pipeline_lib/junklib.py`，纯标准库、绝不抛）
+- **受管文件** `assets/junk.learned.txt`（机器维护，UTF-8/LF，`#` 注释；数据行
+  `TAB` 分隔 5 列 `<count>\t<kind>\t<value>\t<last_date>\t<sources>`；落盘按 count 降序）。
+  已加入 `.gitignore`（含本机确认过的文件名/片段，绝不入库/推送）。
+- 三种 `kind`：**hash**（内容 md5 指纹，改名也认）/ **name**（完整文件名，归一化后精确匹配）/
+  **namepart**（名称片段，子串匹配，取最长命中）。`JUNK_HASH_MAX_BYTES=1MB`（超过不指纹）。
+- `parse_library` / `render_library` **字节无损 round-trip**（护栏：真实库
+  parse→render 逐字节一致）；无法解析的数据行**留在 `pre` 里不丢弃**；
+  `utf-8-sig` + `errors=ignore`；`_atomic_write`（同目录 `.tmp` + `os.replace`）。
+- `lookup` 匹配优先级 **hash → name → namepart**（最强证据优先）；`namepart` 取最长命中
+  （最具体判据优先）。`C.JUNK_NAMEPART_MIN_CHARS=2` —— **刻意不是 3**：广告目录词
+  `广告/推广/加群/最新/扫码` 全是两个字，3 字下限会把它们全挡掉（开发中由测试咬出）。
+- **安全底线（硬约束，写进模块 docstring 与 SKILL.md §6.5）**：机器**永不自动入册**。
+  - 只有两条路径能落库：① 用户在 `clean-junk` 里亲口确认过的删除；② 用户显式跑 `junk-learn`。
+  - 自动规则判定的永远只能「提议」（`files.is_junk/junk_rule`），不得写入库。
+    理由：密码记错只是多试一次，垃圾记错会静默删掉真数据，且一次误判会自我强化。
+  - **密码载体永久豁免**：`junk.is_password_carrier()`（名字/目录含 `密码/解压码/提取码`，
+    或文件名就是 `password.txt`）一律不查库、不入册、不删。
+- **入册粒度按确认强度分档**（`learn_from_confirmed`）：批量 `--yes` 批准 → **只记内容指纹**
+  （不外推到同名文件）；逐条 `y` 或 `junk-learn` → **指纹 + 完整文件名**。
+  `namepart` 只能由 `junk-learn --namepart` 显式加入，机器绝不自动生成。
+- **接线**：`scheduler._handle_non_archive` 在规则表未命中时查库，命中记
+  `junk_rule='LIBRARY:<KIND>'` 并计入 `library_hits`；`junk.is_auto_rule()` 让
+  `LIBRARY:*` **按零风险档**自动删（因为条目只可能来自用户确认）。
+  `junk.is_auto_rule` / `library_rule` / `library_kind` 成为「规则 → 是否自动」的唯一判据，
+  `scheduler` 与 `cmd_clean_junk` 的两处 tier 判断统一改用它（原先各自硬写
+  `cur_rule in C.JUNK_AUTO_RULES`）。
+- **CLI**：`junk-stats`（查看 / `--top N` / `--json` / `--verify` / `--forget KIND:VALUE`）、
+  `junk-learn <path>`（`--namepart TEXT` 可重复 / `--dry-run`）。
+- `clean-junk` 新增 `--no-learn`；默认在用户确认后入册，并打印每条 recorded 结果。
+
+### Part B — 空目录清理（`fsutil` §6.6 + `prune-empty` 命令）
+- 新增 `fsutil.prune_empty_dirs(root, protected, dry_run, candidates)` → `(removed, failed)`：
+  - `candidates=None` → 自底向上全树清扫（`prune-empty` 命令用）；
+  - `candidates=[...]` → 从给定目录**只向上走**，遇非空/被保护/出根即停（**批次收尾用**，
+    只清「本批自己弄空的壳」，绝不动用户原有结构）。
+  - 永不删 root 本身、永不删 `protected` 前缀下的、永不删名字像密码载体的目录；
+    仅删**确实为空**的目录。
+- **批次收尾自动跑**（`_run_locked_main` 第 4c 步，`EMPTY_DIR_PRUNE_ON_FINISH` 可关，
+  dry-run 不跑）：候选来自本批每一次成功删除（源包删除 + 垃圾删除）的父目录；
+  每个动作写 `ACTION_PRUNE` 事件；整段 try/except，出错只 warn、**绝不让批次失败**。
+  摘要新增 `library_hits` / `pruned_dirs`。
+- **新命令** `prune-empty [--apply] [--json]`：**默认干跑**；**全程不打开数据库**
+  （保持只读语义，不在用户根里物化 DB 文件）。
+- `clean-junk` 删完自己的东西后**同样会收空壳**（候选 = 它本次删掉的文件所在目录），
+  新增 `--no-prune` 关闭。理由：`clean-junk` 才是用户亲手确认的那一步，
+  删完留下一个空广告文件夹正好是用户的痛点，不该等到下一次 `run` 才清。
+- **⚠ 安全模型修正（本版最重要的发现，见 references/pitfalls.md #49 / LES-20260915-08）**：
+  本开发沙箱的 safe-delete 层把**任何**目录删除调用（`os.rmdir` **与** Win32
+  `RemoveDirectoryW`）改写成递归删除，对非空目录也**返回成功**（`GetLastError` 非标准码 14007）。
+  因此「rmdir 会拒绝非空目录」**不能**当作防线。最终做法：判空即唯一防线，且判空走钩子不可达的
+  `ctypes FindFirstFileW`（pattern `*` 不返回 `.`/`..`），并与 `os.scandir` **双通道 fail-closed**
+  （任一说非空即不删）；`remove_empty_dir` 弃用 `os.rmdir` 改 `RemoveDirectoryW`，
+  docstring 明确「不继承 OS 的拒绝语义」。
+
+### Part C — 广告目录关键词配置化（纯 bug 级缺失）
+- `("广告", "推广", "加群")` 原为 `junk.py` 第 71 行的**硬编码元组**，用户无法自行增删。
+- 挪入 `config.py` 的 `AD_DIR_KEYWORDS`，`junk.py` 改读 `C.AD_DIR_KEYWORDS`。
+
+### 报告
+- 批次报告 §五 新增两节：**五之二 自学习垃圾库**（按 `LIBRARY:*` 分组统计 + 库存条目数 +
+  本批命中自动删除数 + 查看/反悔命令）、**五之三 顺手清掉的空文件夹**（逐条列出，>50 条折叠）。
+- 报告对缺失属性容错（`getattr(pipe, ..., [])`），老调用方不会因此报错。
+
+### 测试
+- 新增 `tests/test_junklib.py`（65 例）与 `tests/test_prune_empty.py`（41 例）：字节无损
+  round-trip / 坏行保留 / 原子写失败不动原文件 / 三种 kind 的优先级 / 归一化匹配 /
+  namepart 最长命中 / 密码载体永不命中/永不入册 / 超额文件不指纹 / forget / verify 四类问题 /
+  批量与逐条入册粒度差异 / 库命中算零风险 / 广告词来自 config（含静态断言）/
+  CLI 各分支退出码 / 目录判空双通道 / 深层内容保护整条祖先链 / 只删空壳 / 收尾钩子接线与容错。
+- 实现过程中由测试咬出两处真问题：`namepart` 最短长度 3 会挡掉全部两字广告词（改 2）；
+  `os.rmdir` 在本沙箱递归（改用 `FindFirstFileW` 判空 + `RemoveDirectoryW`）。
+
 ## v3.6.0 (2026-09-15) — 密码库自进化（Part A）+ 自进化环真正自动跑（Part B）
 
 **背景（用户原话）**：自我升级/迭代"不能仅停留在功能上，必须要实际能运作起来"；
