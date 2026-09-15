@@ -74,7 +74,7 @@ python pipeline.py run --root <处理根> --src <待处理目录> --dry-run
 python pipeline.py run --root <处理根> --src <待处理目录>
 ```
 
-常用运维：`doctor` 开工体检（7z 探测 / Python 版本 / root 与源目录 / db 可写 / 密码库盘点）；
+常用运维：`doctor` 开工体检（7z 探测 / Python 版本 / root 与源目录 / db 可写 / 密码库盘点 / 第 7 项自进化环欠账**仅提示、不影响退出码**）；`evolve` 自进化环体检与治理（`--check` 才是收尾闸口，见 §3.2）；
 `status` 看库内概况；`resolve-dup <id> --keep old|new` 定夺去重待定项；
 `clean-junk` 确认后清中风险垃圾；`purge-recycle` 手动清回收站；`retry-failed` 重跑失败项；
 `report` 重新生成报告。
@@ -106,7 +106,9 @@ python pipeline.py add-password "<密码>" --test --root <处理根> [--sevenzip
 > **第 0 步 · 读教训（自进化入口）**：动批前 Read `references/lessons.md` 的 **open 条目**——
 > 里面是历次真实批次踩过、尚未提升成正式判据的坑（含待办处置方案）。open 条目里写了
 > "这类失败出现时优先怀疑什么、别做什么"，能直接避免重蹈覆辙。
-> 教训复现 ≥2 次或达到 P0 的，按条目里的处置方案提升进 Skill 层后关闭（见 §3.1）。
+> 也支持一条命令拿到全部 open 清单与待提升项，不必手工翻 Markdown：
+> `python pipeline.py evolve --json`（脚本消费）或 `python pipeline.py evolve`（人读报告）。
+> 教训复现 ≥2 次或达到 P0 的，按 §3.2 自我迭代协议提升进 Skill 层后关闭（判据见 §3.1）。
 
 | # | 步骤 | 做什么 | 关键判据（写死成 config 常量） |
 |---|---|---|---|
@@ -119,13 +121,14 @@ python pipeline.py add-password "<密码>" --test --root <处理根> [--sevenzip
 | 7 | **预检** | 分卷按"同基名+连续序号"配对；空间闸门 | 空间需求 = `输入体积 × 1.5 + 6 GiB`；不足 → `DISK_GUARD_SKIP` **跳过不停机** |
 | 8 | **密码试解 + 解压** | 先 `7z t -p<pwd>` 逐条试（命中即停）→ `7z x -y -p<pwd> -o<out>` | 每条密码必带 `-p` + `stdin=DEVNULL`（否则永久挂死）；超时 `S7Z_TIMEOUT_SEC=5400`；看门狗 = 墙钟 + 进度签名零增长 `PROGRESS_IDLE_SEC=1800` |
 | 9 | **终结判定 + 回溯** | 每个文件进终结态时沿 `parent_id` 向上 `is_fully_done()` 重判；全过 12 条 check 才删源包 | 12 条 check 见 `references/failure-matrix.md` §删除；check#12：有 FAILED 子包 → 父包转 COMPLETE 但**跳过删除** |
-| 10 | **收尾** | 收敛复判（连续 **2 轮**空闲扫描才算收敛）、垃圾规则扫描、生成九节报告 | 报告九节：① 总览 ② 完成清单（按层级） ③ 失败清单（按 fail_reason） ④ 去重待定夺 ⑤ 垃圾待清理 ⑥ 空间账 ⑦ 需人工介入 ⑧ 本批自动执行了什么（可追溯） ⑨ **因下载时间过新被跳过的文件**（deferred_fresh 计数 + 明细 + 建议稍后重跑 `run` 自动接续）；控制台同时打中英双语警告 |
+| 10 | **收尾** | 收敛复判（连续 **2 轮**空闲扫描才算收敛）、垃圾规则扫描、生成报告 | 报告批次主体九节：① 总览 ② 完成清单（按层级） ③ 失败清单（按 fail_reason） ④ 去重待定夺 ⑤ 垃圾待清理 ⑥ 空间账 ⑦ 需人工介入 ⑧ 本批自动执行了什么（可追溯） ⑨ **因下载时间过新被跳过的文件**（deferred_fresh 计数 + 明细 + 建议稍后重跑 `run` 自动接续）；另附跨批 pending 汇总与**第十一节「自省」**（`evolve` 引擎产出：skill 健康度 + 本批候选教训，见 §3.2）；控制台同时打中英双语警告 |
 
-> **第 11 步 · 复盘（自进化出口，每批必做）**：批次收尾后对照报告与 events 回顾本批，
-> 满足任一触发条件就写新条目到 `references/lessons.md`：
-> ① 出现了新的 FAIL_* 形态或错误集群；② 用户纠正了 AI 的做法/判断；③ 修了代码或改了判据
-> （记 commit hash）；④ 发现"报告数字与磁盘实际不符"之类的意外。条目按 lessons.md 头部格式写
-> （现象/根因/处置/状态），**一次最多 5 条、只记非显然的**；同一根因合并成一条。
+> **第 11 步 · 复盘（自进化出口，每批必做，硬流程不是祈使句）**：批次收尾**必须**执行
+> `python pipeline.py evolve --batch <batch>`，把它打印的「自进化环报告」抄进批次报告第十一节。
+> - `python pipeline.py evolve --check` 返回**非 0** 时，**本批不得标记收尾**：必须先把待提升教训
+>   （P0 或复现 ≥2）按 §3.2 ④ 处置掉，让 `evolve --check` 归零，再收尾。
+> - 本批出现的新错误形态 / 新 FAIL_* / 用户纠正 / 改了代码或判据，按 §3.2 写进 `references/lessons.md`
+>   （同类根因复现就 +1 `occ` 不新建；新根因用 `evolve --new` 新建）。**未走完 §3.2 ①–⑤ 视为任务未完成。**
 
 ### 3.1 自进化环（本 skill 如何越用越聪明）
 
@@ -142,6 +145,45 @@ Skill 层对应文档（pitfalls 追加编号、failure-matrix 补枚举、SKILL
 `promoted`。**只补丁不重写**——正式文档是实测判据权威。
 **归档（curation）**：lessons.md 超 ~150 行时把 promoted/resolved 移入 `lessons-archive.md`；
 同一根因只留一条。这样 skill 每跑一批都会变准一点，且永远可 diff、可回滚（纯 Markdown）。
+
+**谁来做（机械 vs 人/AI 的边界，2026-09-15 机械化）**——引擎在 `scripts/pipeline_lib/evolve.py`，
+CLI 入口 `python pipeline.py evolve`：
+
+| 环节 | 机械自动（`evolve` 引擎） | 必须人/AI 写（判断） |
+|---|---|---|
+| 条目解析 / round-trip | `parse_lessons` / `render_lessons`（字节级无损） | — |
+| 复现次数 `- 复现：N 次` | 缺字段自动补默认值；按值判 `occ>=2` | 判断"是否同一根因"（决定 +1 还是新建） |
+| 提升候选筛选 | `promotion_candidates`（`open` 且 `P0` 或 `occ>=2`） | — |
+| 提升决策 + 判据正文 | —（`--apply` **绝不**自动改 Skill 层正文） | ★ 补丁式写 pitfalls / failure-matrix / SKILL.md |
+| 条目状态 `open→promoted` | —（`--apply` **绝不**自动改状态） | ★ 处置到位后手工改那一行 |
+| 归档 promoted/resolved | `archive`（超 150 行自动；`--force` 强制；**写前必备份**） | 决定何时执行 |
+| 健康度自检 | `health`（8 项检查；接进 `doctor` 第 7 项**仅提示**、报告第十一节；**收尾闸口用 `evolve --check`**） | — |
+| 本批候选素材挖掘 | `mine_from_db`（**只读**：errors / fail_reasons / 新错误形态） | 判断"哪些值得记成教训" |
+| 版本 vs 代码一致性 | `health` 的 `changelog_vs_code`（比对 CHANGELOG 日期与 `scripts/**/*.py` 最新 mtime） | 决定版本号并写条目 |
+
+### 3.2 自我迭代协议（遇到问题后的标准动作）
+
+> **触发**：修了 bug / 用户纠正了 AI 的做法与判断 / 出现新的错误形态 / 改了判据。
+> **硬约束：任何一次修 bug 之后，未走完 ①–⑤ 视为任务未完成。**
+> 机械动作只兜底，判据正文与提升决策必须人/AI 补丁式写——「有牙齿」不等于「无人」。
+
+1. **定位根因（禁止拍脑袋）**：先用探针/最小复现把根因钉死（改哪一行、什么条件下触发）。
+   拿不准的写进条目写作「根因（待定）」并列备选假设，别假装已知。
+2. **写教训条目**：同类根因**复现就 `occ +1`、不新建**；新根因才新建。条目正文格式含
+   `- 现象：/- 根因：/- 处置：/- 关联：/- 复现：N 次`。新建命令：
+   `python pipeline.py evolve --new <bug|ops|limit|user> <P0|P1|P2> --phenomenon "…" --root-cause "…" --fix "…" --related "…" [--occ N]`
+   （自动编号 `LES-YYYYMMDD-NN`，并备份到 `references/.backup/`）。
+3. **修代码 + 补回归测试**：先写/补能咬住缺陷的回归用例，再改代码；全量测试必须全绿——
+   `python -m unittest discover -s tests`（**必须带 `-s tests`**，否则 `Ran 0`）。
+4. **提升判据（promotion）**：P0 或 `occ>=2` → **补丁式**写进 Skill 层对应文档
+   （`bug`→pitfalls 追加编号 / `limit`→failure-matrix 补枚举 / `ops`→SKILL.md §3 判据列 /
+   `user`→SKILL.md §5），然后把条目状态改成 `promoted`（手工改；`evolve --apply` 不代劳）。
+   **只补丁，不重写**——正式文档是实测判据权威。
+5. **记版本 + 闸口归零**：`CHANGELOG.md` 顶部加一条版本条目（含 commit hash 位），
+   然后跑 `python pipeline.py evolve --check`：返回 0 才算本轮自进化闭环完成（非 0 看提示补漏）。
+
+机械治理一条命令：`python pipeline.py evolve --apply`（补 `- 复现：N 次` + 归档
+promoted/resolved；**写前自动备份**到 `references/.backup/`；不改正文、不改状态）。
 
 ## 4. 配置全表（config.py 默认值，全部可被 `config.local.json` 覆盖）
 
@@ -320,13 +362,16 @@ laowang-unzip/
 │   ├── magic-signatures.md     ← 魔数表 + 头伪装/carve/magic 修复判据
 │   ├── failure-matrix.md       ← 失败枚举 + 12 条删除 check + 7z 输出归类速查
 │   ├── pitfalls.md             ← 实测坑全集（实现前必读，45 条）
-│   └── lessons.md              ← ★ 自进化教训库（Lessons 层，动批前读 open 条目，§3.1）
+│   ├── lessons.md              ← ★ 自进化教训库（Lessons 层，动批前读 open 条目，§3.1/§3.2）
+│   ├── lessons-archive.md      ← 已归档教训（promoted/resolved，由 evolve --apply 生成）
+│   └── .backup/                ← 每次写 lessons.md 前的自动备份（evolve append/archive）
 └── scripts/                    ← 实现代码（冒烟 31 项 + 回归 24/24 + carve 10 + open-db 5 通过）
-    ├── pipeline.py             ← CLI：run/doctor/status/resolve-dup/clean-junk/purge-recycle/retry-failed/report/init-db
+    ├── pipeline.py             ← CLI：run/doctor/status/resolve-dup/clean-junk/purge-recycle/
+    │                              retry-failed/report/init-db/**evolve**（自进化环）
     ├── cli.py                  ← 别名入口（与 pipeline.py 等价）
     ├── init_db.py              ← 显式建库
-    ├── tests/                  ← 单元测试（unittest：test_header_carve / test_open_db_src 等）
-    └── pipeline_lib/           ← 13 个模块文件（`__init__` + 12 个功能模块）：config / db /
+    ├── tests/                  ← 单元测试（unittest：test_header_carve / test_evolve / …）
+    └── pipeline_lib/           ← 14 个模块文件（`__init__` + 13 个功能模块）：config / db /
                                  fsutil(平台适配) / hasher / header / junk / passwords / sz /
-                                 space / recycle / scheduler / report
+                                 space / recycle / scheduler / report / **evolve**(自进化引擎)
 ```

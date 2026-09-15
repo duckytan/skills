@@ -4,6 +4,11 @@ Hard requirements (§8.3): reproducible (same db state -> same report),
 actionable (every section names the command to run next), honest about the
 recycle bin (deleted bytes are NOT freed), and traceable (auto-executed
 actions listed with their events counts).
+
+Besides the batch-scoped sections ①–⑨ (plus the cross-batch pending summary
+§十), §十一 自省 (self-evolution: this batch's lesson candidates + the skill's
+health verdict) is appended.  §十一 is strictly best-effort — it is wrapped in
+try/except and must NEVER make report generation fail.
 """
 
 from __future__ import annotations
@@ -221,6 +226,8 @@ def generate_report(pipe) -> str:
                  % (n, len(fresh_rows)))
     if n == 0:
         L.append("（无 — 本批没有需要人工处理的项）")
+    n += 1
+    L.append("%d. ★ 本批自省：见第十一节（未处置的候选教训不得标记批次收尾）" % n)
     L.append("")
 
     # -- 七·附、遗留的 carved 派生包（需你确认后清） ------------------------
@@ -319,6 +326,57 @@ def generate_report(pipe) -> str:
         L.append("")
     L.append("处理命令：`resolve-dup <id> --keep old|new` / "
              "`clean-junk`（不加 --batch 即全库）")
+    L.append("")
+
+    # -- 十一、自省（本批候选教训 + skill 健康度，SKILL.md §3.1/§3.2） --------
+    # 注意：本节任何异常都不得让报告生成失败，故整段包 try/except。
+    L.append("## 十一、自省（本批候选教训 + skill 健康度）")
+    L.append("")
+    try:
+        from . import evolve as evolve_mod
+        ev = evolve_mod.evolve(root=cfg.workdir, batch=batch)
+        h = ev.get("health", {}) or {}
+        L.append("- skill 健康度：**%s**（lessons.md %d 行 / open %d / 待提升 %d）"
+                 % ("合格" if h.get("ok") else "不合格",
+                    h.get("lessons_lines", 0), h.get("open_count", 0),
+                    h.get("promotion_due", 0)))
+        bad = [c["name"] for c in h.get("checks", []) if not c.get("ok")]
+        if bad:
+            L.append("- 未通过检查：%s" % "、".join(bad))
+
+        mine = ev.get("mine", {}) or {}
+        L.append("- 本批（%s）候选素材：" % (mine.get("batch") or batch))
+        errs = mine.get("errors") or []
+        if errs:
+            L.append("  - 错误/告警聚合（level in ERROR/WARN）：")
+            for e in errs[:8]:
+                L.append("    - `%s` %s × %d"
+                         % (e.get("level"), e.get("action"), e.get("count")))
+        frs = mine.get("fail_reasons") or []
+        if frs:
+            L.append("  - fail_reason：%s"
+                     % "、".join("%s×%d" % (f["fail_reason"], f["count"])
+                                 for f in frs[:10]))
+        nfr = mine.get("new_fail_reasons") or []
+        if nfr:
+            L.append("  - ⚠ **本批新错误形态（其它批次从未出现）**：%s"
+                     % "、".join(nfr))
+        if mine.get("detail"):
+            L.append("  - note：%s" % mine["detail"])
+
+        cands = ev.get("candidates") or []
+        if cands:
+            L.append("- 待提升教训（P0 或复现 ≥2）：")
+            for c in cands:
+                L.append("    - `%s` %s %s（occ=%d）"
+                         % (c["id"], c["category"], c["priority"], c["occ"]))
+        else:
+            L.append("- 待提升教训：无")
+        L.append("")
+        L.append("> 下一步：按 SKILL.md §3.2 自我迭代协议处置；"
+                 "**未处置的候选教训不得标记批次收尾**。")
+    except Exception as exc:  # noqa: BLE001 — 自省失败绝不能让报告失败
+        L.append("自省模块未运行：%s" % exc)
     L.append("")
 
     text = "\n".join(L)
