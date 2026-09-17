@@ -141,6 +141,10 @@ class Pipeline:
         # -- v3.7.0: junk library + empty-dir pruning ----------------------
         self.library_hits: List[dict] = []     # LIBRARY:* hits this batch (report)
         self.prune_candidates: set = set()     # dirs we may have emptied
+        # v3.7.4: 标记为 after_extraction 的垃圾（如 解压密码.txt），发现时不删，
+        # 收进这里，等整批解压完毕（_flush_deferred_junk_deletes）再统一删。
+        self._deferred_junk_deletes: List = []   # [(fid, path), ...]
+        self.deferred_junk_deletes: int = 0
         self.prune_removed: List[str] = []     # empty dirs removed at batch end
 
     # ------------------------------------------------------------------
@@ -328,6 +332,10 @@ class Pipeline:
                 deferred_fresh += 1
         self.deferred_fresh = deferred_fresh
 
+        # -- 4b-2. v3.7.4: 整批解压完毕，删除 after_extraction 延迟垃圾（如 解压密码.txt）
+        self.deferred_junk_deletes = self._flush_deferred_junk_deletes(
+            dry_run=cfg.dry_run)
+
         # -- 4c. §6.6 (v3.7.0): remove the empty shells this batch left behind
         self.prune_removed = self._prune_empty_dirs()
 
@@ -350,6 +358,7 @@ class Pipeline:
             "recycle_freed_start": freed_start,
             "recycle_freed_end": freed_end,
             "deferred_fresh": deferred_fresh,
+            "deferred_junk_deletes": self.deferred_junk_deletes,
             "db_path": cfg.db_path,
             "library_hits": len(self.library_hits),
             "pruned_dirs": len(self.prune_removed),
@@ -756,6 +765,18 @@ class Pipeline:
                      "output %d bytes ~= source %d bytes (<2%% mismatch) — "
                      "judged complete, continuing as EXTRACTED"
                      % (removed, stat.total_bytes, src_bytes), batch=cfg.batch)
+            # LES-20260909-11 ④ + cascade: a disk-full residue was cleaned and
+            # the surviving volume only *approximately* matches the source — its
+            # completeness is still ambiguous, so the source is deliberately
+            # KEPT (continue as EXTRACTED, do NOT finish/delete).  Cascade delete
+            # (解一级删一级) must therefore NOT fire at extract time here; deleting
+            # the source while its completeness is unproven would defeat the
+            # freeze fix (tests.test_freeze_fixes.test_10) and could lose a
+            # partially-recovered archive.  Later, once the child is fully
+            # verified, the backtrack / final-recheck paths may still close it.
+            zero_roots_vol_match = True
+        else:
+            zero_roots_vol_match = False
         db.update_fields(fid, is_extracted=1, extracted_files=stat.total_files,
                          non_archive_children=stat.non_archive,
                          extracted_at=_now())
@@ -773,6 +794,14 @@ class Pipeline:
         # -- 8a. enqueue extraction products (recursive; 套娃 continues here) ----
         for p in fsutil.real_list_files(out_dir):
             self._upsert_child(p, row, origin="EXTRACTED")
+
+        # -- 8b. cascade delete (解一级删一级): the products we just registered
+        #     may already prove the parent's content is consumed, so delete the
+        #     parent NOW (saving disk) instead of waiting for the whole chain.
+        #     Skip when the extract hit the OUTPUT_ZERO_ROOTS volume-match path
+        #     (completeness still ambiguous — keep the source, see ④ above).
+        if not zero_roots_vol_match:
+            self._try_cascade_delete(fid)
 
         # -- 9/10. completion judgement + delete + backtrack ---------------------
         stat = fsutil.scan_output(out_dir)
@@ -927,6 +956,7 @@ class Pipeline:
                 content_head = fh.read(4096)
         except OSError:
             pass
+        delete_when = "immediate"   # v3.7.4: 仅库命中(after_extraction)才会改变
         rule = junk_mod.match(row["path"], info.real_type, row["size_bytes"],
                               content_head)
         if not rule:
@@ -937,6 +967,7 @@ class Pipeline:
             hit = junklib_mod.lookup_file(row["path"], size=row["size_bytes"])
             if hit:
                 rule = hit["rule"]
+                delete_when = hit.get("delete_when", "immediate")
                 self.library_hits.append({
                     "path": row["path"], "kind": hit["kind"],
                     "value": hit["value"], "count": hit["count"]})
@@ -945,6 +976,15 @@ class Pipeline:
             db.bump_batch(cfg.batch, "n_junk")
             if junk_mod.is_auto_rule(rule) and not cfg.ask_all and \
                     self._delete_allowed(row["path"]):
+                if delete_when == "after_extraction":
+                    # v3.7.4: 解压过程中还可能被用到的文件（如 解压密码.txt），
+                    # 先标记，等整批解压完毕（_flush_deferred_junk_deletes）再删。
+                    self._deferred_junk_deletes.append((fid, row["path"]))
+                    db.transition(fid, C.STATUS_JUNK_PENDING, C.ACTION_DELETE,
+                                  "junk (%s) — deferred: delete after extraction"
+                                  % rule)
+                    self._on_terminal(fid)
+                    return
                 if cfg.dry_run:
                     db.transition(fid, C.STATUS_JUNK_PENDING, C.ACTION_ANALYZE,
                                   "junk (%s) — dry run, kept" % rule)
@@ -1354,6 +1394,14 @@ class Pipeline:
                                   "final re-check: no output dir, children "
                                   "all digested")
                     self._maybe_delete_source(fid, row=row, stat=None)
+                elif self._cascade_delete_ready(fid)[0]:
+                    # 解一级删一级 fallback (no output dir): the freshly produced
+                    # children are valid artifacts, so the source can go even
+                    # though its own output pointer is gone.
+                    db.transition(fid, C.STATUS_COMPLETE, C.ACTION_VERIFY,
+                                  "final re-check: no output dir, cascade ready")
+                    self._maybe_delete_source(fid, row=row, stat=None,
+                                              cascade=True)
                 self._on_terminal(fid)
                 continue
             stat = fsutil.scan_output(out)
@@ -1361,6 +1409,13 @@ class Pipeline:
                 db.transition(fid, C.STATUS_COMPLETE, C.ACTION_VERIFY,
                               "final re-check: fully done")
                 self._maybe_delete_source(fid, row=row, stat=stat)
+            elif self._cascade_delete_ready(fid)[0]:
+                # 解一级删一级 fallback: catch rows whose deletion was not
+                # triggered by an event (e.g. a child terminal transition that
+                # raced the loop) — delete as soon as the children are valid.
+                db.transition(fid, C.STATUS_COMPLETE, C.ACTION_VERIFY,
+                              "final re-check: cascade ready")
+                self._maybe_delete_source(fid, row=row, stat=stat, cascade=True)
             self._on_terminal(fid)
 
     # ------------------------------------------------------------------
@@ -1561,8 +1616,218 @@ class Pipeline:
                 self._delete_one(row["path"], row)
 
     # ------------------------------------------------------------------
+    # Cascade delete (解一级删一级) — §3.5 revision (2026-09-16).
+    #
+    # Previously "delete-on-extract" only fired once the WHOLE descendant chain
+    # was fully mined to the leaves (`_is_fully_done`), so a deep nested chain
+    # held every level on disk at once and could deadlock on free space.  The
+    # new rule: delete a parent the moment its content is safely represented by
+    # VALID child artifacts — a leaf product, or a complete self-contained
+    # archive (incl. a whole volume set) that can be re-extracted later without
+    # the parent.  Repair/Carved artifacts keep the strict P0 误删闸门.
+    # ------------------------------------------------------------------
+    def _resolve_delete_path(self, row) -> Optional[str]:
+        """Resolve the REAL on-disk path of *row* for deletion.
+
+        Bug fix (2026-09-15): after a stage move the DB may still hold the OLD
+        path while the file now lives under the source root (a sibling in the
+        same dir, or anywhere under ``cfg.src_dir``).  If ``row["path"]`` is NOT
+        on disk but a same-basename file exists under the source root, return
+        the resolved real path.  The resolved path MUST still pass
+        ``_delete_allowed`` — the source-root protection is NEVER relaxed; if
+        nothing resolvable is found, return ``None`` so the caller keeps the
+        source (audited).  Used by both ``_maybe_delete_source`` and
+        ``_delete_one`` so every deletion entry point benefits.
+        """
+        db, cfg = self.db, self.cfg
+        stored = row["path"]
+        if fsutil.exists(stored) and delete_allowed(cfg.src_dir, stored):
+            return stored
+        base = row["file_name"] or os.path.basename(stored)
+        # 1) sibling in the recorded directory (stage may have moved it within
+        #    the same folder).
+        sib = os.path.join((row["dir_path"] or os.path.dirname(stored)), base)
+        if sib != stored and fsutil.exists(sib) and delete_allowed(cfg.src_dir, sib):
+            return sib
+        # 2) anywhere under the source root with the same basename.
+        for root, _dirs, files in os.walk(cfg.src_dir):
+            if base in files:
+                cand = os.path.join(root, base)
+                if delete_allowed(cfg.src_dir, cand):
+                    return cand
+        return None
+
+    def _cascade_delete_ready(self, fid: int) -> tuple:
+        """Decide whether *fid*'s source can be deleted by CASCADE (解一级删一级).
+
+        Unlike ``_is_fully_done`` (which waits for children to be fully extracted
+        to the leaves), cascade only requires that every DIRECT child is a
+        self-contained, valid, independently-extractable artifact already on
+        disk:
+
+          * a childless row proves nothing (v1 pitfall 15) -> not ready;
+          * a PENDING_USER child (DUPLICATE_PENDING / JUNK_PENDING) must never be
+            bypassed by automation -> not ready;
+          * a FAILED child keeps the source (retry path, same as check#12) -> not
+            ready;
+          * a REPAIR_ORIGINS child is NOT relaxed — the P0 误删闸门 still demands
+            the whole carved subtree be extracted + registered (we reuse
+            ``_carved_subtree_ready``); if not ready -> not ready;
+          * a child archive (``is_archive==1``) must be a COMPLETE, self-contained,
+            VALID archive — a valid magic header at offset 0 proves it can be
+            re-extracted later WITHOUT the parent, so the parent's bytes are no
+            longer needed (we do NOT require the child to have been extracted);
+          * a volume-group child must have ALL its volumes present on disk AND
+            its FIRST volume (``.001`` / ``.z01`` / lowest number) must carry a
+            valid archive magic header;
+          * a non-archive output (mp4/jpg/...) must simply exist on disk with
+            size > 0 (we cannot deep-verify content, only exclude missing /
+            zero-byte).
+
+        Returns ``(ready, reasons)`` — ``reasons`` is non-empty on the first
+        failure found (used by the 12-check audit trail).
+        """
+        db = self.db
+        kids = db.children_of(fid)
+        if not kids:
+            return (False, ["no children — nothing proves content consumed"])
+        for c in kids:
+            cpath = c["path"]
+            status = c["status"]
+            # 1) child must be physically present on disk.
+            if not fsutil.exists(cpath):
+                return (False, ["child missing on disk: %s" % cpath])
+            # 2) a FAILED child keeps the source as the retry path (check#12).
+            if status == C.STATUS_FAILED:
+                return (False, ["FAILED child — keep source for retry: %s" % cpath])
+            # 3) pending-user verdicts must never be auto-bypassed.
+            if status in C.PENDING_USER_STATES:
+                return (False, ["pending-user child: %s" % cpath])
+            # 4) REPAIR_ORIGINS: do NOT relax the P0 误删闸门.  The carved
+            #    subtree must be fully extracted + registered, else keep source.
+            if c["origin"] in REPAIR_ORIGINS:
+                if not self._carved_subtree_ready(c["id"]):
+                    return (False, ["repair subtree not fully extracted — "
+                                    "keep source (P0 gate): %s" % cpath])
+                continue  # carved child is safe -> next child
+            # 5) archive vs non-archive validation.
+            if c["is_archive"] == 1:
+                ok, why = self._archive_child_ready(c)
+                if not ok:
+                    return (False, [why])
+            else:
+                # non-archive product: must be a real, non-zero-byte file.
+                try:
+                    if fsutil.getsize(cpath) <= 0:
+                        return (False, ["child is zero-byte: %s" % cpath])
+                except OSError:
+                    return (False, ["child missing on disk: %s" % cpath])
+        return (True, [])
+
+    def _archive_child_ready(self, c) -> tuple:
+        """Validate that archive child *c* is a complete, self-contained, valid
+        archive that can stand on its own (no parent needed).
+
+        Returns ``(ready, reason)``; ``reason`` is the audit message (already
+        including the offending path) when not ready.
+        """
+        db = self.db
+        group = c["volume_group"]
+        if group:
+            # Volume set: ALL members must be on disk, and the FIRST volume must
+            # carry a valid archive magic header.
+            members = db.conn.execute(
+                "SELECT * FROM files WHERE volume_group=? AND source_deleted=0",
+                (group,)).fetchall()
+            for m in members:
+                if not fsutil.exists(m["path"]):
+                    return (False, "archive child incomplete/invalid: %s"
+                            % m["path"])
+            first = self._first_volume_path(members) or c["path"]
+            if not self._valid_archive_head(first):
+                return (False, "archive child incomplete/invalid: %s" % first)
+            return (True, "")
+        # Single-volume archive: a valid magic header at offset 0 suffices.
+        if not self._valid_archive_head(c["path"]):
+            return (False, "archive child incomplete/invalid: %s" % c["path"])
+        return (True, "")
+
+    def _first_volume_path(self, members) -> Optional[str]:
+        """Pick the FIRST volume of a set for the magic-header pre-check.
+
+        Order of preference:
+          * the member whose name carries the volume_set FIRST role
+            (``7z`` ``.7z.001`` / zip ``.z01`` / rar ``.part1.rar``) — this is
+            the volume 7z actually reads first;
+          * else the member with the numerically-smallest volume extension;
+          * else the single member (or ``None`` for an empty/degenerate set).
+        """
+        for m in members:
+            role, _ = header.volume_info(os.path.basename(m["path"]))
+            if role == "FIRST":
+                return m["path"]
+        numbered = []
+        for m in members:
+            for rx in (header.RE_VOL_COMPOUND, header.RE_VOL_PART,
+                       header.RE_VOL_ZIP):
+                mm = rx.match(os.path.basename(m["path"]))
+                if mm and mm.groupdict().get("num"):
+                    numbered.append((int(mm.group("num")), m["path"]))
+                    break
+        if numbered:
+            numbered.sort(key=lambda t: t[0])
+            return numbered[0][1]
+        if len(members) == 1:
+            return members[0]["path"]
+        return None
+
+    def _valid_archive_head(self, path: str) -> bool:
+        """True iff *path* carries a valid archive magic header at offset 0.
+
+        Reuses ``header.py`` magic scan (``probe_magic_only``) — a non-empty
+        archive magic (RAR / RAR5 / ZIP / 7Z / TAR / GZ) proves the file is a
+        self-contained, extractable archive that no longer needs its parent.
+        """
+        if not fsutil.exists(path):
+            return False
+        rtype = header.probe_magic_only(path)
+        return rtype in C.ARCHIVE_TYPES
+
+    def _try_cascade_delete(self, fid: int) -> None:
+        """Walk UP from *fid* deleting by cascade (解一级删一级) as long as each
+        ancestor is cascade-ready.  Stops at the first ancestor that is NOT
+        cascade-ready (avoids holding a deeper ancestor that still needs its own
+        source bytes).  In dry-run this is a pure no-op that only emits an audit
+        event naming the candidate (never deletes, never promotes status).
+        """
+        db, cfg = self.db, self.cfg
+        cur = fid
+        while cur is not None:
+            row = db.get(cur)
+            if row is None:
+                break
+            # Cascade only re-judges freshly-extracted parents; a COMPLETE /
+            # DELETED row has already been (or will be) handled elsewhere, and
+            # re-promoting a DELETED row would be wrong.
+            if row["status"] != C.STATUS_EXTRACTED:
+                break
+            if cfg.dry_run:
+                if self._cascade_delete_ready(cur)[0]:
+                    db.event(cur, C.ACTION_VERIFY,
+                             "cascade delete candidate (dry-run — not performed)",
+                             batch=cfg.batch)
+                break
+            if not self._cascade_delete_ready(cur)[0]:
+                break
+            db.transition(cur, C.STATUS_COMPLETE, C.ACTION_VERIFY,
+                          "cascade delete: children are valid archives/outputs")
+            self._maybe_delete_source(cur, row=row, stat=None, cascade=True)
+            cur = row["parent_id"]
+
+    # ------------------------------------------------------------------
     def _maybe_delete_source(self, fid: int, row=None,
-                             stat: Optional[fsutil.OutputStat] = None) -> bool:
+                             stat: Optional[fsutil.OutputStat] = None,
+                             cascade: bool = False) -> bool:
         """§4.1 — the 12 delete checks.  ANY failure keeps the source file.
 
         Deliberately chatty: every rejection is audited so the report can
@@ -1581,26 +1846,40 @@ class Pipeline:
         if (row["extract_rc"] or 0) != 0:
             reasons.append("check1: extract_rc=%s" % row["extract_rc"])
         digested = self._children_digested(fid)
-        # 2. output dir exists — a lost/missing output pointer no longer
-        #    blocks closure when the children prove the content was consumed
-        #    (LES-20260909-11 ①: all children terminal, none FAILED/pending).
-        if (not out_dir or not fsutil.isdir(out_dir)) and not digested:
-            reasons.append("check2: output dir missing")
-            stat = stat or fsutil.OutputStat()
-        # 3. output has real (non-archive) content — EXCEPT when the content
-        #    was intentionally cleaned afterwards (dedup deletion / junk
-        #    cleanup): that is a normal end state, not a reason to keep the
-        #    source forever (LES-20260909-11 ②).
+        # Cascade mode (解一级删一级): the cascade gate (_cascade_delete_ready)
+        # already proved every child is a valid, self-contained artifact (or a
+        # fully-extracted repair subtree), so the output-dir / non-archive /
+        # "all children terminal" checks are satisfied — they must NOT block.
+        if cascade:
+            casc_ready, casc_reasons = self._cascade_delete_ready(fid)
+            if not casc_ready:
+                reasons.append("cascade: " + "; ".join(casc_reasons))
+        else:
+            # 2. output dir exists — a lost/missing output pointer no longer
+            #    blocks closure when the children prove the content was consumed
+            #    (LES-20260909-11 ①: all children terminal, none FAILED/pending).
+            if (not out_dir or not fsutil.isdir(out_dir)) and not digested:
+                reasons.append("check2: output dir missing")
+                stat = stat or fsutil.OutputStat()
+            # 3. output has real (non-archive) content — EXCEPT when the content
+            #    was intentionally cleaned afterwards (dedup deletion / junk
+            #    cleanup): that is a normal end state, not a reason to keep the
+            #    source forever (LES-20260909-11 ②).
+            stat = stat or fsutil.scan_output(out_dir or "")
+            if out_dir and stat.non_archive < 1 and not digested:
+                reasons.append("check3: no non-archive content yet")
+        # 4. no zero-byte residue (always checked — a corrupt extract must not
+        #    be waved through even in cascade mode; ensures a stat exists for the
+        #    cascade path which may be called with stat=None).
         stat = stat or fsutil.scan_output(out_dir or "")
-        if out_dir and stat.non_archive < 1 and not digested:
-            reasons.append("check3: no non-archive content yet")
-        # 4. no zero-byte residue
         if stat.zero_byte > 0:
             reasons.append("check4: %d zero-byte roots" % stat.zero_byte)
         kids = db.children_of(fid)
-        # 5. children all terminal
-        if any(k["status"] not in C.TERMINAL_STATES for k in kids):
-            reasons.append("check5: children not all terminal")
+        # 5. children all terminal (non-cascade only — cascade replaces this
+        #    with the relaxed _cascade_delete_ready gate above).
+        if not cascade:
+            if any(k["status"] not in C.TERMINAL_STATES for k in kids):
+                reasons.append("check5: children not all terminal")
         # 12. no FAILED children (keep source as the retry path — v2.1 C-rev)
         if any(k["status"] == C.STATUS_FAILED for k in kids):
             reasons.append("check12: FAILED child exists — keep source for retry")
@@ -1624,8 +1903,14 @@ class Pipeline:
                      batch=cfg.batch)
             return False
 
-        # 11. protected-path guard — hard stop with ERROR audit (§11.2)
-        if not self._delete_allowed(row["path"]):
+        # 11. protected-path guard — hard stop with ERROR audit (§11.2).
+        # Stale-path recovery (2026-09-15): after a stage move the DB may hold
+        # the OLD path while the file now lives under the source root; resolve
+        # the real on-disk path before the guard.  Source-root protection is
+        # NEVER relaxed — _resolve_delete_path only returns a path that still
+        # passes _delete_allowed.
+        target_path = self._resolve_delete_path(row)
+        if target_path is None or not self._delete_allowed(target_path):
             db.event(fid, C.ACTION_DELETE,
                      "delete refused: path outside source root or protected",
                      level="ERROR", batch=cfg.batch)
@@ -1640,15 +1925,16 @@ class Pipeline:
             return False
 
         # Volume sets are deleted as a whole group or not at all (§4.1).
-        paths = [row["path"]]
+        paths = [target_path]
         rows = [row]
         if row["volume_group"]:
             cur = db.conn.execute(
                 "SELECT * FROM files WHERE volume_group=? AND source_deleted=0"
                 " AND id<>?", (row["volume_group"], fid)).fetchall()
             for m in cur:
-                if m["path"] not in paths and fsutil.exists(m["path"]):
-                    paths.append(m["path"])
+                rp = self._resolve_delete_path(m)
+                if rp and rp not in paths and fsutil.exists(rp):
+                    paths.append(rp)
                     rows.append(m)
 
         # §fix①: also delete carved/repair artifacts (REPAIR_ORIGINS descendants)
@@ -1667,8 +1953,10 @@ class Pipeline:
             if p not in paths and fsutil.exists(p):
                 r = db.get_by_path(p)
                 if r is not None:
-                    paths.append(p)
-                    rows.append(r)
+                    rp = self._resolve_delete_path(r)
+                    if rp and rp not in paths:
+                        paths.append(rp)
+                        rows.append(r)
 
         ok_all = True
         for p, r in zip(paths, rows):
@@ -1700,19 +1988,30 @@ class Pipeline:
         The FIRST deletion of a batch doubles as the minimal probe: if it does
         not really remove the file, ALL further deletions are blocked and the
         incident is audited at ERROR level.
+
+        Stale-path recovery (2026-09-15): when *row* is supplied, prefer the
+        real on-disk path resolved from the source root over the (possibly
+        outdated) DB path — this closes the "path outside source root" false
+        refusal after a stage move.  The resolved path is still subject to the
+        ``_delete_allowed`` guard below, so the source root is never widened.
         """
         db, cfg = self.db, self.cfg
-        if not self._delete_allowed(path):
-            db.event(row["id"], C.ACTION_DELETE,
-                     "delete refused: %s" % path, level="ERROR", batch=cfg.batch)
+        real = path
+        if row is not None:
+            resolved = self._resolve_delete_path(row)
+            if resolved is not None:
+                real = resolved
+        if not self._delete_allowed(real):
+            db.event(row["id"] if row is not None else None, C.ACTION_DELETE,
+                     "delete refused: %s" % real, level="ERROR", batch=cfg.batch)
             return False
         first_delete = not self.probe_done
-        ok, rc = fsutil.delete_file(path)
-        gone = not fsutil.exists(path)
+        ok, rc = fsutil.delete_file(real)
+        gone = not fsutil.exists(real)
         self.probe_done = True
         if ok and gone:
             # §6.6 (v3.7.0): the parent may have just become an empty shell.
-            self.prune_candidates.add(os.path.dirname(path))
+            self.prune_candidates.add(os.path.dirname(real))
             if fsutil.last_delete_mode != "RECYCLE":
                 # P1-2/P2 audit: the recycle route did not take it (fallback
                 # permanent delete, or an external hook moved it) — record
@@ -1730,7 +2029,7 @@ class Pipeline:
         # Windows rc 5 = access denied, 32 = locked by another process (§4.2).
         db.update_fields(row["id"], delete_rc=rc)
         db.event(row["id"], C.ACTION_DELETE,
-                 "delete failed rc=%s path=%s" % (rc, path), level="WARN",
+                 "delete failed rc=%s path=%s" % (rc, real), level="WARN",
                  batch=cfg.batch)
         if first_delete:
             self.delete_blocked = True
@@ -1746,6 +2045,39 @@ class Pipeline:
     # ------------------------------------------------------------------
     # Terminal backtracking (§3.3 on_terminal, revision C2)
     # ------------------------------------------------------------------
+    def _flush_deferred_junk_deletes(self, dry_run: bool = False) -> int:
+        """v3.7.4: 整批解压完毕后，删除标记为 after_extraction 的垃圾（如 解压密码.txt）。
+
+        这些文件在解压过程中还可能被用到来试密码，绝不能在发现时立刻删；
+        等到本批所有解压都跑完，再统一删除。返回实际删除条数。
+        """
+        db, cfg = self.db, self.cfg
+        n = 0
+        for fid, p in self._deferred_junk_deletes:
+            if dry_run:
+                db.event(fid, C.ACTION_DELETE,
+                         "DEFERRED junk (dry run, kept): %s" % p,
+                         level="INFO", batch=cfg.batch)
+                continue
+            ok, rc = fsutil.delete_file(p)
+            if ok:
+                self.prune_candidates.add(os.path.dirname(p))
+                if fsutil.last_delete_mode != "RECYCLE":
+                    db.event(fid, C.ACTION_DELETE,
+                             "DELETE_MODE=%s (deferred non-recycle, rc=%s)"
+                             % (fsutil.last_delete_mode, rc), batch=cfg.batch)
+                db.update_fields(fid, source_deleted=1, deleted_at=_now(),
+                                 delete_rc=rc)
+                db.transition(fid, C.STATUS_DELETED, C.ACTION_DELETE,
+                              "junk deferred-deleted (after extraction, "
+                              "mode=%s)" % fsutil.last_delete_mode)
+                n += 1
+            else:
+                db.event(fid, C.ACTION_DELETE,
+                         "deferred junk delete FAILED rc=%s: %s" % (rc, p),
+                         level="WARN", batch=cfg.batch)
+        return n
+
     def _on_terminal(self, fid: int) -> None:
         """Walk UP the parent chain re-judging ancestors after a terminal event.
 
@@ -1765,12 +2097,22 @@ class Pipeline:
                 break
             if p["status"] == C.STATUS_EXTRACTED:
                 out = p["extract_output_dir"]
+                cascade_ready = self._cascade_delete_ready(cur_id)[0]
                 if out and fsutil.isdir(out):
                     st = fsutil.scan_output(out)
                     if self._is_fully_done(cur_id, st):
                         db.transition(cur_id, C.STATUS_COMPLETE, C.ACTION_VERIFY,
                                       "backtrack re-judge: children all terminal")
                         self._maybe_delete_source(cur_id, row=p, stat=st)
+                    elif cascade_ready:
+                        # 解一级删一级: the freshly produced children are valid
+                        # archives/outputs — delete now, do not wait for the full
+                        # descendant chain to be mined to the leaves.
+                        db.transition(cur_id, C.STATUS_COMPLETE, C.ACTION_VERIFY,
+                                      "backtrack re-judge: children are valid "
+                                      "archives/outputs (cascade)")
+                        self._maybe_delete_source(cur_id, row=p, stat=st,
+                                                  cascade=True)
                 elif self._children_digested(cur_id):
                     # LES-20260909-11 ①: output pointer lost, but every
                     # child is terminal — close it here too, not only in
@@ -1779,6 +2121,15 @@ class Pipeline:
                                   "backtrack re-judge: no output dir, "
                                   "children all digested")
                     self._maybe_delete_source(cur_id, row=p, stat=None)
+                elif cascade_ready:
+                    # 解一级删一级 (no output dir variant): the freshly produced
+                    # children are valid artifacts, so the source can go even
+                    # though its own output pointer is gone.
+                    db.transition(cur_id, C.STATUS_COMPLETE, C.ACTION_VERIFY,
+                                  "backtrack re-judge: no output dir, children "
+                                  "are valid archives/outputs (cascade)")
+                    self._maybe_delete_source(cur_id, row=p, stat=None,
+                                              cascade=True)
             elif p["status"] == C.STATUS_SKIPPED and \
                     "HOLD_SOURCE" in (p["note"] or ""):
                 kids = db.children_of(cur_id)

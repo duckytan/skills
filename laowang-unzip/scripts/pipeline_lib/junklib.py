@@ -53,10 +53,20 @@ _SKILL_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(
 
 _SEP = "\t"
 
+# 删除时机（v3.7.4）：每条库记录可带一个删除策略，默认 immediate。
+#   immediate       —— 发现即删（默认；与历史行为一致）。
+#   after_extraction—— 解压过程中还可能被用到的文件（如 解压密码.txt 这类密码载体），
+#                       先标记，等「整批解压完毕」后再删，避免误删正在被用的密码。
+# 仅当用户显式把密码载体登记为 after_extraction 时才允许它进库；密码载体永远是
+# 「延迟删」，绝不「发现即删」（§E 安全底线的延续）。
+DELETE_WHEN_DEFAULT = "immediate"
+DELETE_WHEN_VALUES = ("immediate", "after_extraction")
+
 _LIBRARY_HEADER = [
     "# laowang-unzip 自学习垃圾库（机器维护，勿手改）",
     "# 手动入册请用: python pipeline.py junk-learn \"<文件路径>\"",
-    "# 格式： <确认次数>\\t<kind>\\t<value>\\t<最近确认日期 YYYY-MM-DD>\\t<来源标签,逗号分隔>",
+    "# 格式： <确认次数>\\t<kind>\\t<value>\\t<最近确认日期 YYYY-MM-DD>\\t<来源标签,逗号分隔>\\t<删除时机>",
+    "# 删除时机(可选,缺省=immediate)： immediate=发现即删 / after_extraction=整批解压后删",
     "# kind： hash=内容指纹（内容一致就算，改名也认）"
     " / name=完整文件名 / namepart=名称片段",
     "# 排序： 确认次数降序",
@@ -82,13 +92,18 @@ class Entry:
     count: int = 0
     last_date: str = ""
     sources: List[str] = field(default_factory=list)
+    delete_when: str = DELETE_WHEN_DEFAULT
     # 该数据行「前面」原样保留的行（注释 / 空行），用于字节无损 round-trip。
     pre: List[str] = field(default_factory=list)
 
     def line(self) -> str:
-        return "%d%s%s%s%s%s%s%s%s" % (
+        base = "%d%s%s%s%s%s%s%s%s" % (
             self.count, _SEP, self.kind, _SEP, self.value, _SEP,
             self.last_date, _SEP, ",".join(self.sources))
+        # 缺省策略(immediate)不落列，保持与历史文件字节兼容；仅 after_extraction 显式写出。
+        if self.delete_when and self.delete_when != DELETE_WHEN_DEFAULT:
+            return base + _SEP + self.delete_when
+        return base
 
 
 # ---------------------------------------------------------------------------
@@ -129,8 +144,11 @@ def _parse_data_line(line: str, pre: List[str]) -> Optional[Entry]:
     last_date = parts[3].strip() if len(parts) >= 4 else ""
     raw_src = parts[4] if len(parts) >= 5 else ""
     sources = [s.strip() for s in raw_src.split(",") if s.strip()]
+    dw = parts[5].strip() if len(parts) >= 6 else DELETE_WHEN_DEFAULT
+    if dw not in DELETE_WHEN_VALUES:
+        dw = DELETE_WHEN_DEFAULT
     return Entry(kind=kind, value=value, count=count, last_date=last_date,
-                 sources=sources, pre=list(pre))
+                 sources=sources, delete_when=dw, pre=list(pre))
 
 
 def parse_library(path: str) -> Tuple[List[str], List[Entry], List[str]]:
@@ -144,8 +162,10 @@ def parse_library(path: str) -> Tuple[List[str], List[Entry], List[str]]:
     raw = _read(path)
     if raw is None:
         return [], [], []
-    nl = "\r\n" if "\r\n" in raw else "\n"
-    lines = raw.split(nl)
+    # 换行归一化（jiqing77 事故修复 · v3.7.5）：统一 LF 再 split，杜绝混合换行
+    # 把前面所有 LF 历史数据并成一整块、静默吞掉条目的事故再次发生。
+    raw = raw.replace("\r\n", "\n").replace("\r", "\n")
+    lines = raw.split("\n")
     if lines and lines[-1] == "":
         lines = lines[:-1]
 
@@ -254,8 +274,9 @@ def lookup(file_path: str, size: Optional[int] = None,
     """
     try:
         from . import config as C
-        if not file_path or junk_mod.is_password_carrier(file_path):
+        if not file_path:
             return None
+        carrier = junk_mod.is_password_carrier(file_path)
         entries = read_entries(path or junklib_path())
         if not entries:
             return None
@@ -278,14 +299,21 @@ def lookup(file_path: str, size: Optional[int] = None,
             digest = content_hash(file_path, size=size)
         if digest and digest in by_hash:
             e = by_hash[digest]
+            # §E 延续（v3.7.4）：密码载体仅在 after_extraction 时才可命中（延迟删）。
+            if carrier and e.delete_when != "after_extraction":
+                return None
             return {"kind": e.kind, "value": e.value, "count": e.count,
-                    "rule": junk_mod.library_rule(e.kind)}
+                    "rule": junk_mod.library_rule(e.kind),
+                    "delete_when": e.delete_when}
 
         # ② 完整文件名（归一化后精确相等）。
         e = by_name.get(name_n)
         if e is not None:
+            if carrier and e.delete_when != "after_extraction":
+                return None
             return {"kind": e.kind, "value": e.value, "count": e.count,
-                    "rule": junk_mod.library_rule(e.kind)}
+                    "rule": junk_mod.library_rule(e.kind),
+                    "delete_when": e.delete_when}
 
         # ③ 名称片段：取「最长命中」的那条（最具体的判据优先）。
         best: Optional[Entry] = None
@@ -294,8 +322,11 @@ def lookup(file_path: str, size: Optional[int] = None,
                 if best is None or len(e.value) > len(best.value):
                     best = e
         if best is not None:
+            if carrier and best.delete_when != "after_extraction":
+                return None
             return {"kind": best.kind, "value": best.value, "count": best.count,
-                    "rule": junk_mod.library_rule(best.kind)}
+                    "rule": junk_mod.library_rule(best.kind),
+                    "delete_when": best.delete_when}
 
         return None
     except Exception:  # noqa: BLE001
@@ -320,11 +351,16 @@ def _normalized_value(kind: str, value: str) -> str:
 
 
 def record(kind: str, value: str, source: str = "",
-           date: Optional[str] = None, path: Optional[str] = None) -> dict:
+           date: Optional[str] = None, path: Optional[str] = None,
+           delete_when: str = DELETE_WHEN_DEFAULT) -> dict:
     """把一个「用户确认过的」垃圾特征记入库（已存在则 count+1、合并来源）。
 
     返回 ``{'kind','value','old_count','new_count','is_new','path','written','detail'}``。
     **绝不抛**；写失败时 ``written=False`` 且原文件不变。
+
+    ``delete_when``（v3.7.4）：``immediate``（默认，发现即删）/ ``after_extraction``
+    （整批解压后删）。安全闸：密码载体（名字带密码提示）只能登记为
+    ``after_extraction``，绝不允许 ``immediate``——延续 §E「密码载体永不发现即删」。
     """
     from . import config as C
     result = {"kind": (kind or "").lower(), "value": value or "",
@@ -334,6 +370,10 @@ def record(kind: str, value: str, source: str = "",
     if kind_l not in C.JUNK_LIBRARY_KINDS:
         result["detail"] = "unknown kind: %r" % (kind,)
         return result
+    dw = (delete_when or DELETE_WHEN_DEFAULT).strip().lower()
+    if dw not in DELETE_WHEN_VALUES:
+        result["detail"] = "unknown delete_when: %r" % (delete_when,)
+        return result
     val = _normalized_value(kind_l, value or "")
     result["value"] = val
     if not val:
@@ -342,6 +382,11 @@ def record(kind: str, value: str, source: str = "",
     if kind_l == "namepart" and len(val) < C.JUNK_NAMEPART_MIN_CHARS:
         result["detail"] = ("namepart shorter than %d chars is too broad"
                             % C.JUNK_NAMEPART_MIN_CHARS)
+        return result
+    # §E 延续（v3.7.4）：密码载体只能延迟删，绝不发现即删。
+    if junk_mod.is_password_carrier(val) and dw != "after_extraction":
+        result["detail"] = ("password carrier can only be after_extraction, "
+                             "got %r" % dw)
         return result
     if not date:
         date = time.strftime("%Y-%m-%d")
@@ -362,7 +407,8 @@ def record(kind: str, value: str, source: str = "",
 
     if target is None:
         entries.append(Entry(kind=kind_l, value=val, count=1, last_date=date,
-                             sources=([source] if source else []), pre=[]))
+                             sources=([source] if source else []),
+                             delete_when=dw, pre=[]))
         result["is_new"] = True
         result["new_count"] = 1
     else:
@@ -372,6 +418,7 @@ def record(kind: str, value: str, source: str = "",
         if source and source not in target.sources:
             target.sources.append(source)
         target.last_date = date or target.last_date
+        target.delete_when = dw   # 策略可被后续登记覆盖（如 immediate→after_extraction）
 
     result["written"] = _atomic_write(
         result["path"], render_library(header, entries, footer))
@@ -405,6 +452,25 @@ def learn_from_confirmed(file_path: str, size: Optional[int] = None,
     if include_name:
         out.append(record("name", os.path.basename(file_path), source=source,
                           path=path))
+    return out
+
+
+def learn_deferred(file_path: str, source: str = "DEFERRED_CLEANUP",
+                   path: Optional[str] = None) -> List[dict]:
+    """把「用户指定解压后清理」的文件登记为延迟删（``after_extraction``）。
+
+    与 ``learn_from_confirmed`` 不同：这里**允许密码载体**（解压密码.txt 之类），
+    因为用户本意就是「解压完再删」。只落 ``name`` 策略（按文件名兜所有同名文件），
+    不记内容指纹（密码文件内容各异，按名更通用）。返回落库记录列表（可能为空）。
+    """
+    out: List[dict] = []
+    if not file_path:
+        return out
+    name = os.path.basename(file_path)
+    if not name:
+        return out
+    out.append(record("name", name, source=source, path=path,
+                      delete_when="after_extraction"))
     return out
 
 
@@ -456,8 +522,9 @@ def format_table(path: Optional[str] = None, limit: int = 0) -> str:
     for i, e in enumerate(ordered, 1):
         src = ",".join(e.sources) if e.sources else "-"
         val = e.value if len(e.value) <= 44 else e.value[:41] + "..."
-        out.append("%4d  %6d  %-9s %-10s %s"
-                   % (i, e.count, e.kind, src[:10], val))
+        flag = " DEFER" if e.delete_when == "after_extraction" else ""
+        out.append("%4d  %6d  %-9s %-10s %s%s"
+                   % (i, e.count, e.kind, src[:10], val, flag))
     return "\n".join(out)
 
 
@@ -483,6 +550,13 @@ def verify(path: Optional[str] = None,
             problems.append("empty value (kind=%r)" % (e.kind,))
         if e.kind == "namepart" and len(e.value) < C.JUNK_NAMEPART_MIN_CHARS:
             problems.append("namepart too short: %r" % (e.value,))
+        if e.delete_when not in DELETE_WHEN_VALUES:
+            problems.append("unknown delete_when %r (value=%r)"
+                            % (e.delete_when, e.value))
+        if e.kind == "name" and junk_mod.is_password_carrier(e.value) \
+                and e.delete_when != "after_extraction":
+            problems.append("password carrier must be after_extraction: %r"
+                            % (e.value,))
         key = (e.kind, e.value)
         if key in seen:
             problems.append("duplicate entry: %s = %r" % (e.kind, e.value))

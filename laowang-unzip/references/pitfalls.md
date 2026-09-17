@@ -371,3 +371,23 @@ extract 前就 FAILED」的成员聚合，导致每个成员单独判失败。
 处置：v3.7.2 修复：无扩展名（或派生目录 == 源路径）时输出目录加 `_ext` 后缀；
 7z `Cannot create output directory` 错误串映射进已知 fail_reason（OUTPUT_DIR_CONFLICT）。
 关联：LES-20260915-12；scheduler.py extract_output_dir 派生；evolve.py fail_reason 映射。
+
+**#53. 解一级删一级的闸门返回元组，调用方不能直接当布尔用（v3.7.3）**
+现象：v3.7.3 引入 `解一级删一级`（cascade）后，`tests/test_freeze_fixes.py` 的
+test_2 / test_3 / test_10 三个冻结修复回归同时变红——父包本应停在 EXTRACTED，却一跃
+变成 COMPLETE（甚至 DELETED）。
+根因：`_cascade_delete_ready(fid)` 返回 `(ready, reasons)` 二元组。Python 里**非空元组恒为真**，
+于是 `if self._cascade_delete_ready(fid):` / `elif self._cascade_delete_ready(fid):` 把
+`(False, ["child missing on disk: ..."])` 也当成「就绪」→ 级联分支照常触发，把尚未消费内容的
+父包提前删掉。`_on_terminal` 里 `cascade_ready = self._cascade_delete_ready(...)` 后再
+`elif cascade_ready:` 同理中招；`_try_cascade_delete` 里 `if not self._cascade_delete_ready(cur):`
+因为 `not (非空元组)` 恒为 False，导致「未就绪也不停、一路往上删」。
+教训：**凡是返回 `(bool, reasons)` / `(bool, msg)` 的判定函数，调用点必须取 `[0]` 或解包
+`ready, _ = fn(...)` 再参与布尔判断**，绝不可把整个元组丢进 `if`/`elif`/`not`。
+处置：v3.7.3 修复——`_final_recheck`、`_on_terminal`、`_try_cascade_delete` 全部改为
+`self._cascade_delete_ready(fid)[0]`；`_maybe_delete_source(cascade=...)` 用
+`casc_ready, casc_reasons = self._cascade_delete_ready(fid)` 解包（本就正确）。
+关联：scheduler.py `_cascade_delete_ready` / `_try_cascade_delete` / `_on_terminal` /
+`_final_recheck` / `_maybe_delete_source`；tests/test_cascade_delete.py 与
+tests/test_freeze_fixes.py。
+

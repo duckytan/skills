@@ -1,5 +1,97 @@
 # Changelog
 
+## v3.7.5 (2026-09-17) — 自学习库换行归一化（jiqing77 事故修复）
+
+**背景**：`passwords.learned.txt` 历史数据为 LF，某次用 Windows 默认文本模式
+（`open(path,"a")`，未指定 `newline=""`）追加一批密码，写入的是 CRLF。旧解析器
+`nl = "\r\n" if "\r\n" in raw else "\n"` 一旦文件里出现哪怕一条 CRLF 行，就把
+`\r\n` 选作分隔符，把前面所有 LF 历史数据并成一整块，静默吞掉大量条目
+（jiqing77 / 5678vin 被整段并成 header blob，唯有文件里本就 CRLF 的首条新密码
+能解析）。数据并未丢失（只是被错切），但 `library_password_set` 校验时表现为
+「密码明明在文件里却解析不到」。
+
+### FIX — 解析器换行归一化（pwstats.parse_learned / junklib.parse_library）
+- 改为先 `raw = raw.replace("\r\n","\n").replace("\r","\n")` 再 `raw.split("\n")`，
+  无论文件是 LF / CRLF / 混合，统一成 LF 再切，分隔符选择再也无法被单条 CRLF 污染。
+- 等价 `render_*` 本就 `join("\n")` + 写盘用 `newline=""`（纯 LF），round-trip 字节无损不受影响。
+
+### FEAT — doctor 换行自检（pipeline.py cmd_doctor 6.5）
+- 启动时扫描 `assets/passwords.learned.txt` / `assets/junk.learned.txt` 是否含
+  CRLF / 裸 CR；发现即计入 `problems`（doctor exit 1）并提示
+  `python pipeline.py pw-stats --rebuild` 重写归一成纯 LF。解析器已能正确解析，
+  自检仅作「早发现」哨兵，防止污染累积。
+
+### TEST — tests/test_lineending_safety.py（新增，v3.7.5）
+- 6 个用例锁定：LF 历史 + 中部 CRLF 不吞条目、整文件 CRLF、round-trip 纯 LF、
+  垃圾库 CRLF 下 `delete_when` 字段保全。覆盖两个解析器。
+
+## v3.7.4 (2026-09-17) — 垃圾库「删除时机」字段（delete_when）
+
+**背景**：用户建议——垃圾库绝大多数应「发现即删」，但 `解压密码.txt` 这类在整批
+解压过程中仍会被用到的密码载体，应「整批解压完毕后再删」。为此给每条库记录增加
+`delete_when` 字段。
+
+### FEAT — 删除时机字段（junklib + scheduler）
+- 库记录第 6 列：`immediate`（默认，发现即删） / `after_extraction`（整批解压完再删）。
+  默认省略第 6 列，与旧文件字节兼容。
+- `record()` 闸门：密码载体（文件名/路径含 密码/解压密码/提取码/解压码）只能注册为
+  `after_extraction`，否则拒绝（延续 §E「密码载体绝不自动删」）。
+- `learn_deferred()`：可选入册路径，允许把密码载体以 `after_extraction` 入册。
+- `lookup()`：改写后不再对密码载体一律返回 None；仅当 `delete_when != "after_extraction"`
+  时才返回 None，其余返回含 `delete_when` 的命中。
+- scheduler：命中 `after_extraction` 的垃圾在发现时不删，转入 `_deferred_junk_deletes`，
+  整批解压完毕后由 `_flush_deferred_junk_deletes()` 删除；`delete_allowed` 已确认放行
+  `解压密码.txt`（仅拦截 `password.txt`）。
+- `verify()` 新增两道校验：未知 `delete_when`；密码载体 `name` 必须为 `after_extraction`。
+
+## v3.7.3 (2026-09-17) — 解一级删一级（cascade delete）策略升级
+
+**背景**：深嵌套链 `111.zip → 222.zip(+分卷) → 完美世界.mp4` 下，旧删除策略
+要求「所有直亲子件终态、整条链解到叶子」才删最外层 111.zip，多层同时占盘会
+触发空间死锁（壳→carved→卷三层同时卡住）。「解一级删一级」改为：父包只要其
+**直亲子件**已成为「合法、自包含、可独立重解」的成品/压缩包，即可删除父包，
+不等子件一路解完，从而打破死锁、逐层释放空间。
+
+### FEAT — 解一级删一级（cascade）闸门 `_cascade_delete_ready`（scheduler.py）
+- 新增 `_cascade_delete_ready(fid) -> (ready, reasons)`：仅对**直系子件**判定，
+  不要求其一路解到叶子。子件满足其一即可认为父包内容已被消费、可删父包：
+  - 子件本身是合法压缩包（`is_archive==1`）：首部魔数合法（偏移 0 可独立重解）；
+    分卷组须**全部卷在盘**且**首卷**魔数合法。
+  - 子件是普通成品（mp4/jpg/…）：在盘且 `size > 0`。
+- 永久不放宽的硬闸门（沿用既有 12 条 check）：子件缺盘 / `FAILED` / 待用户
+  （`DUPLICATE_PENDING`/`JUNK_PENDING`）→ 不删；`REPAIR_ORIGINS` 子件仍走 P0
+  误删闸门 `_carved_subtree_ready`，未就绪不删。
+- **返回值是 `(ready, reasons)` 元组**——所有调用方必须用 `[0]`（或解包
+  `ready, _ = ...`）取布尔，不能直接 `if self._cascade_delete_ready(fid):`
+  （非空元组恒为真，会把 `(False, ...)` 误判为就绪）。详见 pitfalls #53。
+
+### FEAT — 三个触发点插入级联评估（scheduler.py）
+- 触发点 1（`_process_one` 解压后 `_upsert_child` 循环之后）：`_try_cascade_delete(fid)`
+  沿 `parent_id` 向上逐层删，遇首个未就绪祖先即停（不持更深的、仍需自身源字节的祖先）。
+- 触发点 2（`_on_terminal` 向上父链分支）：在 `_is_fully_done` 分支外增 cascade 兜底分支。
+- 触发点 3（`_final_recheck` 批次收尾兜底）：对未被事件触发行再判一次级联。
+- `_maybe_delete_source` 新增 `cascade: bool = False`：cascade 模式下用
+  `_cascade_delete_ready` 替换「输出目录 / 非压缩成品 / 子件全终态」门槛，
+  其余 12 条 check（rc / 零字节 / FAILED / 修复 / 路径保护 / 分卷整组 / `_delete_allowed`）
+  全部保留；dry-run 下 cascade 路径为 no-op（只发审计事件）。
+
+### FIX — 同盘 stage 搬家后删除路径陈旧（scheduler.py `_resolve_delete_path`）
+- DB 存的 `row["path"]` 在盘但 `_delete_allowed` 因路径已陈旧被拒（报
+  "path outside source root"）时，按 `cfg.src` 同目录兄弟 / 全盘同名重新解析出真实
+  在盘路径再走删除；解析结果仍须过 `_delete_allowed`（绝不放松 source root 保护），
+  找不到可解析路径则保留源包并审计。`_delete_one` / `_maybe_delete_source` 共用。
+
+### FIX — OUTPUT_ZERO_ROOTS 与级联的边界（scheduler.py `_process_one`）
+- 解压命中 OUTPUT_ZERO_ROOTS（清掉零字节残片、残存卷≈源体积）属「完整性仍存疑、
+  继续 EXTRACTED 不收尾」场景，提取时**不触发**级联删除（保留源包），避免误删
+  可能未完整恢复的包；待子件后续被充分核验后，回溯 / 收尾路径仍可按级联正常收口。
+  对应回归测试 `tests/test_freeze_fixes.py::test_10`。
+
+### TEST — `tests/test_cascade_delete.py`（新增，v3.7.3 覆盖 7 场景 a–g + 附加 h）
+- a 嵌套分卷链级联；b dry-run no-op 仅发事件；c FAILED 子件保留源包；
+  d 分卷缺失保留；e 子件头损坏保留；f 陈旧路径解析后删除；g 修复子件未就绪保留；
+  h 无子件源包不就绪。
+
 ## v3.7.2 (2026-09-16) — LES-11 伪装分卷误报损坏 + LES-12 无扩展名输出目录撞源
 
 **背景**：批 2026-09-15 暴露两个真 bug（pitfalls #51 / #52）：6 组伪装 mp4 的

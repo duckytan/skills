@@ -124,8 +124,12 @@ def parse_learned(path: str) -> Tuple[List[str], List[Entry], List[str]]:
     raw = _read(path)
     if raw is None:
         return [], [], []
-    nl = "\r\n" if "\r\n" in raw else "\n"
-    lines = raw.split(nl)
+    # 换行归一化（jiqing77 事故修复 · v3.7.5）：
+    # 旧逻辑 ``nl = "\r\n" if "\r\n" in raw else "\n"`` 一旦文件里出现哪怕一条
+    # CRLF 行，就把 \r\n 选作分隔符，前面所有 LF 历史数据 + 该 CRLF 行会被并成
+    # 一整块（静默吞掉大量条目）。无论文件是 LF / CRLF / 混合，统一成 LF 再 split。
+    raw = raw.replace("\r\n", "\n").replace("\r", "\n")
+    lines = raw.split("\n")
     # 文件以换行结尾时 split 会多出一个哨兵空串；render 会补回，故此处去掉。
     if lines and lines[-1] == "":
         lines = lines[:-1]
