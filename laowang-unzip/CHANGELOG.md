@@ -55,6 +55,8 @@
 - `cmd_retry_failed` 坏库→2 且 `Database` **未被构造**；`cmd_pw_stats --rebuild` 坏库→2
   且 `rebuild_counts` 未被调用；`cmd_junk_learn` 坏库→2。
 
+> 提交：commit `<pending>` —— v3.7.6 / v3.7.7 / v3.7.8 三者将一并推送（`duckytan/skills` main）；推送被凭证审批闸阻塞，成功后回填真实 hash。
+
 ## v3.7.7 (2026-09-17) — 三司会审驱动的 fail-loud 收口
 
 **背景（三司会审）**：对 v3.7.6 的「自学习库结构损坏即拒跑」硬闸做对抗式复审，
