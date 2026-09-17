@@ -1,5 +1,48 @@
 # Changelog
 
+## v3.7.6 (2026-09-18) — 自学习库「结构损坏即拒跑」fail-loud 硬闸
+
+**背景（jiqing77 事故后续反思）**：v3.7.5 只归一化了换行、止血了「静默吞条目」，
+但没解决更深的病灶——**解析器曾经静默失败**。一条被合并/截断的脏数据行，本该
+大声报错；但旧 `verify()` 只查语义（未知 kind / 空值 / namepart 过短 / delete_when
+/ 密码载体 / 重复），压根不查「数据行 TAB 字段数不对」。于是 batch runner 在库已
+经结构损坏时照跑不误，还继续往坏文件里 `record_success` / `junklib.record` 学数据，
+静默扩大损坏面。本版把「结构损坏」做成**硬闸**：先验、坏了就拒跑并提示修复。
+
+### FIX — `pwstats.verify()`（新增，pipeline_lib/pwstats.py）
+- 新增独立 `verify(path=None)`（默认 `learned_path()`），返回 `(ok, problems)`。
+- 严格扫描：换行归一化后逐行数 TAB 字段——`n==4` 且首字段非整数 / `n in (2,3) or
+  n>=5`（字段数异常=合并或截断）一律显式报错；`n==1` 兼容旧版裸密码（静默接受）。
+- 额外查：重复密码（精确、大小写敏感）、count 未严格降序。无库 = `(True, [])`。
+
+### FIX — `junklib.verify()`（扩展，pipeline_lib/junklib.py）
+- 在原有语义检查之前追加**结构硬闸**：`n<5` 报「字段不足（疑似截断/合并）」，
+  `n>6` 报「字段过多（疑似两条记录被合并）」，`n in (5,6)` 但首字段非整数报
+  「数据行计数非整数」。坏行被 `parse_library` 留痕在 `pre`、不会重复报语义问题，
+  但结构层必拦（fail loud）。
+
+### FIX — `_pwstats_verify()` / run / clean-junk / doctor 硬闸（pipeline.py）
+- `_pwstats_verify`（cmd_pw_stats --verify，rc 0/1）的 learned 部分改为委托
+  `pwstats.verify()`，不再重复造轮子。
+- 新增 `_preflight_learned_libs()`：同时校验 junk.learned.txt + passwords.learned.txt
+  两个自学习库结构完整，绝不抛。
+- `cmd_run` / `cmd_clean_junk`：跑批/清垃圾前先过这道闸，损坏即 `return 2` 并提示
+  `pw-stats --rebuild` / `junk-stats --verify`（clean-junk 额外提示 `--no-learn` 仅删不学）。
+- `cmd_doctor` 新增 6.6) 步骤：复用同一道闸做非阻塞结构自检，计入 `problems`（exit 1）。
+
+### LESSON — 外挂脚本写 learned.txt 的铁律（ jiqing77 / 换行事故根因）
+- **任何外挂脚本写 `passwords.learned.txt` / `junk.learned.txt` 必须用
+  `open(path, "w"/"a", encoding="utf-8", newline="")`** 或走官方 CLI
+  （`add-password` / `junk-learn`）；**禁止裸 `open(path, "a")`**。
+- 裸文本模式在 Windows 默认把 `\n` 写成 `\r\n`（CRLF），会再次诱发 v3.7.5 的合并
+  事故——一条 CRLF 行就让旧解析器把前面所有 LF 历史并成一整块、静默吞条目。
+- v3.7.6 起 run / clean-junk 会在库损坏时**硬闸中止**（fail loud），但「不写坏」
+  才是治本，CLI 与 `newline=""` 原子写是唯一受信任的写入路径。
+
+### TEST — scripts/tests/test_verify_loud.py（新增，v3.7.6）
+- 6 个用例锁定 fail-loud 行为：pwstats 干净 4 字段通过、7 字段合并报错、2 字段报错；
+  junklib 干净 5/6 字段通过、8 字段报错、3 字段报错。
+
 ## v3.7.5 (2026-09-17) — 自学习库换行归一化（jiqing77 事故修复）
 
 **背景**：`passwords.learned.txt` 历史数据为 LF，某次用 Windows 默认文本模式
