@@ -717,9 +717,41 @@ def cmd_collect(args) -> int:
         db.close()
 
 
+def _preflight_learned_libs() -> List[str]:
+    """v3.7.6 fail-loud 硬闸：跑批/清垃圾前校验两个自学习库结构完整。
+
+    返回非空 list = 有损坏，调用方应中止并提示修复。绝不抛。
+    """
+    problems: List[str] = []
+    try:
+        ok_j, pj = junklib_mod.verify()
+    except Exception as exc:  # noqa: BLE001
+        ok_j, pj = False, ["junk.learned.txt 自检异常: %r" % exc]
+    if not ok_j:
+        problems.append("[junk.learned.txt] " + ("; ".join(pj) or "结构异常"))
+    try:
+        ok_p, pp = pwstats_mod.verify()
+    except Exception as exc:  # noqa: BLE001
+        ok_p, pp = False, ["passwords.learned.txt 自检异常: %r" % exc]
+    if not ok_p:
+        problems.append("[passwords.learned.txt] " + ("; ".join(pp) or "结构异常"))
+    return problems
+
+
 def cmd_run(args) -> int:
     cfg = build_config(args)
     pipe = Pipeline(cfg)
+    # v3.7.6 · fail-loud 硬闸：跑批前先校验两个自学习库结构完整，
+    # 损坏则中止并提示修复，避免静默把数据学到坏文件里 / 静默丢数据。
+    gate = _preflight_learned_libs()
+    if gate:
+        warn("⚠ 自学习库自检未通过，本批中止（fail loud，不静默跑）：")
+        for gp in gate:
+            warn("   - %s" % gp)
+        warn("⚠ 修复密码库：python pipeline.py pw-stats --rebuild")
+        warn("⚠ 修复垃圾库：python pipeline.py junk-stats --verify "
+             "（按提示 junk-learn --dry-run / forget；清垃圾可加 --no-learn 仅删不学）")
+        return 2
     summary = pipe.run()
     print("batch %s finished in %ds (sweeps: %d)" %
           (summary["batch"], summary["seconds"], summary["sweep_rounds"]))
@@ -939,6 +971,17 @@ def cmd_resolve_dup(args) -> int:
 def cmd_clean_junk(args) -> int:
     cfg, db = _open_db(args)
     learned = 0
+    # v3.7.6 · fail-loud 硬闸：清垃圾也会写 junk.learned.txt（learn_this），
+    # 库损坏则中止并提示修复，避免静默把脏数据学到坏文件里。
+    gate = _preflight_learned_libs()
+    if gate:
+        warn("⚠ 自学习库自检未通过，本批中止（fail loud，不静默跑）：")
+        for gp in gate:
+            warn("   - %s" % gp)
+        warn("⚠ 修复密码库：python pipeline.py pw-stats --rebuild")
+        warn("⚠ 修复垃圾库：python pipeline.py junk-stats --verify "
+             "（按提示 junk-learn --dry-run / forget；清垃圾可加 --no-learn 仅删不学）")
+        return 2
     try:
         where = "WHERE status='JUNK_PENDING'" + (" AND batch=?" if args.batch else "")
         params = (args.batch,) if args.batch else ()
@@ -1475,25 +1518,19 @@ def _pwstats_rows(passwords_file, workdir, root):
 
 
 def _pwstats_verify(root) -> tuple:
-    """机械自检：可解析 / 无重复 / count 降序 / 合并库不丢密码。返回 ``(ok, msgs)``。"""
+    """机械自检：结构健康 / 无重复 / count 降序 / 合并库不丢密码。返回 ``(ok, msgs)``。
+
+    v3.7.6：learned 文件的「结构 + 语义」自检委托给 ``pwstats.verify()``
+    （fail-loud 硬闸，能抓字段数异常/合并记录/计数非整数）；合并库不丢密码这步保留。
+    """
     msgs = []
-    learned = pwstats_mod.learned_path()
-    try:
-        _h, entries, _f = pwstats_mod.parse_learned(learned)
-    except Exception as exc:  # noqa: BLE001
-        return False, ["① learned 解析失败：%r" % exc]
-    msgs.append("① learned 可解析：%d 条" % len(entries))
-
-    pws = [e.password for e in entries if e.password]
-    if len(pws) != len(set(pws)):
-        return False, msgs + ["② 失败：learned 存在重复密码"]
+    # ① learned 文件结构自检（字段数 / 合并 / 计数 / 重复 / 降序）全交给 pwstats.verify。
+    ok_l, probs_l = pwstats_mod.verify()
+    if not ok_l:
+        return False, ["① learned 结构自检失败："] + probs_l
+    msgs.append("① learned 可解析且结构健康")
     msgs.append("② 无重复密码")
-
-    counts = [e.count for e in entries]
-    desc_ok = all(counts[i] >= counts[i + 1] for i in range(len(counts) - 1))
-    if not desc_ok:
-        return False, msgs + ["③ 失败：数据行未按 count 降序（优先级未生效）"]
-    msgs.append("③ count 严格降序（优先级生效）")
+    msgs.append("③ count 严格降序")
 
     lib = set(passwords_mod.load_library(root=root, workdir=root))
     src_pws = set()
@@ -1644,6 +1681,19 @@ def cmd_doctor(args) -> int:
                   % (lib_name, crlf, lone_cr))
         else:
             print("   - %-20s OK (pure LF)" % lib_name)
+
+    # 6.6) 自学习库结构自检（v3.7.6 fail-loud 硬闸）：复用 run / clean-junk 的同一道
+    #      闸——任何字段数异常 / 合并 / 计数非整数 / 重复 / 未降序 都计入 problems，
+    #      提示用 `pw-stats --rebuild` / `junk-stats --verify` 修复。与 6.5 不重复：
+    #      6.5 只查「含 CRLF 否」，6.6 查「结构是否真的损坏」（更硬的一闸）。
+    print("6.6) learned libs 结构自检 (fail-loud 硬闸):")
+    _plib_probs = _preflight_learned_libs()
+    if _plib_probs:
+        for prob in _plib_probs:
+            problems.append(prob)
+            print("   - [!] %s" % prob)
+    else:
+        print("   - OK (两个自学习库结构均健康)")
 
     # 7) 自进化环健康度（SKILL.md §3.1/§3.2）——**只提示，默认不计入 problems**。
     #    职责分离：doctor 回答「环境+代码能不能开工」，`evolve --check` 回答

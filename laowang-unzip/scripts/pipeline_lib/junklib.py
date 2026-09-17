@@ -9,7 +9,8 @@
      顺序查库，命中即返回 ``LIBRARY:<KIND>`` 规则名；
   §3 ``record`` / ``learn_from_confirmed``：把「用户亲口确认过的」垃圾记账；
   §4 ``forget``：反悔了就把条目删掉；
-  §5 ``verify`` / ``format_table``：机械自检 + 人肉查看。
+  §5 ``verify`` / ``format_table``：机械自检（v3.7.6 fail-loud 结构硬闸——
+      数据行字段数异常/合并脏行必报）+ 人肉查看。
 
 设计原则（硬约束，违反即返工）：
   §A 纯标准库；无第三方依赖。
@@ -541,6 +542,28 @@ def verify(path: Optional[str] = None,
     raw = _read(target)
     if raw is None:
         return True, []            # 还没建库 = 健康
+
+    # —— v3.7.6 fail-loud 结构硬闸：先严格扫描「数据行 TAB 字段数」，
+    #    截断 / 合并的脏行会被 parse 留痕在 pre、不在此重复报语义问题，但必须
+    #    在此显式拦下（fail loud），避免后面 record() 把脏数据学到坏文件里。
+    _norm = raw.replace("\r\n", "\n").replace("\r", "\n")
+    _lines = _norm.split("\n")
+    if _lines and _lines[-1] == "":
+        _lines = _lines[:-1]
+    for _line in _lines:
+        if _is_comment_or_blank(_line):
+            continue
+        _parts = _line.split(_SEP)
+        _n = len(_parts)
+        if _n < 5:
+            problems.append("数据行字段不足（n=%d，应为 5 或 6，疑似截断/合并）: %s"
+                            % (_n, _line[:60]))
+        elif _n > 6:
+            problems.append("数据行字段过多（n=%d，疑似两条记录被合并）: %s"
+                            % (_n, _line[:60]))
+        elif not _parts[0].strip().isdigit():
+            problems.append("数据行计数非整数: %s" % _line[:60])
+
     entries = read_entries(target)
     seen = set()
     for e in entries:

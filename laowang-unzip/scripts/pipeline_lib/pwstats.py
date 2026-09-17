@@ -9,6 +9,8 @@
   §3 ``counts_from_db`` 从只读 DB ``files`` 表汇总「每个密码的成功解压次数」；
   §4 ``rebuild_counts`` 用 DB 口径**单调**校正 learned 计数（只升不降）；
   §5 ``prioritize`` 按成功次数**降序**决定试解优先级（次数多的先试）。
+  §6 ``verify`` 自检（v3.7.6 fail-loud 结构硬闸）：数据行字段数异常 / 合并记录 /
+      计数非整数 / 重复密码 / count 未降序 一律显式报错，供 run / clean-junk 硬闸拒跑。
 
 设计原则（硬约束，违反即返工）：
   §A 纯标准库；无第三方依赖。
@@ -371,6 +373,68 @@ def format_table(path: str, limit: int = 0) -> str:
         src = ",".join(e.sources) if e.sources else "-"
         out.append("%4d  %7d  %-10s  %s" % (i, e.count, src[:10], e.password))
     return "\n".join(out)
+
+
+def verify(path: Optional[str] = None) -> Tuple[bool, List[str]]:
+    """机械自检（fail-loud · v3.7.6）：返回 ``(ok, problems)``。
+
+    检查项——数据行 TAB 字段数异常（合并/截断）、计数非整数、重复密码、
+    count 未降序。任一不通过 → ``ok=False``，调用方（run / clean-junk 硬闸）
+    应中止批次、拒绝把数据学到坏文件里（fail loud，不静默丢）。
+
+    无库（文件不存在）= 健康 ``(True, [])``；换行已归一化（同 ``parse_learned``）。
+    """
+    problems: List[str] = []
+    target = path or learned_path()
+    raw = _read(target)
+    if raw is None:
+        return True, []            # 还没建库 = 健康
+
+    # 换行归一化（jiqing77 修复 · v3.7.5）：统一 LF 再 split。
+    norm = raw.replace("\r\n", "\n").replace("\r", "\n")
+    lines = norm.split("\n")
+    if lines and lines[-1] == "":
+        lines = lines[:-1]
+
+    pws: List[str] = []
+    counts: List[int] = []
+    for line in lines:
+        if _is_comment_or_blank(line):
+            continue
+        parts = line.split(_SEP)
+        n = len(parts)
+        if n == 1:
+            # 兼容旧版裸密码（lenient parser 容忍 count=0）：静默接受，不报。
+            pws.append(line.strip())
+            counts.append(0)
+            continue
+        if n == 4:
+            if not parts[0].strip().isdigit():
+                problems.append("数据行计数非整数（疑似损坏/合并）: %s"
+                                % line[:60])
+            pws.append(parts[1])
+            counts.append(int(parts[0]) if parts[0].strip().isdigit() else 0)
+            continue
+        # n in (2,3) or n >= 5：字段数异常（合并 / 截断）。
+        problems.append("数据行字段数异常（n=%d，应为 1 或 4，疑似记录被合并/截断）: %s"
+                        % (n, line[:60]))
+        pws.append(parts[1] if n >= 2 else line.strip())
+        counts.append(int(parts[0]) if (parts and parts[0].strip().isdigit())
+                      else 0)
+
+    # 重复密码（精确、大小写敏感）。
+    seen = set()
+    for pw in pws:
+        if pw in seen:
+            problems.append("重复密码: %s" % pw)
+        seen.add(pw)
+
+    # count 必须非递增（降序），否则试解优先级未生效。
+    if not all(counts[i] >= counts[i + 1]
+               for i in range(len(counts) - 1)):
+        problems.append("数据行未按 count 降序（试解优先级未生效）")
+
+    return (not problems), problems
 
 
 def initial_header() -> List[str]:
