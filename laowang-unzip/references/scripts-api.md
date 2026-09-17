@@ -13,7 +13,7 @@
   实际合并为 `fsutil`），其他模块不得直接调用 `os.remove` / ctypes。
 - 所有阈值集中在 `config.py`（相对常量，无绝对路径；路径一律由 `PipelineConfig` 从 workdir 派生）。
 - 错误不抛出主循环：单文件失败 → 落库 `FAILED` + `fail_reason`，继续队列；仅两类异常可中止整批：
-  `space.SpaceAbort`（触及 20 GiB 硬地板）、`scheduler.BatchAborted`。
+  `space.SpaceAbort`（**先清一次回收站复测后仍**触及 20 GiB 硬地板，v3.7.9 起）、`scheduler.BatchAborted`。
 
 ## 0.1 目录结构（实际交付）
 
@@ -349,10 +349,11 @@ def classify_extract_fail(res: Result, archive_path: str) -> str   # §7.3 速�
 ## 10. pipeline_lib/space.py —— 空间闸门（design §3.5 / §4.3）
 
 ```python
-class SpaceAbort(Exception)     # 触及 MIN_FREE_BYTES 硬地板 → 整批中止
+class SpaceAbort(Exception)     # 清回收站复测后仍触及 MIN_FREE_BYTES 硬地板 → 整批中止
 def need_bytes_for(input_size: int) -> int   # ceil(input × SPACE_FACTOR=1.5) + 6 GiB
-def check(out_path: str, input_size: int) -> tuple:
-    """返回 (allowed, free_bytes, need_bytes)。free < MIN_FREE_BYTES(20 GiB) 抛 SpaceAbort。
+def check(out_path: str, input_size: int, purge_cb=None) -> tuple:
+    """返回 (allowed, free_bytes, need_bytes)。两门（need 与 20 GiB 地板）**都先清一次回收站再复测**；
+    复测后 free < MIN_FREE_BYTES(20 GiB) 才抛 SpaceAbort。purge_cb=None 时为纯测量（只读调用方用）。
     ★ 记账铁律（v2.1 修订）：回收站里的字节不算 free——删源包不会让 free 上涨，
     只有清回收站才会。所以顺序必须是：先清回收站 → 再解压（PURGE_RECYCLE_ON_START）。"""
 ```
@@ -408,7 +409,7 @@ class Pipeline:
     # _resume_extracted(row) 已 EXTRACTED 行的重入处理（幂等）
     # _maybe_delete_source(fid, row=None, ...) 12 条 check（见下）
     # _delete_one / _delete_allowed  底层删除 + 保护白名单（check#11，拒删记 ERROR）
-    # _purge_recycle(phase)  PURGE_RECYCLE_ON_START / _ON_FINISH 两个阶段
+    # _purge_recycle(phase)  四个阶段：start / finish / space-gate / space-floor
     # _confirm(question)     需确认档交互（sys_stdin_isatty() 判可交互）
 ```
 

@@ -1,5 +1,156 @@
 # Changelog
 
+## v3.7.10 (2026-09-18) — 收尾清理的守卫根不再依赖会漂移的全局 src（修 1 个「静默失效」缺陷）
+
+**立案依据**：批次 `2026-09-17` 跑完后，用户追问「你是不是忘了清理垃圾这个环节？」。核查确认该批次
+3 个 `junk_*.dat`（`status=JUNK_PENDING`）全部未删 —— `clean-junk --batch 2026-09-17 --yes` 对它们
+**逐一拒绝**，输出 `delete refused (outside source root or protected)`，而且**退出码为 0**。
+测试数 **467 → 485**（全绿），由第二方（QA）以**变异测试**独立验证。
+
+### D1 — 收尾清理的守卫根取自会漂移的全局 `src`，失败还静默（P1）
+
+`clean-junk` / `resolve-dup` 的删除守卫用 `cfg.src_dir`，优先级为 `--src` >
+`config.local.json` 的 `"src"` > `<root>/【new】`。而这两个子命令**都没有 `--src` 参数**，于是完全
+依赖那个全局值；批次一旦被 `stage` / `retire` 归集进 `【done】\<date>`，全局值就指向**上一批**了。
+本机实测：`config.local.json` 的 `src` 停在 `【done】\2026-09-11`，当前批次在 `【done】\2026-09-17`
+→ 全部落在守卫范围外。
+
+失败形态比缺陷本身更糟：**按行打印一行 + 退出码不变**，脚本 / agent 只看 rc 就会判定「清理成功」。
+本机因此实际滞留 6 天，直到用户开口问才发现。
+
+### 修复 — 追加式：把「批次自己的位置」补成一路守卫根
+
+`batches.root_dir` 由 `db.begin_batch(cfg.batch, cfg.src_dir, ...)` 写入，本来就是该批文件的
+正经地盘，收尾清理却从不去读它。新增：
+
+- `scheduler.batch_guard_roots(workdir, recorded_root)` —— 只接受**合法批次容器**：`<root>/【new】`
+  本身，或 `<root>/【done】` 之下的**严格子孙**（`os.path.commonpath` 逐段比较，禁用裸 `startswith`，
+  故 `【done】2` 不会假命中）；`<root>` 本身、`<root>/【done】` 本身、`<root>/pipeline` 一律拒
+  （否则一次清理能横扫整个工作区）；
+- `scheduler.delete_allowed_any(roots, path)` —— 多根判定，空根集 fail-closed；
+- `Database.batch_root(batch)` —— 只读单行查询，未知批次返回 `""`。
+
+`cmd_clean_junk` / `cmd_resolve_dup` 的守卫根改为 `[cfg.src_dir] + batch_guard_roots(workdir,
+db.batch_root(该行批次))`；**多批次时逐行取根**，不共用缓存。两个子命令补上 `--src`。
+拒绝信息改为**指名用了哪些守卫根 + 给出 `--src` 提示**，`clean-junk` 末尾汇总拒绝条数。
+退出码语义不变（清理拒绝仍 0，`resolve-dup` 拒绝仍 2）。
+
+**`delete_allowed()` 一字未改** —— 保护只做**追加**，绝不放宽；批次无记录、或记录根不是合法批次
+容器的行，照旧被拒。
+
+### 测试
+
+新增 `tests/test_cleanup_guard_roots.py` **18 例**：8 例 `batch_guard_roots` 单元表（接受 `【new】`
+与 `【done】/<日期>`；拒 `<root>`、`<root>/pipeline`、`【done】` 本身、同前缀 `【done】2`、工作区外、
+`""` / `None`）、4 例 `delete_allowed_any` 语义、6 例端到端（陈旧 `src` 下批次内垃圾必须被删 /
+无 `batches` 记录的控制行必须仍被拒 / `--src` 覆盖 / `resolve-dup --keep old` / 拒绝必须「大声」 /
+不带 `--batch` 的多批次逐行取根）。全量 **485 例全绿**。
+
+QA 变异验证：逐条把修复回退都能让对应用例**变红**；其中「冻结每批缓存」一处暴露出**覆盖缺口**
+（无任何用例变红，且 B2 的行会静默不删、rc 仍 0 —— 正是本版要消灭的形态），返工补出 `test_8`，
+并留下可复现的红测试证据。
+
+**生产验证**：修复后用**当初失败的那条命令**（不带 `--src`）重跑，3 个文件全部 `deleted.`，
+DB 三行转 `DELETED` / `source_deleted=1`，全库 `JUNK_PENDING` 归 0；空目录清理正确地**未误删**
+（3 个包装目录内各有真内容，如 `XIAOYANG` / `灵` / `laop`）。
+
+### 已知限制（登记不改）
+
+路径判定用 `abspath` 而非 `realpath`：`【done】` 内若存在指向外部的目录软链接（junction），守卫
+可被绕过。已核对原始 `delete_allowed` 与 2026-09-15 基线**逐字节一致**，**非本版引入**；利用它需先
+在磁盘建软链接 + 伪造 `batches.root_dir`。加固需单独评估路径解析的风险面。详见 pitfalls **#56**。
+
+## v3.7.9 (2026-09-18) — 本批实测驱动的 6 个真缺陷 + 崩溃恢复收口（含 2 个数据丢失向量）
+
+**立案依据**：2026-09-17 批次（418 行 / 128.51 GB）实跑中暴露（修复工作跨 09-17 → 09-18 凌晨），逐条定位 → 修复 → 由第二方
+（QA）以**变异测试**独立验证（把每处修复逐个回退，确认对应测试真的变红，证明不是装饰）。
+测试数 **399 → 467**（全绿）。本版另校正 `SKILL.md` 头部滞后的版本串（3.7.3 → 3.7.9）。
+
+### D1 — 空间闸门在「回收站里还有可清空间」时就中止整批（P1）
+运行期可用空间跌破地板（20 GiB）时直接 `SpaceAbort`，从不尝试清回收站——而本工具删除走回收站，
+**删源包不释放字节**，只有 `purge-recycle` 会。本批实测：地板报 19.34 GB 时回收站里尚有约
+64.91 GB 可回收，却已中止（历史 6 批 / 7 次复发）。改为**对称处置**：先清一次回收站再复测，
+仅当复测仍低于地板才中止（阈值不变）。同时把第二处闸门的裸 `SpaceAbort` 统一转 `BatchAborted`
+（旧代码会让它冒泡成通用异常 → 单文件被判 FAILED）。统一落到 `space.check()` 的 `purge_cb`。
+
+### D2 — 报告在批次尚未收尾时生成，输出 RUNNING / 0 B（P2）
+`_finalize_and_report` 里报告先生成、`finish_batch` 后执行，报告读到未收尾的统计。改为先测
+`free_end` → 再定档 `aborted` → `finish_batch` → 最后 `generate_report`。
+
+### D3 — 删除不幂等：同一文件被删两次，报表虚增 43%（P1，兼数据丢失向量）
+终结态回溯 / 级联 / 收尾复查 / 库盘对账四条路径都可能重复进入删除；实测 106 个文件却写了
+278 条 DELETE 事件、33 条 `DELETE_MODE=NONE` 空转、33 次 `DELETED→DELETED` 自转移，报表
+「自动删源包」从真实的 84 个虚增到 117 个（64.91 → 93.31 GB）。**同时是数据丢失向量**：若该
+路径事后被真实文件重新占用（重新下载 / 重新解出），`upsert_file` 保持同一 row id 且不重置
+`source_deleted`，重放就会删掉**新**文件。修复：`_maybe_delete_source` 与 `_delete_one` 双处
+加 `source_deleted` 前置守卫；`n_deleted` / `bytes_deleted` 只在**真的删掉**时累加。
+
+### D4 — 垃圾库命中被去重前置逻辑拦截（P1）
+`junklib.lookup` 排在去重 `return` 之后，故「既是重复、又是用户确认过的垃圾」的行永远走不到
+垃圾流程。本批 196 条 DUPLICATE_PENDING 中 **175 条**其实是垃圾库命中（`LIBRARY:HASH` 172 +
+`LIBRARY:NAME` 3，合计仅 0.14 MB，全是论坛广告）。修复：把廉价的 `junklib.lookup` 提到去重
+`return` 之前。
+
+### D5 — 旧路径同名删除向量（P1 数据丢失）
+`_resolve_delete_path` 的 stale-path 兜底会接受**任意同名**文件 → 可能删错文件。修复：加 `size`
+硬闸（不等即拒，取不到大小也拒）+ 仅在 `hash_mode == FULL` 时校验整文件 MD5（AUTO 抽样刻意
+排除，避免误伤），拒绝时留 WARN 事件并保留源包。
+
+### D6 — 崩溃会把「没解完」误判成「已解完」，进而删掉源包（P1 数据丢失）
+`_recover_states` 用**磁盘启发式**（输出目录有非压缩内容且无 0 字节文件）把 `EXTRACTING` 提升为
+`EXTRACTED`——但 **7z 先分配后写入**，崩溃瞬间的半成品尺寸非 0，「无 0 字节」成立，于是被当成
+解压成功；紧接着 `_is_fully_done` 在 `non_archive > 0` 分支用 `all(k in TERMINAL for k in kids)`，
+**零子件时 `all([]) == True`** → 判「已完成」→ 删源包、半成品留下。两处修复：①提升**只**以
+`row["extract_rc"] == 0` 为准（`extract_rc` 在解压器返回后才回写，NULL = 中途崩溃；NULL / 非 0
+一律回退 `QUEUED`），磁盘事实降为辅助记录；②`_is_fully_done` 的 `non_archive > 0` 分支加
+`len(kids) > 0`，恢复 v1 pitfall 15 的保守方向。**验证**：QA 把①换回旧启发式后 `test_1` 立刻
+复现「源包被删」——证明①是这条链路**唯一**的承重防线（两处修复缺一不可）。
+
+### 崩溃恢复收口 — 恢复行永久搁浅 + 产物认领（P1）
+只加①还不够。`EXTRACTED` **不在** `OPEN_STATES`，其唯一入队路径是显式传 `initial_ids`，常规扫描
+只收 `{DISCOVERED, QUEUED}`——故被提升的行**永远不会再被捡起**，`_resume_extracted`（重扫盘登记
+子件的那条路）永不执行 → 行无限期停在 EXTRACTED、源包永久留盘，与仓库自己写明的铁律
+（LES-20260909-11 ①「不留永久搁浅行」）冲突。修复：rc==0 提升后**入队**，交 `_resume_extracted`
+正常收口。
+进一步排查发现**更深一层**：重启时 `_resweep` 用 `real_list_files(src_dir)` **递归**扫源根，而
+输出目录就在源根之下 → 产物**先**被登记成「无父根行」（`origin=DOWNLOAD, depth=0`）；而
+`upsert_file` 冲突时**故意保留 lineage** → `_upsert_child` 永远认领不到 → 父行零子件 → 依旧搁浅。
+修复：`_upsert_child` 允许**收养**无父根行（回写 `parent_id/depth/parent_archive/origin/root_id`），
+并把「隐式契约」逐步收成**断言**：
+- 路径关系：须落在该父行 `extract_output_dir` 之下（产物）或与其 `dir_path` 同级（修复产物）。
+  用 `os.path.commonpath` 逐段比较，**不用裸 `startswith`**（否则 `…\out2` 会假命中 `…\out`）；
+  不成立则不收养，仅落 `ADOPT_SKIP`(DEBUG)。
+- 修复产物再加「名字以父行 stem 开头」——`header.repair_artifacts()` 四种产物名
+  （`_patched.zip` / `_carved.<ext>` / `.concat.<ext>` / 删除后缀改名）**恒由同一 stem 拼出**。
+  这样才挡住「同目录里另一条无关下载」被误收养（`origin` 会被写成 `CARVED` 等，而
+  `REPAIR_ORIGINS` 的子件是**会进删除集**的）。
+- **已知边界（如实记录）**：判据是裸前缀，故 `A.mp4` 与同目录 `AB_carved.zip` 会假命中，单元层
+  可复现。经 QA 复核**生产不可达**（该分支只被 `repair_artifacts()` 的返回值喂到）；`test_9`
+  如实钉住该行为，未粉饰。
+
+### 自进化环三处修复
+① 已结案指纹仍被重新起草（噪声）：新增 `_adjudicated_id` 扫描 `lessons-archive.md`，
+resolved / promoted 的指纹不再生成新草稿；② 机器草稿一律自动标 P0 → **一律 P2**（最保守），
+避免「虚假触发提升阈值」（本批实际撞过 `--check` 闸口）；③ 草稿 ID 撞号：`_next_seq` 同时跳过
+`lessons.md` ∪ `lessons-archive.md` 已用编号，保证全局唯一。
+
+### 报告与文档
+报告 §一 / §六 / §八 标签消歧（终态 `files.source_deleted=1` vs 运行计数 `batches.bytes_deleted`）；
+报告头部 `root_dir` 回退到批次真实源目录（修 stale-src 表头）；`design-v2.1.md` / `SKILL.md` /
+`scripts-api.md` 同步为对称地板规则（「跌破地板先清一次回收站再复测，仍低于才停」，阈值不变）。
+
+### 已知限制（本版不修，已登记 pitfalls #55）
+`_resweep` 递归扫源根**不排除**任何 `extract_output_dir`，故解压产物会被当作「新下载的文件」重走
+一遍流程：多 GB 视频被**重复全量哈希**、`n_discovered` 少量虚增、报表 origin 归属漂移。严重度
+**P2**（无数据丢失、无错误删除）。不修的理由：它同时是崩溃场景的发现面安全网，改动需重新论证
+整条发现路径；本版以「收养」缓解其最严重后果（父行零子件 → 搁浅）。
+
+### 测试
+**399 → 467**（全绿）。新增覆盖：空间地板「先清后停」、报告终态口径、删除幂等（含「不重复计数」
+反向断言）、去重/垃圾拦截（含「非垃圾的重复仍待决」反向断言）、stale-path 守卫、evolve 三修、
+崩溃恢复守卫（rc NULL / 非 0 / 为 0 三态 + 「零子件不算完成」+「退回旧启发式即删源」）、恢复行
+入队与不成环、收养逻辑（正向 + 不偷同行 + 越界 + 前缀假命中 + 四命名护栏）。
+
 ## v3.7.8 (2026-09-17) — QA 复核补闸：4 个 learned 写手补齐 fail-loud
 
 **立案依据（QA 独立复核 v3.7.7）**：v3.7.7 的 4 条主张经 QA 复核证实，但**主张 4
@@ -55,7 +206,7 @@
 - `cmd_retry_failed` 坏库→2 且 `Database` **未被构造**；`cmd_pw_stats --rebuild` 坏库→2
   且 `rebuild_counts` 未被调用；`cmd_junk_learn` 坏库→2。
 
-> 提交：commit `<pending>` —— v3.7.6 / v3.7.7 / v3.7.8 三者将一并推送（`duckytan/skills` main）；推送被凭证审批闸阻塞，成功后回填真实 hash。
+> 提交：commit `6afa5d0` —— v3.7.6 / v3.7.7 / v3.7.8 已一并推送至 `duckytan/skills` main。
 
 ## v3.7.7 (2026-09-17) — 三司会审驱动的 fail-loud 收口
 

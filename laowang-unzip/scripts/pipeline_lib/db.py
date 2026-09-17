@@ -452,6 +452,15 @@ class Database:
             " WHERE batch=?", (now_iso(), status, free_bytes_end, batch))
         self.conn.commit()
 
+    def batch_root(self, batch: str) -> str:
+        """``batches.root_dir`` for *batch*, or '' when unknown."""
+        if not batch:
+            return ""
+        cur = self.conn.execute(
+            "SELECT root_dir FROM batches WHERE batch=?", (batch,))
+        row = cur.fetchone()
+        return (row["root_dir"] or "") if row else ""
+
     # ------------------------------------------------------------------
     # Retention (P1-3: events of old batches) — pure DML, schema unchanged
     # ------------------------------------------------------------------

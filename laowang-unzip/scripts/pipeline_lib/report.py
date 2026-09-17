@@ -44,11 +44,15 @@ def generate_report(pipe) -> str:
     started = bstat["started_at"] if bstat else ""
     finished = bstat["finished_at"] if bstat else time.strftime("%Y-%m-%d %H:%M:%S")
     rounds = getattr(pipe, "sweep_round", 0)
+    # 处理根优先取「本批实际用的」根（持久化在 batches.root_dir），而非 cfg.src_dir —
+    # 后者在马后重新生成报告时可能是 config.local.json 里的陈旧默认值（实测印成
+    # 上一批的 【done】\2026-09-11）。缺失才回落到 cfg.src_dir。
+    root_dir = (bstat["root_dir"] if bstat and bstat["root_dir"] else cfg.src_dir)
 
     L = []
     L.append("# 伪装包处理报告 · %s" % batch)
     L.append("")
-    L.append("生成时间：%s    批次：%s    处理根：%s" % (finished, batch, cfg.src_dir))
+    L.append("生成时间：%s    批次：%s    处理根：%s" % (finished, batch, root_dir))
     L.append("开始：%s    复扫轮次：%d    状态：%s"
              % (started, rounds, bstat["status"] if bstat else "RUNNING"))
     L.append("")
@@ -76,7 +80,11 @@ def generate_report(pipe) -> str:
     L.append("| 垃圾标记 | %d | %s |" % (row["n"], _fmt_bytes(row["s"])))
     row = q("SELECT COUNT(*) n, SUM(size_bytes) s FROM files WHERE batch=?"
             " AND source_deleted=1", (batch,))[0]
-    L.append("| 已删源包 | %d | %s（注意：Windows 下已进回收站，空间需清回收站才释放） |"
+    # 口径 A（最终态）：本批最终被标记删除的源包行数（files.source_deleted=1）。
+    # 这是「最后到底删成了多少」的真实值，§六「本批已删源包字节」取用同一基准。
+    deleted_files_s = row["s"]
+    L.append("| 已删源包（最终态：files.source_deleted=1 的行数） | %d | %s"
+             "（注意：Windows 下已进回收站，空间需清回收站才释放） |"
              % (row["n"], _fmt_bytes(row["s"])))
     row = q("SELECT MAX(depth) d FROM files WHERE batch=?", (batch,))[0]
     L.append("| 最深解压层级 | %d 层 | — |" % (row["d"] or 0))
@@ -223,14 +231,17 @@ def generate_report(pipe) -> str:
     # -- 六、空间账 ----------------------------------------------------------
     free_start = bstat["free_bytes_start"] if bstat else None
     free_end = bstat["free_bytes_end"] if bstat else None
-    deleted = bstat["bytes_deleted"] if bstat else 0
+    run_deleted = bstat["bytes_deleted"] if bstat else 0
     L.append("## 六、空间账")
     L.append("")
     L.append("| 项 | 数值 |")
     L.append("|---|---|")
     L.append("| 开工前剩余 | %s |" % _fmt_bytes(free_start))
     L.append("| 收尾剩余 | %s |" % _fmt_bytes(free_end))
-    L.append("| 本批删除源包字节 | %s（**未真实释放：进回收站**） |" % _fmt_bytes(deleted))
+    L.append("| 本批已删源包字节（最终态：files.source_deleted=1，口径同 §一） | %s"
+             "（**未真实释放：进回收站**） |" % _fmt_bytes(deleted_files_s))
+    L.append("| 本次 run 删除动作字节（batches.bytes_deleted，逐 run 重算、含垃圾）"
+             " | %s |" % _fmt_bytes(run_deleted))
     L.append("| 本批清回收站释放 | 开工前 %s / 收尾 %s |"
              % (_fmt_bytes(getattr(pipe, "recycle_freed_start", 0)),
                 _fmt_bytes(getattr(pipe, "recycle_freed_end", 0))))
@@ -296,7 +307,9 @@ def generate_report(pipe) -> str:
     L.append("| 动作 | 数量 | 涉及体积 | 授权档位 |")
     L.append("|---|---|---|---|")
     if bstat:
-        L.append("| 自动删源包（12 条 check 全过） | %d | %s | 零风险 |"
+        L.append("| 自动删源包**动作数**（本次 run：batches.n_deleted"
+                 " / bytes_deleted；逐 run 重算、含垃圾删除，口径≠§一）"
+                 " | %d | %s | 零风险 |"
                  % (bstat["n_deleted"], _fmt_bytes(bstat["bytes_deleted"])))
     row = q("SELECT COUNT(*) n, SUM(size_bytes) s FROM events e JOIN files f"
             " ON e.file_id=f.id WHERE e.batch=? AND e.action='DELETE'"

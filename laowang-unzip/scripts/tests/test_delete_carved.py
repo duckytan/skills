@@ -104,10 +104,23 @@ class DeleteCarvedTests(unittest.TestCase):
         sid, _ = self._seed_source("shell.mp4")
         out = self._make_out()
         cid, cpath = self._seed_carved(sid, "shell_carved.7z", out_dir=out)
+        # Round-5 D6: "_is_fully_done" now requires >= 1 child (a childless
+        # output proves nothing — aligned with _children_digested / pitfall 15).
+        # A realistic carved row always has its extracted content REGISTERED as
+        # children (§8a), so register the output file to model that state.
+        self._register_child(cid, os.path.join(out, "video.bin"), root_id=sid)
         pipe = self._pipe()
         paths = pipe._collect_deletable_tree(sid)
         self.assertIsNotNone(paths, "P0 gate must NOT trip when carved is ready")
         self.assertIn(cpath, paths, "carved artifact must be in the delete set")
+
+    def _register_child(self, parent_id, path, status=C.STATUS_COMPLETE,
+                        root_id=None):
+        chid, _ = self.db.upsert_file(path, batch=BATCH, origin="EXTRACTED",
+                                      depth=2, parent_id=parent_id,
+                                      root_id=root_id or parent_id)
+        self.db.transition(chid, status, C.ACTION_VERIFY, "seed child")
+        return chid
 
     # -- (b) P0 误删闸门: abort (None) if carved content not done ----------
     def test_b_p0_gate_blocks_when_carved_not_done(self):

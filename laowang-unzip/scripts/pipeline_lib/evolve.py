@@ -315,8 +315,10 @@ def append_lesson(path: str, category: str, priority: str, phenomenon: str,
     header, lessons, footer = parse_lessons(path)
     nl = _detect_nl(header or "", footer or "")
 
-    same_day = [ls.seq for ls in lessons if ls.date == date]
-    seq = (max(same_day) + 1) if same_day else 1
+    # 2C: allocate the id over BOTH lessons.md and lessons-archive.md — human
+    # entries and machine drafts share ONE numbering space, so an id already
+    # used in the archive must be skipped.
+    seq = _next_seq(path, date)
     new_id = "LES-%s-%02d" % (date, seq)
 
     body = [
@@ -342,6 +344,64 @@ def append_lesson(path: str, category: str, priority: str, phenomenon: str,
 
 def _default_archive_path(path: str) -> str:
     return os.path.join(os.path.dirname(path), "lessons-archive.md")
+
+
+def _all_lessons(path: str, archive_path: Optional[str] = None) -> List[Lesson]:
+    """Parse ``lessons.md`` **and** ``lessons-archive.md`` into one flat list.
+
+    ``lessons.md`` and ``lessons-archive.md`` share ONE id space
+    (``LES-YYYYMMDD-NN``), so anything that needs the set of *occupied* ids
+    (next-seq allocation) or the set of *already adjudicated* fingerprints
+    (draft guard) must look at both.  A missing / unreadable file degrades to
+    ``[]`` (never raises) — archiving may legitimately leave either side empty.
+    """
+    out: List[Lesson] = []
+    for p in (path, archive_path or _default_archive_path(path)):
+        if not p or not os.path.isfile(p):
+            continue
+        try:
+            _h, ls, _f = parse_lessons(p)
+        except OSError:
+            continue
+        out.extend(ls)
+    return out
+
+
+def _next_seq(path: str, date: str) -> int:
+    """Next free ``NN`` for *date* across ``lessons.md`` + ``lessons-archive.md``.
+
+    Occupied ids from BOTH files are skipped (human entries and machine drafts
+    share one numbering space).  ``max(occupied) + 1`` keeps ids growing
+    monotonically — an archived number is never reused — with a defensive skip
+    loop so an occupied id can never be handed out.  Returns 1 when none.
+    """
+    occupied = {ls.seq for ls in _all_lessons(path) if ls.date == date}
+    if not occupied:
+        return 1
+    seq = max(occupied) + 1
+    while seq in occupied:          # defensive: never hand out an occupied id
+        seq += 1
+    return seq
+
+
+def _adjudicated_id(sig: str, archive_path: str) -> str:
+    """Id of an ARCHIVED entry whose fingerprint == *sig* and status is
+    ``resolved`` / ``promoted``, else ``""``.
+
+    Fingerprint match only (exact) — never fuzzy text.  Used by
+    :func:`draft_lesson` (2A) so an already-settled fingerprint is not
+    re-drafted as a fresh open entry.
+    """
+    if not sig or not archive_path or not os.path.isfile(archive_path):
+        return ""
+    try:
+        _h, lessons, _f = parse_lessons(archive_path)
+    except OSError:
+        return ""
+    for ls in lessons:
+        if ls.sig and ls.sig == sig and ls.status in _ARCHIVED_STATUSES:
+            return ls.id
+    return ""
 
 
 def archive(path: str, archive_path: Optional[str] = None, force: bool = False) -> dict:
@@ -1121,23 +1181,25 @@ def bump_occ(path: str, sig: str, n: int = 1) -> dict:
     return result
 
 
-# fail_reason → 机器草稿优先级映射（写死；依据 SKILL.md §3.1 优先级定义：
-# P0=丢数据/整批失败；P1=大批次产出错误；P2=效率/体验）。
-_P0_TOKENS = ("CORRUPT", "LOST", "DATA", "MISSING")
-_P1_TOKENS = ("WRONG_PASSWORD", "PASSWORD", "EXTRACT", "FAIL")
+# 机器草稿的优先级：一律最保守档 P2。
+#   硬约束（第四轮任务 2B）——机器草稿**不得自评 P0**。旧实现按 fail_reason 关键词
+#   把 CORRUPT / LOST / DATA / MISSING 自动标成 P0，于是 ``archive_corrupt`` 单次
+#   出现（occ=1）就因 ``priority=='P0'`` 虚假触发「单次 P0 即提升」阈值；而本项目
+#   硬约束是不得为凑提升条件虚标 P0。等级只能由人/AI 事后补丁式上调（edit 条目，
+#   或调用 ``draft_lesson(priority=...)`` 显式覆盖）。``occ>=2`` 仍照旧是提升候选
+#   —— 那是设计意图，与优先级无关（见 :func:`promotion_candidates`）。
+_MACHINE_DRAFT_PRIORITY = "P2"
 
 
 def _priority_for_fail(fail_reason: str) -> str:
-    """按 fail_reason 关键词映射机器草稿优先级（见上方依据注释）。
+    """机器草稿的优先级：恒为最保守档 ``P2``（**绝不自动 P0**）。
 
-    ``UNKNOWN_BINARY`` 不含任何 P0/P1 token → 落 P2（"待判"、需人工确认，非必然缺陷）。
+    历史问题（第四轮任务 2B）：旧实现把 ``CORRUPT`` / ``LOST`` / ``DATA`` /
+    ``MISSING`` 关键词自动标成 ``P0``，导致 ``archive_corrupt`` 单次出现即虚假
+    成为提升候选。修复：机器草稿一律给最保守档 P2，等级只能由人/AI 事后在上层
+    补丁式上调。``fail_reason`` 参数保留以稳定调用点签名与可追溯性（未使用）。
     """
-    up = (fail_reason or "").upper()
-    if any(t in up for t in _P0_TOKENS):
-        return "P0"
-    if any(t in up for t in _P1_TOKENS):
-        return "P1"
-    return "P2"
+    return _MACHINE_DRAFT_PRIORITY
 
 
 def _category_for_fail(fail_reason: str, explicit: Optional[str] = None) -> str:
@@ -1163,16 +1225,22 @@ def draft_lesson(path: str, fail_reason: str, count: int,
     """为「真失败」的 fail_reason 自动追加一条机器草稿条目。
 
     类别由 :func:`_category_for_fail` 推导（``category`` 显式传入时以其为准），
-    优先级由 ``_priority_for_fail`` 推导（``priority`` 显式传入时以其为准），
-    状态 ``open``，``- 复现：count 次``，并写入 ``- 指纹：_signature(fail_reason)``
-    （**这是机械累计的关键**：下一批同一 fail_reason 会因同指纹命中本条目而 occ 自增，
-    而不是再新建）。根因与处置必须写明是机器草稿、需人补充。
+    优先级**恒为最保守档 P2**（:func:`_priority_for_fail`；机器草稿不得自评 P0，
+    只有显式传入 ``priority`` 的人/AI 才能上调），状态 ``open``，``- 复现：count 次``，
+    并写入 ``- 指纹：_signature(fail_reason)``（**这是机械累计的关键**：下一批同一
+    fail_reason 会因同指纹命中本条目而 occ 自增，而不是再新建）。根因与处置必须写明
+    是机器草稿、需人补充、优先级待复核。
 
     **良性守卫（纵深防御，v3.7.1）**：``classify_fail_reason(fail_reason) == 'benign'``
     时**直接返回且绝不写文件**——即使调用方漏判，正常终态（NOT_ARCHIVE / 已裁决查重 /
     已清垃圾 等）也永远不会产草稿。
 
-    返回 ``{'id','appended','skipped_reason'}``；已存在同指纹 / 良性 / 空指纹 → ``appended=False``。
+    **已结案守卫（第四轮任务 2A）**：若该指纹已存在于 ``lessons.md``（任意状态）或
+    ``lessons-archive.md``（``resolved`` / ``promoted``）中，**不再起草新条目**——
+    已结案的指纹被重新起草是本批噪声来源。判据是**指纹精确比对**，不做文本模糊匹配。
+
+    返回 ``{'id','appended','skipped_reason'}``；已存在同指纹 / 已结案 / 良性 / 空指纹
+    → ``appended=False``。
     """
     result = {"id": "", "appended": False, "skipped_reason": ""}
     # 1) 良性守卫：正常终态绝不产草稿（不读也不写文件）。
@@ -1195,9 +1263,22 @@ def draft_lesson(path: str, fail_reason: str, count: int,
             result["skipped_reason"] = "same signature already recorded"
             return result
 
+    # 2A: an already-ADJUDICATED fingerprint must never be re-drafted.  Open
+    # entries live in lessons.md (handled above); resolved/promoted entries may
+    # have been archived, so scan lessons-archive.md too — matched by
+    # FINGERPRINT (exact), never by fuzzy text.  The skip is visible to the
+    # caller via skipped_reason (and its applied-log line).
+    done_id = _adjudicated_id(sig, _default_archive_path(path))
+    if done_id:
+        result["id"] = done_id
+        result["skipped_reason"] = ("signature already resolved/promoted (%s)"
+                                    % done_id)
+        return result
+
     date = time.strftime("%Y%m%d")
-    same_day = [ls.seq for ls in lessons if ls.date == date]
-    seq = (max(same_day) + 1) if same_day else 1
+    # 2C: allocate the id over BOTH files (human entries and machine drafts
+    # share one numbering space) so an id already used in the archive is skipped.
+    seq = _next_seq(path, date)
     new_id = "LES-%s-%02d" % (date, seq)
 
     # 2) 类别 / 优先级按规则推导（显式传入时以其为准）。
@@ -1217,6 +1298,8 @@ def draft_lesson(path: str, fail_reason: str, count: int,
     fix = "待办（机器草稿）"
     if is_judgement:
         fix = "待办：人工确认类型后再决定是否建正式判据（机器草稿）"
+    # 2B: 把「不得自评 P0、默认 P2、等级需人/AI 复核上调」写进条目正文（理由可见）。
+    fix += "；优先级默认 %s（机器草稿不得自评 P0，需人/AI 复核后补丁式上调）" % pri
 
     body = [
         "- 现象：%s" % phenomenon,

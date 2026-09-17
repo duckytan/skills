@@ -67,6 +67,117 @@ def delete_allowed(src_dir: str, path: str) -> bool:
     return True
 
 
+def batch_guard_roots(workdir: str, recorded_root: str) -> list:
+    """Extra deletion-guard root recorded for a batch, or ``[]`` if not legit.
+
+    ``batches.root_dir`` (written by ``db.begin_batch(cfg.batch, cfg.src_dir,
+    ...)``) remembers where a batch's files actually live.  Surfacing it here
+    lets the post-batch cleanup subcommands (``clean-junk`` / ``resolve-dup``)
+    still delete *already-staged* files when the global ``config.local.json``
+    ``src`` has drifted to a different batch — WITHOUT ever relaxing the
+    source-root protection.
+
+    Fail-closed: returns ``[]`` unless *recorded_root* is a **legitimate batch
+    container**, meaning ALL of:
+
+      * non-empty;
+      * it is exactly ``<workdir>/<DEFAULT_SRC_DIRNAME>`` (``【new】``), OR it
+        lies *strictly under* ``<workdir>/<DONE_DIRNAME>`` (``【done】``) —
+        compared component-wise via ``_is_strictly_under`` (never a bare
+        ``startswith``, which would mistake ``...\\【done】2`` for a child);
+      * it is NOT the workdir itself and does NOT contain the pipeline dir.
+
+    That last clause is what blocks the degenerate ``--src <workdir>`` case:
+    without it a cleanup could roam the entire workdir.  Accepted roots are
+    returned as a one-element list normalized via ``_norm_abs``.
+    """
+    if not recorded_root:
+        return []
+    default_src = os.path.join(workdir, C.DEFAULT_SRC_DIRNAME)
+    done_parent = os.path.join(workdir, C.DONE_DIRNAME)
+    pipeline_dir = os.path.join(workdir, C.PIPELINE_DIRNAME)
+    if not (_norm_abs(recorded_root) == _norm_abs(default_src)
+            or _is_strictly_under(recorded_root, done_parent)):
+        return []
+    if _norm_abs(recorded_root) == _norm_abs(workdir):
+        return []
+    if _is_strictly_under(pipeline_dir, recorded_root) or \
+            _norm_abs(pipeline_dir) == _norm_abs(recorded_root):
+        return []
+    return [_norm_abs(recorded_root)]
+
+
+def delete_allowed_any(roots, path: str) -> bool:
+    """True iff any root in *roots* white-lists *path* (see delete_allowed).
+
+    Fail-closed for an empty/``None`` *roots*: an empty root set can never
+    authorise a deletion.
+    """
+    if not roots:
+        return False
+    return any(delete_allowed(root, path) for root in roots)
+
+
+def _norm_abs(path: str) -> str:
+    """Absolute + case-folded path, for Windows-safe equality/prefix tests."""
+    return os.path.normcase(os.path.abspath(path))
+
+
+def _is_strictly_under(path: str, ancestor: str) -> bool:
+    """True iff ``path`` lies strictly *below* the directory ``ancestor``.
+
+    Windows-safe *by construction*: it compares per-component via
+    ``os.path.commonpath`` on normalized absolute paths instead of a raw
+    ``str.startswith`` prefix, so ``...\\out2`` is NOT mistaken for living
+    under ``...\\out``.  Different drives (``commonpath`` raises
+    ``ValueError``) and the equal case are never "under".
+    """
+    if not path or not ancestor:
+        return False
+    try:
+        p, a = _norm_abs(path), _norm_abs(ancestor)
+    except (OSError, ValueError):
+        return False
+    if p == a:
+        return False
+    try:
+        return os.path.commonpath([p, a]) == a
+    except ValueError:      # different drives -> no common ancestor
+        return False
+
+
+def _same_dir(path: str, other_dir: str) -> bool:
+    """True iff ``path``'s parent directory equals ``other_dir`` (normcase)."""
+    if not path or not other_dir:
+        return False
+    try:
+        return _norm_abs(os.path.dirname(path)) == _norm_abs(other_dir)
+    except (OSError, ValueError):
+        return False
+
+
+def _name_derives_from(path: str, parent_row) -> bool:
+    """True iff ``basename(path)`` starts with the parent's file stem.
+
+    Every ``header.repair_artifacts()`` output name is stem-derived
+    (``<stem>_patched.zip`` / ``<stem>_carved.<ext>`` / ``<stem>.concat.<ext>``
+    / the RENAMED de-suffixed name), so this distinguishes "this parent's
+    artifact" from an unrelated download that merely sits in the same folder.
+
+    Fail-closed on an empty stem: ``"".startswith(...)``/``x.startswith("")``
+    would otherwise be vacuously true.  Comparison is ``normcase``d (Windows is
+    case-insensitive) and does a bare prefix test only — no suffix whitelist,
+    which would drift as ``header.py`` evolves.
+    """
+    if not path:
+        return False
+    stem = os.path.splitext(parent_row["file_name"] or "")[0]
+    if not stem:
+        return False
+    name = os.path.basename(path)
+    return os.path.normcase(name).startswith(os.path.normcase(stem))
+
+
 class BatchAborted(Exception):
     """Raised when free space hits the absolute floor — whole batch stops (§3.5)."""
 
@@ -339,15 +450,11 @@ class Pipeline:
         # -- 4c. §6.6 (v3.7.0): remove the empty shells this batch left behind
         self.prune_removed = self._prune_empty_dirs()
 
-        # -- 5. report ---------------------------------------------------------
-        from .report import generate_report
-        report_path = generate_report(self)
-
-        free_end = fsutil.disk_free(cfg.src_dir)
-        aborted = aborted or free_end < C.MIN_FREE_BYTES
-        db.finish_batch(cfg.batch, "ABORTED" if aborted else "DONE", free_end)
-        db.event(None, C.ACTION_REPORT, "batch %s finished, report: %s" %
-                 (cfg.batch, report_path), batch=cfg.batch)
+        # -- 5. report (§8) ----------------------------------------------------
+        # Settle the batch row FIRST, then render the report — the report reads
+        # batches.status / free_bytes_end / finished_at, so finalising last made
+        # the report lie (RUNNING / 收尾剩余 0 B / 生成时间 None).
+        report_path = self._finalize_and_report(aborted)
 
         return {
             "batch": cfg.batch,
@@ -392,24 +499,65 @@ class Pipeline:
     def _recover_states(self) -> int:
         """Crash-recovery state normalization (§3.4).
 
-        Uses DISK FACTS to correct rows: an EXTRACTING row whose output dir
-        already holds non-archive content is promoted to EXTRACTED; everything
-        else in-flight is rewound to an idempotent earlier state.
+        Uses DISK FACTS to correct rows, but the promotion decision is gated on
+        the EXTRACTOR's own verdict (``extract_rc == 0``) — never on a
+        filesystem heuristic alone (see D6 below).  Everything else in-flight
+        is rewound to an idempotent earlier state.
+
+        D6 (P1, data loss): an EXTRACTING row is promoted to EXTRACTED **only**
+        when ``row["extract_rc"] == 0``.  ``extract_rc`` is written only AFTER
+        ``sz.extract()`` returns (§6 above), so a NULL here means the process
+        crashed mid-extract.  The old disk-only heuristic
+        (``non_archive > 0 and zero_byte == 0``) is unsound because 7z
+        pre-allocates (pitfall 15): an interrupted half-extraction has
+        "full"-sized files, so ``zero_byte == 0`` holds while the archive is
+        still half-unpacked.  That promoted the crashed row to EXTRACTED with
+        ZERO children, after which ``_is_fully_done`` (``all([]) == True``)
+        judged it done and DELETED the source — silent data loss.  The disk
+        facts are now AUXILIARY (recorded for the record, never the gate).
+
+        Rewinding a mid-extract crash to QUEUED is idempotent-safe: child rows
+        are registered only after the same success point (§8a), so a crashed
+        row has no children; re-extraction re-runs ``7z x -y`` into the same
+        ``out_dir`` (``-y`` overwrites in place) and either reaches rc==0
+        (normal EXTRACTED path) or fails to a terminal FAILED — it can never
+        loop.  The promoted row IS enqueued (the requeue idiom copied from
+        ``_resume_extracted``): EXTRACTED is not in ``OPEN_STATES``, so without
+        it nothing would ever re-scan the output dir, register the children and
+        close the chain — the row would be stranded 'forever' (LES-20260909-11
+        ①: never leave a silently-frozen row).
         """
         db = self.db
         n = 0
         for row in db.all_with_status(C.STATUS_EXTRACTING):
             out = row["extract_output_dir"]
             stat = fsutil.scan_output(out) if out and fsutil.isdir(out) else None
-            if stat is not None and stat.non_archive > 0 and stat.zero_byte == 0:
-                db.update_fields(row["id"], is_extracted=1,
-                                 extracted_files=stat.total_files,
-                                 non_archive_children=stat.non_archive)
+            rc = row["extract_rc"]
+            if rc == 0:
+                fields = {"is_extracted": 1}
+                if stat is not None:        # columns are NOT NULL — only set
+                    fields["extracted_files"] = stat.total_files
+                    fields["non_archive_children"] = stat.non_archive
+                db.update_fields(row["id"], **fields)
                 db.transition(row["id"], C.STATUS_EXTRACTED, C.ACTION_CRASH_RECOVER,
-                              "crash recovery: output already verified")
+                              "crash recovery: extract_rc==0, output verified")
+                # Promotion only means "trust the extractor".  The children must
+                # still be registered by _resume_extracted (which re-scans the
+                # output dir).  EXTRACTED is NOT in OPEN_STATES, so WITHOUT this
+                # enqueue nothing would ever pick the row up again -> permanent
+                # stranding (the LES-20260909-11 ① invariant: never leave a
+                # silently-frozen row).  Same requeue idiom as _resume_extracted.
+                # Cannot loop: a later _recover_states run sees the row already
+                # non-EXTRACTING, so it is never re-promoted/re-enqueued.
+                if row["path"] not in self.seen:
+                    self.seen.add(row["path"])
+                    self.queue.append(row["id"])
             else:
-                db.transition(row["id"], C.STATUS_QUEUED, C.ACTION_CRASH_RECOVER,
-                              "crash recovery: rewind to re-extract")
+                # rc is NULL (mid-extract crash) or non-zero: NEVER promote.
+                db.transition(
+                    row["id"], C.STATUS_QUEUED, C.ACTION_CRASH_RECOVER,
+                    "crash recovery: extract_rc=%s (not verified) — rewind to "
+                    "re-extract" % ("NULL" if rc is None else rc))
             n += 1
         for st, target, note in (
                 (C.STATUS_HASHING, C.STATUS_DISCOVERED, "rewind hashing"),
@@ -486,6 +634,22 @@ class Pipeline:
         if h_value and h_mode != "NONE":
             dup = db.find_by_hash(h_value, row["size_bytes"], h_mode, fid)
             if dup is not None:
+                # §6.5 P1 fix: give the USER-CONFIRMED junk library first
+                # refusal BEFORE parking a duplicate for manual review.
+                # Previously a file that both repeats history AND matches a
+                # library entry was recorded DUPLICATE_PENDING and NEVER reached
+                # the §6 junk path (which sits after the expensive
+                # header.analyze()) — one batch forced 175/196 manual decisions
+                # that way.  Only the CHEAP library lookup is hoisted here;
+                # junk_mod.match stays in §6 because it needs info.real_type.
+                # A library hit is zero-risk by construction (the ledger holds
+                # only entries the user confirmed in person), the same authority
+                # as the §6 path; password carriers are guarded inside the
+                # library lookup.  Non-junk duplicates are unchanged.
+                jl = self._junk_library_verdict(row, digest=h_value)
+                if jl is not None:
+                    self._apply_junk_rule(fid, row, jl[0], jl[1])
+                    return                   # ★ handled as junk, not as a dup
                 note = ""
                 if bool(dup["is_archive"]) != bool(row["is_archive"]):
                     note = "类型判定不一致，请复核"
@@ -591,14 +755,8 @@ class Pipeline:
             db.bump_batch(cfg.batch, "n_failed")
             self._on_terminal(fid)
             return
-        try:
-            allowed, _free, _need = space_mod.check(row["dir_path"], row["size_bytes"])
-        except space_mod.SpaceAbort as exc:
-            raise BatchAborted(str(exc))
-        if not allowed:
-            # One recycle purge attempt, then re-measure (§3.5).
-            self._purge_recycle("space-gate")
-            allowed, _free, _need = space_mod.check(row["dir_path"], row["size_bytes"])
+        allowed, _free, _need = self._space_gate(
+            row["dir_path"], row["size_bytes"])
         if not allowed:
             db.transition(fid, C.STATUS_SKIPPED, C.ACTION_SPACE_CHECK,
                           "space gate: need %d bytes, skip and continue"
@@ -960,59 +1118,15 @@ class Pipeline:
         rule = junk_mod.match(row["path"], info.real_type, row["size_bytes"],
                               content_head)
         if not rule:
-            # §6.5 (v3.7.0): the rule table missed — consult the
-            # user-confirmed junk library (content fingerprint -> name ->
-            # name fragment).  The library can only ever contain entries the
-            # user confirmed in person, so a hit counts as zero-risk.
-            hit = junklib_mod.lookup_file(row["path"], size=row["size_bytes"])
-            if hit:
-                rule = hit["rule"]
-                delete_when = hit.get("delete_when", "immediate")
-                self.library_hits.append({
-                    "path": row["path"], "kind": hit["kind"],
-                    "value": hit["value"], "count": hit["count"]})
+            # §6.5 (v3.7.0): the rule table missed — consult the user-confirmed
+            # junk library (content fingerprint -> name -> name fragment).  The
+            # library only ever holds entries the user confirmed in person, so a
+            # hit counts as zero-risk.  Same helper used by the dedup intercept.
+            jl = self._junk_library_verdict(row, digest=row["hash"])
+            if jl is not None:
+                rule, delete_when = jl
         if rule:
-            db.update_fields(fid, is_junk=1, junk_rule=rule)
-            db.bump_batch(cfg.batch, "n_junk")
-            if junk_mod.is_auto_rule(rule) and not cfg.ask_all and \
-                    self._delete_allowed(row["path"]):
-                if delete_when == "after_extraction":
-                    # v3.7.4: 解压过程中还可能被用到的文件（如 解压密码.txt），
-                    # 先标记，等整批解压完毕（_flush_deferred_junk_deletes）再删。
-                    self._deferred_junk_deletes.append((fid, row["path"]))
-                    db.transition(fid, C.STATUS_JUNK_PENDING, C.ACTION_DELETE,
-                                  "junk (%s) — deferred: delete after extraction"
-                                  % rule)
-                    self._on_terminal(fid)
-                    return
-                if cfg.dry_run:
-                    db.transition(fid, C.STATUS_JUNK_PENDING, C.ACTION_ANALYZE,
-                                  "junk (%s) — dry run, kept" % rule)
-                    return
-                ok, rc = fsutil.delete_file(row["path"])
-                if ok:
-                    # §6.6: this directory may now be an empty shell.
-                    self.prune_candidates.add(os.path.dirname(row["path"]))
-                    # Audit parity with _delete_one (P2-1): record which
-                    # route the deletion actually took.
-                    if fsutil.last_delete_mode != "RECYCLE":
-                        db.event(fid, C.ACTION_DELETE,
-                                 "DELETE_MODE=%s (non-recycle route: "
-                                 "rc=%s)" % (fsutil.last_delete_mode, rc),
-                                 batch=cfg.batch)
-                    db.update_fields(fid, source_deleted=1, deleted_at=_now(),
-                                     delete_rc=rc)
-                    db.transition(fid, C.STATUS_DELETED, C.ACTION_DELETE,
-                                  "junk auto-deleted (zero-risk rule %s, "
-                                  "mode=%s)" % (rule, fsutil.last_delete_mode))
-                    db.bump_batch(cfg.batch, "n_deleted", bytes_added=row["size_bytes"])
-                else:
-                    db.transition(fid, C.STATUS_JUNK_PENDING, C.ACTION_DELETE,
-                                  "junk delete failed rc=%s" % rc, level="WARN")
-            else:
-                db.transition(fid, C.STATUS_JUNK_PENDING, C.ACTION_ANALYZE,
-                              "junk (%s) — awaiting user decision" % rule)
-            self._on_terminal(fid)
+            self._apply_junk_rule(fid, row, rule, delete_when)
             return
 
         reason = info.fail_reason or C.FAIL_NOT_ARCHIVE
@@ -1027,6 +1141,90 @@ class Pipeline:
             db.transition(fid, C.STATUS_SKIPPED, C.ACTION_ANALYZE, note,
                           fail_reason=C.FAIL_NOT_ARCHIVE if reason == C.FAIL_NOT_ARCHIVE
                           else reason)
+        self._on_terminal(fid)
+
+    # ------------------------------------------------------------------
+    # Junk handling (§6 / §6.5) — shared by the dedup intercept and §6
+    # ------------------------------------------------------------------
+    def _junk_library_verdict(self, row, digest: Optional[str] = None):
+        """Cheap §6.5 lookup against the user-confirmed junk library.
+
+        Returns ``(rule, delete_when)`` on a hit, else ``None``, recording the
+        hit for the report.  Only the LIBRARY lookup runs here — the full junk
+        rule table (:func:`junk.match`) needs ``info.real_type`` from the
+        expensive ``header.analyze()`` and stays in §6.  ``digest`` avoids a
+        re-read when the caller already computed the content hash.  Password
+        carriers are exempt inside the lookup itself (a carrier can only hit an
+        ``after_extraction`` entry), so this never widens authority.
+        """
+        hit = junklib_mod.lookup(row["path"], size=row["size_bytes"],
+                                 digest=digest)
+        if not hit:
+            return None
+        self.library_hits.append({
+            "path": row["path"], "kind": hit["kind"],
+            "value": hit["value"], "count": hit["count"]})
+        return hit["rule"], hit.get("delete_when", "immediate")
+
+    def _apply_junk_rule(self, fid: int, row, rule: str,
+                         delete_when: str) -> None:
+        """Mark *row* as junk and act per §6.
+
+        仅零风险档（§11.2）自动删；尊重 ``--ask-all`` / ``--dry-run`` /
+        ``_delete_allowed``。``after_extraction`` 走延迟删除（收尾 flush）。
+        Extracted from the old inline §6 block so the dedup intercept (step 2b)
+        and §6 share ONE implementation.  删除计数沿用 ``actually_deleted``
+        守卫：文件本就不存在（``mode=NONE``）时不计 size、不写误导性审计。
+        """
+        db, cfg = self.db, self.cfg
+        db.update_fields(fid, is_junk=1, junk_rule=rule)
+        db.bump_batch(cfg.batch, "n_junk")
+        if junk_mod.is_auto_rule(rule) and not cfg.ask_all and \
+                self._delete_allowed(row["path"]):
+            if delete_when == "after_extraction":
+                # v3.7.4: 解压过程中还可能被用到的文件（如 解压密码.txt），
+                # 先标记，等整批解压完毕（_flush_deferred_junk_deletes）再删。
+                self._deferred_junk_deletes.append((fid, row["path"]))
+                db.transition(fid, C.STATUS_JUNK_PENDING, C.ACTION_DELETE,
+                              "junk (%s) — deferred: delete after extraction"
+                              % rule)
+                self._on_terminal(fid)
+                return
+            if cfg.dry_run:
+                db.transition(fid, C.STATUS_JUNK_PENDING, C.ACTION_ANALYZE,
+                              "junk (%s) — dry run, kept" % rule)
+                return
+            ok, rc = fsutil.delete_file(row["path"])
+            if ok:
+                # §6.6: this directory may now be an empty shell.
+                self.prune_candidates.add(os.path.dirname(row["path"]))
+                # "Already gone" (mode NONE) = nothing removed, no bytes freed:
+                # reconcile state but never count it (fix: same guard as
+                # _delete_one — the empty-delete must not inflate n_deleted).
+                actually_deleted = fsutil.last_delete_mode != "NONE"
+                # Audit parity with _delete_one (P2-1): record which route the
+                # deletion actually took.
+                if actually_deleted and fsutil.last_delete_mode != "RECYCLE":
+                    db.event(fid, C.ACTION_DELETE,
+                             "DELETE_MODE=%s (non-recycle route: rc=%s)"
+                             % (fsutil.last_delete_mode, rc), batch=cfg.batch)
+                db.update_fields(fid, source_deleted=1, deleted_at=_now(),
+                                 delete_rc=rc)
+                db.transition(
+                    fid, C.STATUS_DELETED, C.ACTION_DELETE,
+                    ("junk auto-deleted (zero-risk rule %s, mode=%s)"
+                     if actually_deleted else
+                     "junk already gone — marked DELETED, 0 bytes freed "
+                     "(rule %s, mode=%s)") % (rule, fsutil.last_delete_mode))
+                if actually_deleted:
+                    db.bump_batch(cfg.batch, "n_deleted",
+                                  bytes_added=row["size_bytes"])
+            else:
+                db.transition(fid, C.STATUS_JUNK_PENDING, C.ACTION_DELETE,
+                              "junk delete failed rc=%s" % rc, level="WARN")
+        else:
+            db.transition(fid, C.STATUS_JUNK_PENDING, C.ACTION_ANALYZE,
+                          "junk (%s) — awaiting user decision" % rule)
         self._on_terminal(fid)
 
     # ------------------------------------------------------------------
@@ -1316,6 +1514,51 @@ class Pipeline:
             path, batch=cfg.batch, origin=origin, depth=depth,
             parent_id=parent_row["id"], parent_archive=parent_row["file_name"],
             root_id=parent_row["root_id"] or parent_row["id"])
+        if not created:
+            # D6 / round-6: a restart's _resweep walks the source root
+            # RECURSIVELY and registers the products of an EXTRACTED row's
+            # output dir as UNPARENTED root rows (origin=DOWNLOAD, depth 0)
+            # *before* the parent can claim them (the output dir lives inside
+            # the source root).  upsert_file deliberately never rewrites
+            # lineage on conflict, so without adopting them here the parent
+            # keeps ZERO children -> _is_fully_done is forever False -> the row
+            # is permanently stranded (source never deleted) — the very
+            # invariant LES-20260909-11 ① forbids.  Adopt ONLY plain root rows;
+            # never steal a row that already belongs to another parent.
+            #
+            # round-7 (contract made explicit): "unparented root row" alone only
+            # proves the row is *a* root — NOT that it is *this* parent's
+            # product.  Today safety relies on all six call sites passing their
+            # own paths; a future caller passing a wrong path would silently
+            # rewrite an unrelated root row's lineage.  So the adoption now ALSO
+            # requires a PATH RELATIONSHIP: the row must sit either (a) under
+            # this parent's extraction output dir, or (b) beside it as a repair
+            # artifact (written next to the source, in parent_row["dir_path"]).
+            # If neither holds we do NOT adopt (lineage stays untouched — the
+            # safe side) and leave a DEBUG note for later forensics.
+            cur = db.get(fid)
+            if cur is not None and cur["parent_id"] is None \
+                    and (cur["depth"] or 0) == 0:
+                out_dir = parent_row["extract_output_dir"]
+                is_product = bool(out_dir) and _is_strictly_under(path, out_dir)
+                # (b) repair artifact: written in the source's own folder AND
+                # named after the source's stem.  "Same folder" alone would still
+                # adopt an unrelated download that happens to sit beside the
+                # source (round-8: the implicit contract had only narrowed from
+                # "any folder" to "the source folder"); the stem prefix is the
+                # stable invariant shared by all four repair_artifacts() kinds.
+                is_repair = _same_dir(path, parent_row["dir_path"]) \
+                    and _name_derives_from(path, parent_row)
+                if is_product or is_repair:
+                    db.update_fields(
+                        fid, parent_id=parent_row["id"], depth=depth,
+                        parent_archive=parent_row["file_name"], origin=origin,
+                        root_id=parent_row["root_id"] or parent_row["id"])
+                else:
+                    db.event(fid, C.ACTION_ADOPT_SKIP,
+                             "root row not adopted: path outside parent's "
+                             "product scope (#%d)" % parent_row["id"],
+                             level="DEBUG", batch=cfg.batch)
         if created:
             db.event(fid, C.ACTION_ENQUEUE, "product of #%d (%s)"
                      % (parent_row["id"], origin), batch=cfg.batch)
@@ -1363,12 +1606,22 @@ class Pipeline:
         real 81GB batch froze a three-layer chain 壳→carved→卷 exactly here).
         A fully digested child set (all terminal, none FAILED/pending) is the
         consumed signature and now closes the chain instead of freezing it.
+
+        D6 (P1, data loss, defence in depth): the ``non_archive > 0`` branch
+        requires at least ONE child.  ``all([]) == True`` silently judged a
+        childless output as done — exactly what let the crash-recovery bug (see
+        ``_recover_states``) delete a source whose children were never
+        registered.  Aligning with ``_children_digested`` ("a childless row
+        proves nothing", v1 pitfall 15): even if some future path leaves a row
+        EXTRACTED with no children, it can never be judged fully done; the
+        resume/requeue path is the fallback.
         """
         if stat is None:
             return False
         if stat.non_archive > 0:
             kids = self.db.children_of(fid)
-            return all(k["status"] in C.TERMINAL_STATES for k in kids)
+            return len(kids) > 0 and all(
+                k["status"] in C.TERMINAL_STATES for k in kids)
         return self._children_digested(fid)
 
     def _final_recheck(self) -> None:
@@ -1626,6 +1879,48 @@ class Pipeline:
     # archive (incl. a whole volume set) that can be re-extracted later without
     # the parent.  Repair/Carved artifacts keep the strict P0 误删闸门.
     # ------------------------------------------------------------------
+    def _resolve_candidate_ok(self, cand: str, row) -> tuple:
+        """Prove a same-basename *cand* really IS *row*'s file (round-4 P1).
+
+        The stale-path recovery used to accept ANY file with the same basename
+        under the source root, so after a rename a DIFFERENT same-named file
+        could be resolved and deleted — deleting the wrong file IS data loss,
+        even inside the source root.  Two gates now, both fail-closed:
+
+          1. **size** — hard gate.  ``cand`` must be the same size as the
+             recorded ``size_bytes``.  A ``None`` recorded size means UNKNOWN
+             and is refused (never "assume match").
+          2. **full-file fingerprint** — applied only when the row carries a
+             whole-file digest (``hash`` set AND ``hash_mode == HASH_MODE`` =
+             ``FULL``): recompute the candidate's MD5 and require equality.
+             ``AUTO`` (sampled head/tail fingerprint) is deliberately NOT used:
+             it can collide across different files, so it cannot prove identity
+             — when nothing can be proven we refuse rather than guess.
+
+        Returns ``(ok, reason)``.  ``reason`` names why a candidate was refused
+        so the caller can audit it (fail loud).
+        """
+        recorded_size = row["size_bytes"]
+        if recorded_size is None:
+            return False, "recorded size unknown (fail-closed)"
+        try:
+            cand_size = fsutil.getsize(cand)
+        except OSError as exc:
+            return False, "candidate size unreadable (%s)" % exc
+        if cand_size != recorded_size:
+            return False, ("size mismatch: cand=%d recorded=%d"
+                           % (cand_size, recorded_size))
+        mode = (row["hash_mode"] or "").upper()
+        if row["hash"] and mode == C.HASH_MODE.upper():
+            try:
+                cand_hash = hasher.compute_md5(cand)
+            except OSError as exc:
+                return False, "candidate unreadable for hash check (%s)" % exc
+            if cand_hash != row["hash"]:
+                return False, ("content hash mismatch "
+                               "(same size, different bytes)")
+        return True, ""
+
     def _resolve_delete_path(self, row) -> Optional[str]:
         """Resolve the REAL on-disk path of *row* for deletion.
 
@@ -1633,28 +1928,59 @@ class Pipeline:
         path while the file now lives under the source root (a sibling in the
         same dir, or anywhere under ``cfg.src_dir``).  If ``row["path"]`` is NOT
         on disk but a same-basename file exists under the source root, return
-        the resolved real path.  The resolved path MUST still pass
-        ``_delete_allowed`` — the source-root protection is NEVER relaxed; if
-        nothing resolvable is found, return ``None`` so the caller keeps the
-        source (audited).  Used by both ``_maybe_delete_source`` and
-        ``_delete_one`` so every deletion entry point benefits.
+        the resolved real path.
+
+        Round-4 (P1, data loss): "same basename" is NOT enough — a same-named
+        file elsewhere may be a DIFFERENT file that merely re-used the name.
+        Every candidate must now be *proven* identical to the row
+        (:meth:`_resolve_candidate_ok`: size hard gate + optional whole-file
+        hash) before it may be returned; a rejected candidate is audited at
+        WARN (fail loud).  The resolved path MUST still pass ``_delete_allowed``
+        — the source-root protection is NEVER relaxed; if no candidate can be
+        proven, return ``None`` so the caller keeps the source (audited).  Used
+        by both ``_maybe_delete_source`` and ``_delete_one`` so every deletion
+        entry point benefits.
         """
         db, cfg = self.db, self.cfg
         stored = row["path"]
+        # step 0 — the recorded path itself.  UNCHANGED: when the file really
+        # is where the DB says it is, we do not second-guess it.
         if fsutil.exists(stored) and delete_allowed(cfg.src_dir, stored):
             return stored
         base = row["file_name"] or os.path.basename(stored)
+        refused: List[str] = []
         # 1) sibling in the recorded directory (stage may have moved it within
-        #    the same folder).
+        #    the same folder) — still must be proven identical.
         sib = os.path.join((row["dir_path"] or os.path.dirname(stored)), base)
         if sib != stored and fsutil.exists(sib) and delete_allowed(cfg.src_dir, sib):
-            return sib
-        # 2) anywhere under the source root with the same basename.
+            ok, why = self._resolve_candidate_ok(sib, row)
+            if ok:
+                return sib
+            refused.append("%s (%s)" % (sib, why))
+        # 2) anywhere under the source root with the same basename — the widest
+        #    (and riskiest) net; every hit must still be proven identical.
         for root, _dirs, files in os.walk(cfg.src_dir):
-            if base in files:
-                cand = os.path.join(root, base)
-                if delete_allowed(cfg.src_dir, cand):
-                    return cand
+            if base not in files:
+                continue
+            cand = os.path.join(root, base)
+            if cand == stored or cand == sib:
+                continue
+            if not delete_allowed(cfg.src_dir, cand):
+                continue
+            ok, why = self._resolve_candidate_ok(cand, row)
+            if ok:
+                return cand
+            refused.append("%s (%s)" % (cand, why))
+        # fail loud — never guess-delete a same-named file, never silently
+        # pretend success.  Record the refused candidates (or the bare fact
+        # that nothing resolvable was found) before returning None; the caller
+        # then keeps the source per existing semantics.
+        db.event(
+            row["id"], C.ACTION_DELETE,
+            "stale-path resolve: no verified candidate for %s — %s"
+            % (stored, ("; ".join(refused) if refused
+                        else "no same-name candidate under source root")),
+            level="WARN", batch=cfg.batch)
         return None
 
     def _cascade_delete_ready(self, fid: int) -> tuple:
@@ -1839,6 +2165,18 @@ class Pipeline:
         row = db.get(fid) or row
         if row is None or cfg.dry_run:
             return False
+        # Idempotency (fix): a source ALREADY marked deleted must never re-enter
+        # the delete path.  Re-entry (terminal backtracking / cascade / final
+        # re-check / reconciliation) used to write a SECOND DELETE event, a
+        # DELETED->DELETED self-transition and a phantom n_deleted/bytes_deleted
+        # bump — the report §八 "自动删源包" inflated ~43% (117 vs the real 84).
+        # It ALSO closes a data-loss vector: if the same path was later
+        # RE-OCCUPIED by a real file (re-downloaded, or re-extracted), upsert_file
+        # keeps the same row id and does NOT reset source_deleted, so replaying
+        # this row would delete the NEW file.  Refusing on source_deleted stops
+        # that cold.  (No code path ever resets source_deleted back to 0.)
+        if row["source_deleted"]:
+            return False
         out_dir = row["extract_output_dir"]
         reasons: List[str] = []
 
@@ -1996,6 +2334,14 @@ class Pipeline:
         ``_delete_allowed`` guard below, so the source root is never widened.
         """
         db, cfg = self.db, self.cfg
+        # Idempotency (fix): never re-delete/re-count a row already marked
+        # deleted.  This is the direct-call guard for callers that reach
+        # _delete_one without going through _maybe_delete_source's entry check
+        # (reconcile §0b, _on_terminal group/carved rows).  It runs BEFORE any
+        # path resolution, so an already-deleted row can never resolve to — and
+        # delete — a live file that later re-occupied the same path.
+        if row is not None and row["source_deleted"]:
+            return True
         real = path
         if row is not None:
             resolved = self._resolve_delete_path(row)
@@ -2012,7 +2358,14 @@ class Pipeline:
         if ok and gone:
             # §6.6 (v3.7.0): the parent may have just become an empty shell.
             self.prune_candidates.add(os.path.dirname(real))
-            if fsutil.last_delete_mode != "RECYCLE":
+            # "Already gone" (last_delete_mode stays "NONE": fsutil.delete_file
+            # short-circuits and reports success when the path held no file)
+            # means NOTHING was removed and NO bytes were freed.  Reconcile the
+            # row state (mark DELETED so reconcile §0b stops re-visiting it), but
+            # NEVER count it as a deletion: the phantom n_deleted/bytes_deleted
+            # bump was the other half of the report §八 inflation (fix).
+            actually_deleted = fsutil.last_delete_mode != "NONE"
+            if actually_deleted and fsutil.last_delete_mode != "RECYCLE":
                 # P1-2/P2 audit: the recycle route did not take it (fallback
                 # permanent delete, or an external hook moved it) — record
                 # the actual mode so ops can tell recoverable from not.
@@ -2021,10 +2374,14 @@ class Pipeline:
                          % (fsutil.last_delete_mode, rc), batch=cfg.batch)
             db.update_fields(row["id"], source_deleted=1, deleted_at=_now(),
                              delete_rc=rc)
-            db.transition(row["id"], C.STATUS_DELETED, C.ACTION_DELETE,
-                          "source deleted (rc=%s, mode=%s)"
-                          % (rc, fsutil.last_delete_mode))
-            db.bump_batch(cfg.batch, "n_deleted", bytes_added=row["size_bytes"] or 0)
+            db.transition(
+                row["id"], C.STATUS_DELETED, C.ACTION_DELETE,
+                ("source deleted (rc=%s, mode=%s)" if actually_deleted
+                 else "source already gone — marked DELETED, 0 bytes freed "
+                      "(rc=%s, mode=%s)") % (rc, fsutil.last_delete_mode))
+            if actually_deleted:
+                db.bump_batch(cfg.batch, "n_deleted",
+                              bytes_added=row["size_bytes"] or 0)
             return True
         # Windows rc 5 = access denied, 32 = locked by another process (§4.2).
         db.update_fields(row["id"], delete_rc=rc)
@@ -2195,6 +2552,51 @@ class Pipeline:
                      "empty dir kept (rc=%s): %s" % (rc, d), level="WARN",
                      batch=cfg.batch)
         return list(removed)
+
+    def _finalize_and_report(self, aborted: bool) -> str:
+        """Settle the batch row, THEN render the report (§8).
+
+        Order is load-bearing: :func:`report.generate_report` reads
+        ``batches.status`` / ``free_bytes_end`` / ``finished_at``, so
+        ``finish_batch`` MUST run first.  Rendering before finalising produced
+        a report that contradicted the DB: header said RUNNING (DB said
+        ABORTED), §六 收尾剩余 read ``0 B`` (DB held the real ``free_end``) and
+        生成时间 read ``None``.
+
+        The final status still honours the "below the floor => ABORTED" rule:
+        ``aborted`` is the caller's flag (mid-loop BatchAborted) OR an
+        end-of-batch free-space floor breach, evaluated here after the final
+        measurement.  Returns the report path (also surfaced in ``run()``'s dict).
+        """
+        cfg, db = self.cfg, self.db
+        free_end = fsutil.disk_free(cfg.src_dir)
+        aborted = aborted or free_end < C.MIN_FREE_BYTES
+        db.finish_batch(cfg.batch, "ABORTED" if aborted else "DONE", free_end)
+
+        from .report import generate_report
+        report_path = generate_report(self)
+        db.event(None, C.ACTION_REPORT, "batch %s finished, report: %s" %
+                 (cfg.batch, report_path), batch=cfg.batch)
+        return report_path
+
+    def _space_gate(self, path: str, size_bytes: int) -> tuple:
+        """§3.5 space gate with a recycle rescue on BOTH thresholds.
+
+        Delegates the accounting to :func:`space.check` and hands it the
+        recycle purge callback, so the absolute floor and the need gate are now
+        symmetric: recycled bytes are not free (v2.1), so a bin full of our own
+        deleted sources is purged ONCE and the space re-measured before either
+        gate gives up.  ``self._purge_recycle`` keeps its own ``--dry-run`` /
+        ``--no-purge-recycle`` guard, so this never cleans when it must not.
+
+        Raises :class:`BatchAborted` (the batch-stop signal the main loop
+        catches, §3.5) when the floor is STILL breached after the rescue.
+        """
+        try:
+            return space_mod.check(path, size_bytes,
+                                   purge_cb=self._purge_recycle)
+        except space_mod.SpaceAbort as exc:
+            raise BatchAborted(str(exc))
 
     def _purge_recycle(self, phase: str) -> int:
         if not self.cfg.purge_recycle or self.cfg.dry_run:
