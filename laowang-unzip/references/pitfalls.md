@@ -391,3 +391,86 @@ test_2 / test_3 / test_10 三个冻结修复回归同时变红——父包本应
 `_final_recheck` / `_maybe_delete_source`；tests/test_cascade_delete.py 与
 tests/test_freeze_fixes.py。
 
+
+## I. 判据可靠性（v3.7.9 新增，来源：references/lessons.md LES-20260917-06/07/08）
+
+**#54. 「磁盘事实」不能替代「执行者自己的裁决」；空集合的真空真值会伪装成「全部满足」（v3.7.9）**
+
+崩溃恢复走过的两层错误判据，是同一个病：**用间接证据替代直接证据**。
+
+① **先分配后写入**。7z 解压会先按最终尺寸建文件再填内容，所以"被强杀后的半成品"在磁盘上
+尺寸非 0、也不是 0 字节。任何形如「输出目录有非压缩内容 且 无 0 字节文件 → 说明解压成功」的
+启发式，在这种文件面前**必然为真**。判「某个动作成功」只能以**执行者自己的返回值**为准
+（这里是 `extract_rc == 0`）；磁盘状态只能当**辅助记录**，绝不能当闸门。特别地，`NULL` 必须
+按 fail-closed 处理——"从没跑到那儿"不等于"跑成功了"。
+
+② **`all([]) == True`**。`all(k.status in TERMINAL for k in kids)` 在 `kids` 为空时返回 `True`，
+于是「**没有任何子件**」被读成「**所有子件都终态了**」——零子件被判"已完成"，直接导致删源包。
+铁律：凡对**可能为空**的集合做 `all()` / `any()`，先显式回答"空集合算哪一边"。凡"空集合 →
+判完成 / 就绪 / 可删"的一律是**危险侧**，必须补 `len(x) > 0` 或 `if not x: return <保守值>`。
+本仓库同类判据已按此全面复核：`_children_digested` / `_cascade_delete_ready` / `_is_fully_done`
+均在安全侧；`_maybe_delete_source` 的 check5 / check12 / check10 是"放行倾向"的真空通过，当前被
+check2 / check3 / check6 兜住，**登记为 P2 待加固**（刻意不加 `if not kids or ...`：零子件在
+非 cascade 模式下本就被那三条拦住，加了是永不触发的冗余）。
+
+③ **判据的"隐式契约"必须写成断言**。`_upsert_child` 的"收养"最初只校验"这是一条无父根行"，
+安全性完全靠 6 个调用点自觉传自己家的路径；一旦有人传错，就会**静默改写无关行的 lineage**
+（`origin` 被写成 `CARVED` 等，而 `REPAIR_ORIGINS` 的子件**是会进删除集**的）。现已收紧为
+路径关系 + 命名派生双重断言（`os.path.commonpath` 逐段比较，**禁用裸 `startswith`**——否则
+`…\out2` 会假命中 `…\out`）。**凡"靠调用方自觉"的前置条件，都要落到被调方**。
+已知边界：裸前缀判据下 `A.mp4` 与同目录 `AB_carved.zip` 会假命中（单元层可复现，经复核生产
+不可达），已由 `test_9` 如实钉住。
+
+**#55. `_resweep` 递归扫源根、不排除输出目录 = 产物被当「新下载」重走一遍（已知限制，v3.7.9 登记）**
+
+`_resweep` 用 `fsutil.real_list_files(cfg.src_dir)` **递归**枚举源根，**没有**跳过任何
+`extract_output_dir`；而输出目录恰恰就在源根之下。结合 `upsert_file` 冲突时「**保留 lineage**」
+（`status` / `depth` / `origin` / `parent_id` 不回写——这是为了让重复扫盘安全），后果有三：
+
+- 解压产物会被登记成 `origin=DOWNLOAD, depth=0` 的**无父根行**，于是父行看起来"零子件"
+  → `_is_fully_done` 恒假 → 行搁浅（已被 `_upsert_child` 收养逻辑缓解，见 LES-20260917-07）；
+- 这些产物同时会被当"新下载"走一遍 `hash` / `dedup` / `junk` / 密码试解：**多 GB 视频会被重复
+  全量哈希**（耗时可观），并可能产生多余的 dedup 待决提示；
+- 收养把 `origin` 从 `DOWNLOAD` 改写成 `EXTRACTED` → `report.py` 的 origin 分桶漂移
+  （`DOWNLOAD` / `CARVED` / `CONCATENATED` / `MAGIC_PATCHED` 少、`EXTRACTED` 多）。
+
+严重度 **P2**：无数据丢失、无错误删除，代价是**白做功 + 报表口径**。**刻意不修**——`_resweep`
+同时是崩溃场景的**发现面安全网**（产物尚未被登记时靠它兜住），排除输出目录等于缩小发现面，
+必须重新论证整条发现路径。若日后要修，判据应是"该路径落在**某条已登记行的
+`extract_output_dir`** 之下"（而非路径名猜测），并保留"父行状态未知时照旧登记"的兜底。
+**观察指标**：报表 `n_discovered` 与真实下载数的差额、全量哈希耗时的异常抬升。
+
+---
+
+**#56. 收尾清理的守卫根用「会漂移的全局 `src`」而不是「每批自己的记录根」（v3.7.10 修）**
+
+批次跑完归集进 `【done】\<date>` 之后，`clean-junk` / `resolve-dup` 对已归集文件**一律拒绝删除**，
+每行只打印一行 `delete refused (outside source root or protected)`，**退出码仍然是 0**。于是收尾
+清理静默失效，报告里「待清理」那一节永远清不掉。本机实际滞留 6 天，最后由用户一句
+「你是不是忘了清理垃圾这个环节？」问出来（当时 3 个 `junk_*.dat` 全在盘上、DB 里仍是 `JUNK_PENDING`）。
+
+根因：这两个子命令的守卫根是 `cfg.src_dir`，优先级为 `--src` > `config.local.json` 的 `"src"`
+> `<root>/【new】`；而它们**没有 `--src` 参数**，于是完全依赖那个会漂移的全局值。批次一旦被
+`stage` / `retire` 归集进 `【done】\<date>`，全局值就指向**上一批**了。
+
+**判据（写死）**：收尾清理的守卫根 =
+
+    [cfg.src_dir] + scheduler.batch_guard_roots(workdir, batches.root_dir[该行批次])
+
+`batches.root_dir` 由 `db.begin_batch(cfg.batch, cfg.src_dir, ...)` 写入，是**批次自己的位置**，
+本来就是权威事实，收尾清理必须去读它。追加根**只接受合法批次容器**：`<root>/【new】` 本身，或
+`<root>/【done】` 之下的**严格子孙**（`os.path.commonpath` 逐段比较，**禁用裸 `startswith`** ——
+否则 `【done】2` 会假命中）。`<root>` 本身、`<root>/【done】` 本身、`<root>/pipeline` 一律拒：
+否则一次清理能横扫整个工作区。`delete_allowed()` **一字不改** —— 保护只做**追加**，绝不放宽；
+批次无记录、或记录根不是合法批次容器的行，照旧被拒。
+
+**多批次必须逐行取根**，不许共用一次查找结果。共用会让后来的批次**静默不删、退出码仍为 0**，
+正是同一个坑的另一副面孔（已由 `test_8` 咬住：把每批缓存冻结到第一行，B2 的行就会被悄悄留下）。
+
+**禁止**：把守卫拒绝做成「按行打印 + 退出码不变」却不给汇总和可执行提示 —— **静默的守卫等于
+不存在的守卫**。拒绝必须指名**用了哪些守卫根**，并给出可执行出路（`--src <批次目录>`）。
+
+**已知限制（既有，非本版引入）**：路径判定用 `abspath` 而非 `realpath`，所以 `【done】` 里若存在
+指向外部的目录软链接（junction），守卫可被绕过。已核对：原始 `delete_allowed` 与 2026-09-15 基线
+**逐字节一致**，从未被削弱；利用它需要先在磁盘建软链接 + 伪造 `batches.root_dir`。加固路径解析
+需单独评估风险面，本版登记不改。

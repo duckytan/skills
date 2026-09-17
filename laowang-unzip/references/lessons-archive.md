@@ -139,3 +139,20 @@
 - 指纹：自动采集本批出现unclassified2次实锤证据671377788899911gb与671777788899937gbreal_type7zdeclared
 - 指纹：无扩展名7Z包Cannot create output directory当文件已存在时
 - 复现：2 次
+
+### [LES-20260916-01] bug P2 resolved（重复草稿：与同 ID 已结案条目同根因）
+- 现象：自动采集：本批出现 ARCHIVE_CORRUPT ×4 次
+- 根因：与同 ID 已结案条目同根因——carve 残骸尾部截断导致的 ARCHIVE_CORRUPT（真损坏，非管线 bug）；该域判据早已见 pitfalls #51 与 v3.7.2 分卷守卫，本草稿无新增信息。
+- 处置：结案（resolved）。本条系机器按批聚合出的**重复草稿**（occ=17 为同指纹跨批累计），承已结案条目定级 P2（不丢用户数据、不整批失败），不再新建判据。⚠ 附注：本条与人工结案条目**撞号**（同为 LES-20260916-01），编号唯一性问题已另案登记。
+- 关联：pitfalls #51；v3.7.2 分卷守卫；同 ID 已结案条目（本文件上文 [LES-20260916-01] data P2 resolved）
+- 指纹：archive_corrupt
+- 复现：19 次
+
+### [LES-20260916-02] ops P2 resolved（正常终态：UNKNOWN_BINARY = 识别不出的成品内容，SKIP 保守正确）
+- 现象：自动采集：本批出现 UNKNOWN_BINARY ×6 次（待判：需人工确认类型）。**人工确认已完成**：全库抽检 624 条 UNKNOWN_BINARY，全部是 APK 解包后的内部成品（res/*.xml、classes.dex、*.kotlin_builtins、AndroidManifest.xml）与非压缩包内容（.mp4、废文件.bin）——即「本来就不是压缩包」。
+- 根因：**非缺陷**。UNKNOWN_BINARY = 整文件扫不到任何已知签名（failure-matrix #5）；对「筛压缩包」的流水线而言它就是「不是压缩包」的正常终态，SKIP 属保守正确行为。
+- 处置：结案（resolved）。判据早已存在（failure-matrix #5 + config.py FAIL_UNKNOWN_BINARY），且同指纹、同数量（×6）的案子此前已结案（LES-20260915-10）。**不提升、不新建判据**；若日后要降低草稿噪音，另案讨论是否把 UNKNOWN_BINARY 移出 evolve 的 JUDGEMENT 档。
+- 关联：failure-matrix #5；LES-20260915-10；evolve.py JUDGEMENT_FAIL_REASONS
+- 指纹：unknown_binary
+- 复现：11 次
+

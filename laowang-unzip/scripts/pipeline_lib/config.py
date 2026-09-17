@@ -71,6 +71,9 @@ ACTION_COLLECT = "COLLECT"             # 成品归集 move/copy of a leaf conten
 # Doubles as the idempotency credential (one PW_LEARNED event per file_id).
 ACTION_PW_LEARNED = "PW_LEARNED"
 ACTION_PRUNE = "PRUNE"                 # v3.7.0: empty-directory removal (§6.6)
+# v3.7.x: a pre-existing unparented root row was NOT adopted by a re-sweep's
+# product because its path is outside the parent's product scope (DEBUG note).
+ACTION_ADOPT_SKIP = "ADOPT_SKIP"
 
 # ---------------------------------------------------------------------------
 # fail_reason enum (§7.1, 25 values)

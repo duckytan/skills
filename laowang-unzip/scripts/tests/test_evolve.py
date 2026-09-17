@@ -672,7 +672,8 @@ class DraftLessonTests(unittest.TestCase):
             self.assertEqual(len(lessons), 1)
             ls = lessons[0]
             self.assertEqual(ls.occ, 3)
-            self.assertEqual(ls.priority, "P1")
+            # Round-4 2B: machine drafts never self-assign P0/P1 — always P2.
+            self.assertEqual(ls.priority, "P2")
             self.assertEqual(ls.status, "open")
             self.assertEqual(ls.sig, E._signature("WRONG_PASSWORD"))
             joined = "\n".join(ls.body)
@@ -689,11 +690,14 @@ class DraftLessonTests(unittest.TestCase):
             self.assertEqual(len(lessons), 1)
 
     def test_draft_priority_mapping(self):
+        """Round-4 2B: machine drafts are ALWAYS the most conservative tier P2
+        and must never self-assign P0 (that falsely tripped the promote gate on
+        a single occurrence).  Elevation is human/AI-only."""
         with tempfile.TemporaryDirectory() as d:
             p = os.path.join(d, "references", "lessons.md")
             _write_lessons(p, [])
-            self.assertEqual(E._priority_for_fail("ARCHIVE_CORRUPT"), "P0")
-            self.assertEqual(E._priority_for_fail("WRONG_PASSWORD"), "P1")
+            self.assertEqual(E._priority_for_fail("ARCHIVE_CORRUPT"), "P2")
+            self.assertEqual(E._priority_for_fail("WRONG_PASSWORD"), "P2")
             self.assertEqual(E._priority_for_fail("OUTPUT_ZERO_ROOTS"), "P2")
 
     def test_draft_then_bump_accumulates(self):

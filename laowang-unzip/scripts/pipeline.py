@@ -270,6 +270,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("file_id", type=int, help="id of the DUPLICATE_PENDING row")
     p.add_argument("--keep", choices=("old", "new"), required=True,
                    help="keep the previously-seen file (old) or the new one (new)")
+    p.add_argument("--src", default=None,
+                   help="guard root for deletions. Default: <root>/【new】 or "
+                        "pipeline/config.local.json \"src\". Use it to clean an "
+                        "already-staged batch, e.g. --src <root>/【done】/<date>")
     p.set_defaults(func=cmd_resolve_dup)
 
     p = sub.add_parser("clean-junk", help="review & delete flagged junk files")
@@ -286,6 +290,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-prune", action="store_true",
                    help="do NOT clean up directories left empty by the "
                         "deletions (§6.6)")
+    p.add_argument("--src", default=None,
+                   help="guard root for deletions. Default: <root>/【new】 or "
+                        "pipeline/config.local.json \"src\". Use it to clean an "
+                        "already-staged batch, e.g. --src <root>/【done】/<date>")
     p.set_defaults(func=cmd_clean_junk)
 
     p = sub.add_parser("junk-stats",
@@ -970,10 +978,19 @@ def cmd_resolve_dup(args) -> int:
         keeper, victim = (old, row) if keep_old else (row, old)
         vpath = victim["path"]
         if fsutil.exists(vpath):
-            # P2-③: same §4.1 check#11 guard the batch loop uses.
-            if not scheduler_mod.delete_allowed(cfg.src_dir, vpath):
+            # P2-③: same §4.1 check#11 guard the batch loop uses — but
+            # SUPPLEMENTED by the victim row's own recorded batch root, so an
+            # already-staged batch can still be cleaned when the global config
+            # "src" has drifted to another batch.  The source-root protection
+            # itself is never relaxed (batch_guard_roots is fail-closed).
+            vroots = [cfg.src_dir] + scheduler_mod.batch_guard_roots(
+                cfg.workdir, db.batch_root(victim["batch"]))
+            if not scheduler_mod.delete_allowed_any(vroots, vpath):
                 print("delete refused (outside source root or protected): %s"
                       % vpath)
+                print("  guard roots: %s" % "; ".join(vroots))
+                print("  hint: pass --src <batch dir> to clean an already-staged"
+                      " batch")
                 db.close()
                 return 2
             ok, rc = fsutil.delete_file(vpath)
@@ -1013,7 +1030,12 @@ def cmd_clean_junk(args) -> int:
             return 0
         cur_rule = None
         deleted = 0
+        refused = 0
+        refused_paths = []
         emptied = set()
+        # one batch_guard_roots() lookup per batch, not per row (--batch may be
+        # omitted, in which case rows from several batches are processed).
+        guard_cache = {}
         for r in rows:
             if r["junk_rule"] != cur_rule:
                 cur_rule = r["junk_rule"]
@@ -1035,9 +1057,21 @@ def cmd_clean_junk(args) -> int:
             if not approved:
                 print("    kept.")
                 continue
-            # P2-③: §4.1 check#11 guard, same as the batch loop.
-            if not scheduler_mod.delete_allowed(cfg.src_dir, r["path"]):
-                print("    delete refused (outside source root or protected).")
+            # P2-③: §4.1 check#11 guard, same as the batch loop — supplemented
+            # by the row's OWN recorded batch root so an already-staged batch
+            # can still be cleaned when the global config "src" has drifted.
+            # The source-root protection is never relaxed (fail-closed).
+            if r["batch"] not in guard_cache:
+                guard_cache[r["batch"]] = scheduler_mod.batch_guard_roots(
+                    cfg.workdir, db.batch_root(r["batch"]))
+            roots = [cfg.src_dir] + guard_cache[r["batch"]]
+            if not scheduler_mod.delete_allowed_any(roots, r["path"]):
+                refused += 1
+                refused_paths.append(r["path"])
+                print("    REFUSED (outside guard root): %s" % r["path"])
+                print("      guard roots: %s" % "; ".join(roots))
+                print("      hint: pass --src <batch dir> to clean an already-"
+                      "staged batch")
                 continue
             # §6.5 (v3.7.0): prepare the library entry BEFORE the file is gone.
             # Only user-confirmed deletions are eligible, and only for files the
@@ -1072,6 +1106,13 @@ def cmd_clean_junk(args) -> int:
             else:
                 print("    delete FAILED rc=%s" % rc)
         print("\n%d junk file(s) deleted, rest kept for review." % deleted)
+        if refused:
+            print("%d file(s) refused by the deletion guard — nothing was "
+                  "removed for them." % refused)
+            for p in refused_paths:
+                print("  refused: %s" % p)
+            print("  hint: pass --src <batch dir> to clean an already-staged "
+                  "batch")
         if learned:
             print("%d junk-library entr(ies) recorded — these will be removed "
                   "automatically next time. Inspect: python pipeline.py "

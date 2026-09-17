@@ -9,7 +9,7 @@ description: >-
   详细判据见 references/，接口约定见 references/scripts-api.md，完整设计见 references/design-v2.1.md。
 ---
 
-# 伪装压缩包批量整理（通用版 v3 · skill 3.7.3）
+# 伪装压缩包批量整理（通用版 v3 · skill 3.7.10）
 
 > ## ⚠️ 平台：Windows 专用（Q1 拍板 2026-09-09）
 > 本 skill 的**删除与回收站语义只在 Windows 上完整成立**：
@@ -139,7 +139,7 @@ python pipeline.py prune-empty [--apply] [--json] [--root <处理根>]
 
 | # | 步骤 | 做什么 | 关键判据（写死成 config 常量） |
 |---|---|---|---|
-| 1 | **启动预检** | 盘点磁盘真实剩余空间（三路读数交叉验证）+ 盘点/按需清空回收站（`PURGE_RECYCLE_ON_START`）+ 数据库迁移 | 最少可用 `MIN_FREE_BYTES=20GiB`；回收站读数以真实枚举 `$R*` 体积为准 |
+| 1 | **启动预检** | 盘点磁盘真实剩余空间（三路读数交叉验证）+ 盘点/按需清空回收站（`PURGE_RECYCLE_ON_START`）+ 数据库迁移 | 最少可用 `MIN_FREE_BYTES=20GiB`；回收站读数以真实枚举 `$R*` 体积为准（v3.7.9：运行期跌破地板会先清一次回收站再复测） |
 | 2 | **发现入库** | 真枚举处理根（`\\?\` 长路径 scandir，禁裸 os.walk），逐文件 upsert 进 SQLite | `path` 唯一索引 upsert；所有经手文件都要落库（含续卷） |
 | 3 | **轻量头部判定** | `header.probe_magic_only()` 只读前 32 KB 定 `is_archive` | 单次 < 1 ms；**不做**整文件扫描（成本差 5 个数量级，且去重命中时白付） |
 | 4 | **哈希 + 去重拦截** | 全量 MD5 → 查 `hash+size_bytes+hash_mode` 相同且 id 不同的记录 | 命中 → `DUPLICATE_PENDING`，**不解压不删**，队列继续；判重**只看 hash+size 全等，与 is_archive 无关**（头伪装包真签名在几十 MB 处，轻量判定定不了性） |
@@ -254,7 +254,7 @@ root 未知时另按序搜索指针文件：`./pipeline/` → `./` → `<skill>/
 
 | 常量（config.py 实名） | 默认值 | 出处 |
 |---|---|---|
-| `MIN_FREE_BYTES` | `20 * 1024**3` | 启动硬闸门（触及抛 `SpaceAbort` 整批中止） |
+| `MIN_FREE_BYTES` | `20 * 1024**3` | 硬地板：**先清一次回收站 → 复测**，仍低于才抛 `SpaceAbort` 整批中止（v3.7.9 起与需求门对称；阈值本身未改） |
 | `SPACE_FACTOR` / `SPACE_RESERVE_BYTES` | `1.5` / `6 GiB` | 空间闸门：`need = 输入×1.5 + 6GiB` |
 | `PURGE_RECYCLE_ON_START` / `_FINISH` | `True` / `True` | 先清回收站再解压（回收站字节不算 free） |
 | `MAX_DEPTH` | `8` | 防无限套娃 |
@@ -431,7 +431,8 @@ root 未知时另按序搜索指针文件：`./pipeline/` → `./` → `<skill>/
 | magic patch（UA→PK） | 全文批量替换 `55 41 → 50 4B`；大文件误伤概率极低但未实测统计 |
 | 「删」后缀首卷改名 | 仅处理 `删除` / `删` 两种后缀；其他改名形态（_、bak 等）需人工 |
 | 看门狗 `TIMEOUT` / `HANG_KILLED` | 5400 s 墙钟 + 1800 s 进度零增长双判据；kill 后 retry 1 次的路径未实测 |
-| 空间闸门熔断 | `MIN_FREE_BYTES`（20 GiB）以下抛 `SpaceAbort` 整批中止；真实写满场景未实测 |
+| 空间闸门熔断 | `MIN_FREE_BYTES`（20 GiB）以下**先清一次回收站再复测**，仍不足才抛 `SpaceAbort` 整批中止；真实写满场景未实测 |
+| 空间闸门地板路径 | v3.7.9 修复：旧代码地板路径**不 purge**（与需求门不对称），曾连续 6 批 7 次白停；另修「恢复检查第二次裸抛 `SpaceAbort` 冒泡成 FAILED」 |
 | `MAX_DEPTH = 8` | 超过 8 层套娃停止下挖；真实样本最深只到 5 层 |
 | 长路径（> 260 字符） | Windows 用 `\\?\` 前缀；shell 删除 API 不接受该前缀（会走永久删回退），极端深度路径未实测 |
 
