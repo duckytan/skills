@@ -1619,6 +1619,32 @@ def cmd_doctor(args) -> int:
                                      "" if os.path.isfile(path) else "(absent)"))
     print("   = %d unique candidate password(s) loaded" % len(pw_lib))
 
+    # 6.5) 自学习库换行自检（jiqing77 事故 · v3.7.5）：v3.7.5 之前，库文件一旦混入
+    #      哪怕一条 CRLF 行，解析器会把前面所有 LF 历史数据并成一整块、静默吞掉
+    #      大量条目。解析器现已归一化（不再吞数据），此处仅作**早发现**哨兵——
+    #      发现即计入 problems，提示用 `python pipeline.py pw-stats --rebuild` 重写归一。
+    print("6.5) learned libs (CRLF 自检):")
+    for lib_name in ("passwords.learned.txt", "junk.learned.txt"):
+        lp = os.path.join(SKILL_DIR, "assets", lib_name)
+        if not os.path.isfile(lp):
+            print("   - %-20s (absent — skip)" % lib_name)
+            continue
+        try:
+            with open(lp, "rb") as fh:
+                blob = fh.read()
+        except OSError as exc:
+            print("   - %-20s UNREADABLE -> %s" % (lib_name, exc))
+            continue
+        crlf = blob.count(b"\r\n")
+        lone_cr = blob.replace(b"\r\n", b"").count(b"\r")
+        if crlf or lone_cr:
+            problems.append("%s 含 CRLF/混合换行 (%d CRLF + %d 裸CR) —— 建议 pw-stats --rebuild 归一化"
+                            % (lib_name, crlf, lone_cr))
+            print("   - %-20s [!] 含 %d CRLF + %d 裸CR（已能正常解析，但仍建议 rebuild 为纯 LF）"
+                  % (lib_name, crlf, lone_cr))
+        else:
+            print("   - %-20s OK (pure LF)" % lib_name)
+
     # 7) 自进化环健康度（SKILL.md §3.1/§3.2）——**只提示，默认不计入 problems**。
     #    职责分离：doctor 回答「环境+代码能不能开工」，`evolve --check` 回答
     #    「自进化有没有欠账、本批能不能收尾」——欠账不该阻止开工（否则 doctor
