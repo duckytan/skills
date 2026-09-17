@@ -84,14 +84,36 @@ def learned_path(skill_root: Optional[str] = None) -> str:
     return os.path.join(base, "assets", "passwords.learned.txt")
 
 
+class ReadError(IOError):
+    """文件存在但读不到（**权限 / 锁** 等 ``OSError``）。
+
+    v3.7.7：``_read`` 必须区分「文件不存在」（返回 ``None``，视作空库）与「文件
+    存在但读取失败」（抛 ``ReadError``）。旧实现把两者都吞成 ``None``，于是
+    「库存在却读不到」会被上层当成空库，随后 ``record_success`` /
+    ``rebuild_counts`` 用空结构**整体覆盖**原文件——静默丢数据。让异常向外传播，
+    上层 ``try: parse_learned() except Exception`` 才能落 ``written=False``、
+    保住原文件（读不到就不覆盖）。
+
+    v3.7.8：**编码错误不会**触发本异常——``_read`` 用 ``errors="ignore"`` 容忍
+    编码异常（读得到，只是个别坏字节被跳过）；只有 ``open``/``read`` 抛的
+    ``OSError``（权限被拒 / 文件被占用等）才抛 ``ReadError``。
+    """
+
+
 def _read(path: str) -> Optional[str]:
-    """读文本（utf-8-sig 容错、忽略编码错误、不翻译换行）；读不到返回 ``None``。"""
+    """读文本（utf-8-sig 容错、忽略编码错误、不翻译换行）。
+
+    文件**不存在** → ``None``（上层视作空库）；文件**存在但读取失败** → 抛
+    ``ReadError``（绝不静默把「读不到」当「空库」，以免后续整体覆盖丢数据）。
+    """
+    if not os.path.exists(path):
+        return None
     try:
         with open(path, "r", encoding="utf-8-sig", errors="ignore",
                   newline="") as fh:
             return fh.read()
-    except OSError:
-        return None
+    except OSError as exc:
+        raise ReadError("%s: %s" % (path, exc))
 
 
 def _is_comment_or_blank(line: str) -> bool:
@@ -191,6 +213,10 @@ def read_counts(path: str) -> Dict[str, int]:
 
 def _atomic_write(path: str, text: str) -> bool:
     """同目录 ``<name>.tmp`` → ``os.replace`` 原子替换；失败不损坏原文件。"""
+    # v3.7.7 写盘兜底：无论调用方传进来的是 LF / CRLF / 裸CR，落盘一律纯 LF。
+    # 读时归一化（v3.7.5）已是硬兜底，这里再加一道，保证本文件永不因写入侧产出
+    # CRLF 而触发 doctor 的「含 CRLF」念叨。
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
     tmp = path + ".tmp"
     try:
         d = os.path.dirname(path)
@@ -232,6 +258,14 @@ def record_success(path: str, password: str, source: str = "",
         header, entries, footer = parse_learned(path)
     except Exception as exc:  # noqa: BLE001
         result["detail"] = "parse failed: %r" % exc
+        return result
+
+    # v3.7.8 写前守卫：库结构损坏时拒绝改写（fail loud），绝不让一次写入把
+    # 损坏行静默吞掉/截断。verify 对「文件不存在」返回 (True, [])，首次建库不受影响。
+    ok_lib, lib_problems = verify(path)
+    if not ok_lib:
+        result["detail"] = ("自学习库结构损坏，拒绝写入（fail loud）: %s"
+                            % "; ".join(lib_problems[:3]))
         return result
 
     target: Optional[Entry] = None
@@ -307,6 +341,13 @@ def rebuild_counts(path: str, db_counts: Dict[str, int]) -> dict:
         header, entries, footer = parse_learned(path)
     except Exception as exc:  # noqa: BLE001
         result["detail"] = "parse failed: %r" % exc
+        return result
+
+    # v3.7.8 写前守卫：库结构损坏时拒绝改写（fail loud），文件一个字节都不动。
+    ok_lib, lib_problems = verify(path)
+    if not ok_lib:
+        result["detail"] = ("自学习库结构损坏，拒绝写入（fail loud）: %s"
+                            % "; ".join(lib_problems[:3]))
         return result
 
     result["before_total"] = sum(e.count for e in entries)
@@ -386,7 +427,12 @@ def verify(path: Optional[str] = None) -> Tuple[bool, List[str]]:
     """
     problems: List[str] = []
     target = path or learned_path()
-    raw = _read(target)
+    try:
+        raw = _read(target)
+    except ReadError as exc:
+        # v3.7.7：文件存在但读不到 → 视为「不健康」并拒跑（fail loud），绝不
+        # 当成空库放过（否则 run/clean-junk 会照着空库把数据学到坏文件上）。
+        return False, ["文件存在但不可读（权限/锁）: %s" % exc]
     if raw is None:
         return True, []            # 还没建库 = 健康
 
@@ -408,15 +454,27 @@ def verify(path: Optional[str] = None) -> Tuple[bool, List[str]]:
             pws.append(line.strip())
             counts.append(0)
             continue
-        if n == 4:
+        if n == 3:
+            # 合法：count\tpassword\tdate（缺来源列）。lenient parser 认这个形态，
+            # 不该当损坏误伤；但首字段非整数仍报「计数非整数」。
             if not parts[0].strip().isdigit():
                 problems.append("数据行计数非整数（疑似损坏/合并）: %s"
                                 % line[:60])
             pws.append(parts[1])
             counts.append(int(parts[0]) if parts[0].strip().isdigit() else 0)
             continue
-        # n in (2,3) or n >= 5：字段数异常（合并 / 截断）。
-        problems.append("数据行字段数异常（n=%d，应为 1 或 4，疑似记录被合并/截断）: %s"
+        if n == 4:
+            if not parts[0].strip().isdigit():
+                problems.append("数据行计数非整数（疑似损坏/合并）: %s"
+                                % line[:60])
+            # v3.7.7：第二字段为空 = 空密码数据行（无密码可试），显式报。
+            if parts[1].strip() == "":
+                problems.append("空密码数据行（无密码可试）: %s" % line[:60])
+            pws.append(parts[1])
+            counts.append(int(parts[0]) if parts[0].strip().isdigit() else 0)
+            continue
+        # n == 2 或 n >= 5：字段数异常（合并 / 截断）。
+        problems.append("数据行字段数异常（n=%d，应为 1/3/4，疑似记录被合并/截断）: %s"
                         % (n, line[:60]))
         pws.append(parts[1] if n >= 2 else line.strip())
         counts.append(int(parts[0]) if (parts and parts[0].strip().isdigit())
@@ -430,8 +488,11 @@ def verify(path: Optional[str] = None) -> Tuple[bool, List[str]]:
         seen.add(pw)
 
     # count 必须非递增（降序），否则试解优先级未生效。
-    if not all(counts[i] >= counts[i + 1]
-               for i in range(len(counts) - 1)):
+    # v3.7.7：只对**真实计数行**（count>0）断言降序——裸密码（count=0）是历史
+    # 遗留形态，不该把它们掺进来误报「未按 count 降序」。
+    real = [(i, c) for i, c in enumerate(counts) if c > 0]
+    if len(real) >= 2 and not all(real[i][1] >= real[i + 1][1]
+                                  for i in range(len(real) - 1)):
         problems.append("数据行未按 count 降序（试解优先级未生效）")
 
     return (not problems), problems

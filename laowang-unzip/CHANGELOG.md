@@ -1,6 +1,120 @@
 # Changelog
 
-## v3.7.6 (2026-09-18) — 自学习库「结构损坏即拒跑」fail-loud 硬闸
+## v3.7.8 (2026-09-17) — QA 复核补闸：4 个 learned 写手补齐 fail-loud
+
+**立案依据（QA 独立复核 v3.7.7）**：v3.7.7 的 4 条主张经 QA 复核证实，但**主张 4
+暴露真缺口**——`run` / `clean-junk` 的硬闸接线没问题，可**另有 4 个会写自学习库的
+入口完全没接闸**。QA 最小复现：pwstats 合并行
+`"5\tpw1\t2026-01-01\tsrc1\t9\tpw2\t2026-01-02\tsrc2"` 被 `verify` 判 `False`，但
+`record_success(path, "brandnew")` 照样 `written=True`，写回后 `pw2` 那一段被**静默
+吞掉**——正是这轮反思要根除的「静默丢数据」。本版从**治本（写手守卫）**与**接线
+（CLI 入口闸）**两侧同时堵死。
+
+### FIX (P1-①) — 4 个写库函数加「写前守卫」（pwstats.py / junklib.py）
+- 统一姿势：在各自 `parse_*` 成功之后、**任何 mutate / `_atomic_write` 之前**插一道
+  `verify()` 守卫；库结构损坏 → `written=False` + `detail`（含「拒绝写入（fail loud）」）
+  → **直接 return，文件一个字节都不动**，绝不抛、绝不静默改写。
+- 落地：`pwstats.record_success` / `pwstats.rebuild_counts` / `junklib.record` /
+  `junklib.forget`。
+- 守卫**不**放进 `_atomic_write`（它拿不到「库内容」语义，且被非库文件复用）。
+  `verify()` 只读、对不存在文件返回 `(True, [])`，首次建库不受影响。
+
+### FIX (P1-①) — CLI 入口闸：`_preflight_gate_and_rc` 参数化并按库补接（pipeline.py）
+- `_preflight_learned_libs(which=("junk","pw"))` 与 `_preflight_gate_and_rc(which=...)`
+  加 `which` 参数：只校验点名的库，修复指引也只打印相关库那几行。
+- `cmd_run` / `cmd_clean_junk` 保持默认两库不变；**新增接闸**：
+  - `cmd_retry_failed`（跑批变体）→ `("pw",)`（在任何 DB 构造之前早退）；
+  - `cmd_pw_stats --rebuild` → `("pw",)`（仅 `--rebuild` 分支；`--verify`/默认/`--json`
+    只读路径**不接闸**，坏库上仍要能出诊断）；
+  - `cmd_junk_stats --forget` → `("junk",)`（仅 `--forget` 分支；只读路径不接闸）；
+  - `cmd_junk_learn` → `("junk",)`（在 `--dry-run` 早退之后；`--dry-run` 是复核工具、
+    不写盘，故不接闸）。
+- 文案：`_preflight_gate_and_rc` 首行「本批中止」→「本次操作中止」（该 helper 已不只
+  为跑批服务）。
+
+### FIX (P1-②) — `add-password` 追加写入加 `newline=""`（pipeline.py）
+- `open(lib_path, "a", encoding="utf-8")` → 加 `newline=""`：杜绝 Windows 文本模式把
+  `\n` 写成 CRLF（与 v3.7.5 事故同源；虽是 `passwords.local.txt` 非 learned 库，同源
+  坑一并堵）。
+
+### FIX (P2) — 两处诚实性/笔误订正
+- (P2-①) `pwstats` / `junklib` 的 `class ReadError` docstring 原称「权限/锁/**编码**」，
+  但 `_read` 用 `errors="ignore"`，编码错误**永不**触发 `ReadError`。改为诚实表述：
+  只有权限/锁等 `OSError` 触发；编码错误被 `errors="ignore"` 容忍。两处 `verify()` 的
+  提示串同步去掉「编码」。
+- (P2-②) `CHANGELOG` 的 v3.7.6 段标题日期 `2026-09-18` 晚于 v3.7.7 的 `2026-09-17`，
+  改回 `2026-09-17`，恢复时间序。
+
+### TEST — scripts/tests/test_write_guard.py（新增，把 QA 复现钉成回归）
+- pwstats 合并行：`verify` 判坏 → `record_success` `written=False` 且**字节不变**；
+  `rebuild_counts` 同断言；健康库对照 `record_success` 必须 `written=True` 且 count+1。
+- junklib 错位行：`record` / `forget` 均 `written=False` 且字节不变；健康库 `record` OK。
+- `which` 过滤：`_preflight_learned_libs(("pw",))` / `("junk",)` / `("junk","pw")` 各返回正确。
+
+### TEST — 扩展 scripts/tests/test_run_preflight_gate.py（+3 例）
+- `cmd_retry_failed` 坏库→2 且 `Database` **未被构造**；`cmd_pw_stats --rebuild` 坏库→2
+  且 `rebuild_counts` 未被调用；`cmd_junk_learn` 坏库→2。
+
+## v3.7.7 (2026-09-17) — 三司会审驱动的 fail-loud 收口
+
+**背景（三司会审）**：对 v3.7.6 的「自学习库结构损坏即拒跑」硬闸做对抗式复审，
+发现五处漏网 / 误伤 / 骗人之处——`_read` 把「文件存在但读不到」静默当「空库」
+（进而可能整体覆盖丢数据）、junklib 对「value 内嵌 TAB 凑成 6 字段」的错位行直接
+放行、`pwstats.verify` 把合法的 3 字段行与「裸密码」误报为损坏、闸的修复提示把
+`pw-stats --rebuild` 说成万灵药（其实不修结构损坏）、以及硬闸接线没有任何测试锁。
+本版逐条收口。
+
+### FIX (P0) — `_read` 区分「不存在」与「读不到」（pwstats.py / junklib.py）
+- 两模块各加 `class ReadError(IOError)`；`_read(path)`：文件不存在 → `None`（空库），
+  文件存在但 `open` 抛 `OSError` → 抛 `ReadError`（不再静默吞成 `None`）。
+- `parse_learned` / `parse_library` 遇 `ReadError` **向外传播**；`record_success` /
+  `rebuild_counts` / `junklib.record` 已有的 `try: parse_...() except Exception`
+  正好落 `written=False`——**读不到就不覆盖**，杜绝「读不到 → 当空库 → 整体覆盖丢数据」。
+- 两处 `verify()`：`_read` 抛 `ReadError` → 返回
+  `(False, ["文件存在但不可读（权限/锁/编码）: ..."])`。
+
+### FIX (P0) — junklib.verify value 内嵌 TAB 字段错位漏网（junklib.py）
+- 结构扫描由「n==5/6 直接放行」收紧为：`n==6` 且第 6 段
+  `not in DELETE_WHEN_VALUES` → 追加「疑似 value 含 TAB 导致字段错位（第6段非合法
+  删除时机）」。拦住「value 内嵌 TAB 恰好凑成 6 字段、第 6 段被当 delete_when、
+  value 被静默截断」的漏网。
+
+### FIX (P1) — pwstats.verify 误伤修复 + 空密码（pwstats.py）
+- `n==3`（`count\tpassword\tdate`，缺来源列）判为**合法**并容忍（首字段非整数仍报）。
+- `n==4` 且第二字段为空 → 追加「空密码数据行（无密码可试）」。
+- `n==2` 或 `n>=5` → 「数据行字段数异常（n=%d，应为 1/3/4，疑似记录被合并/截断）」。
+- 降序校验改为**只对真实计数行**（`count > 0`）：裸密码（count=0，历史遗留形态）
+  不再掺进来误报「未按 count 降序」。
+
+### REFACTOR (P1) — 硬闸单入口 + 提示文案改准（pipeline.py）
+- 新增 `_preflight_gate_and_rc()`：返回 `0`=通过 / `2`=中止；`cmd_run` 与
+  `cmd_clean_junk` 的重复闸块统一替换为 `rc = _preflight_gate_and_rc(); if rc: return rc`。
+- 修复提示按库分开给准：密码库提示「结构损坏请手动编辑 `assets/passwords.learned.txt`
+  删除/拆分坏行，或备份后删除该文件让下次 run 重建；`pw-stats --rebuild` 仅按 DB 单调
+  校正 count，不修结构损坏」；垃圾库提示「`junk-stats --verify` 仅报告不修复；请手动编辑
+  或 `junk-learn --dry-run` 复核；清垃圾可加 `--no-learn` 仅删不学」——不再把 rebuild
+  当万灵药。
+
+### TEST (P0) — scripts/tests/test_run_preflight_gate.py（新增，锁接线）
+- 三司会审指出 v3.7.6 的硬闸**接线无测试锁**：闸是否真接在跑批/清垃圾路径、拦截时
+  是否真不跑批，全靠肉眼。本组用例锁死：
+  - `_preflight_gate_and_rc` 映射（坏 → 2 / 好 → 0）；
+  - `cmd_run` 坏库 → 2 且 **`Pipeline.run` 未被调用**；
+  - `cmd_clean_junk` 坏库 → 2。
+
+### HARDEN (P2) — 写盘兜底统一纯 LF（pwstats.py / junklib.py）
+- 两个 `_atomic_write` 落盘前
+  `text = text.replace("\r\n", "\n").replace("\r", "\n")`，写入侧不再可能产出 CRLF。
+
+### DOCS — v3.7.6 LESSON 措辞降级
+- 「铁律 / 禁止」降级为「卫生约定」，并注明「读时归一化（v3.7.5）已是 CRLF 的硬兜底，
+  本约定只为保证文件纯 LF、以免 doctor 念叨」。
+
+### TEST — 扩展 test_verify_loud.py（+4 例）
+- junk：value 内嵌 TAB 凑 6 字段（第 6 段非法 delete_when）→ 报「字段错位」。
+- pwstats：3 字段合法通过；4 字段空密码报「空密码」；裸密码 + 正常计数行不误报降序。
+
+## v3.7.6 (2026-09-17) — 自学习库「结构损坏即拒跑」fail-loud 硬闸
 
 **背景（jiqing77 事故后续反思）**：v3.7.5 只归一化了换行、止血了「静默吞条目」，
 但没解决更深的病灶——**解析器曾经静默失败**。一条被合并/截断的脏数据行，本该
@@ -30,14 +144,18 @@
   `pw-stats --rebuild` / `junk-stats --verify`（clean-junk 额外提示 `--no-learn` 仅删不学）。
 - `cmd_doctor` 新增 6.6) 步骤：复用同一道闸做非阻塞结构自检，计入 `problems`（exit 1）。
 
-### LESSON — 外挂脚本写 learned.txt 的铁律（ jiqing77 / 换行事故根因）
-- **任何外挂脚本写 `passwords.learned.txt` / `junk.learned.txt` 必须用
+### LESSON — 外挂脚本写 learned.txt 的卫生约定（ jiqing77 / 换行事故根因）
+- **建议外挂脚本写 `passwords.learned.txt` / `junk.learned.txt` 时用
   `open(path, "w"/"a", encoding="utf-8", newline="")`** 或走官方 CLI
-  （`add-password` / `junk-learn`）；**禁止裸 `open(path, "a")`**。
+  （`add-password` / `junk-learn`）；**避免裸 `open(path, "a")`**。
 - 裸文本模式在 Windows 默认把 `\n` 写成 `\r\n`（CRLF），会再次诱发 v3.7.5 的合并
   事故——一条 CRLF 行就让旧解析器把前面所有 LF 历史并成一整块、静默吞条目。
-- v3.7.6 起 run / clean-junk 会在库损坏时**硬闸中止**（fail loud），但「不写坏」
-  才是治本，CLI 与 `newline=""` 原子写是唯一受信任的写入路径。
+- **读时归一化（v3.7.5）已是 CRLF 的硬兜底**（无论 LF / CRLF / 混合都能正确切行），
+  本约定只为让文件保持**纯 LF**、以免 doctor 反复念叨「含 CRLF」——是「卫生约定」，
+  不是「否则必出事」。真正的写入侧兜底在 v3.7.7 落地：`_atomic_write` 落盘前统一把
+  CRLF / 裸 CR 归一成 LF。
+- v3.7.6 起 run / clean-junk 会在库损坏时**硬闸中止**（fail loud）；v3.7.7 起写入侧
+  也不再可能产出 CRLF。
 
 ### TEST — scripts/tests/test_verify_loud.py（新增，v3.7.6）
 - 6 个用例锁定 fail-loud 行为：pwstats 干净 4 字段通过、7 字段合并报错、2 字段报错；

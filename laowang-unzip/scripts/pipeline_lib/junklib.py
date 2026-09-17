@@ -117,13 +117,35 @@ def junklib_path(skill_root: Optional[str] = None) -> str:
     return os.path.join(base, "assets", "junk.learned.txt")
 
 
+class ReadError(IOError):
+    """文件存在但读不到（**权限 / 锁** 等 ``OSError``）。
+
+    v3.7.7：``_read`` 必须区分「文件不存在」（返回 ``None``，视作空库）与「文件
+    存在但读取失败」（抛 ``ReadError``）。旧实现把两者都吞成 ``None``，于是
+    「库存在却读不到」会被上层当成空库，随后 ``record`` 用空结构**整体覆盖**原
+    文件——静默丢数据。让异常向外传播，上层 ``try: parse_library() except
+    Exception`` 才能落 ``written=False``、保住原文件（读不到就不覆盖）。
+
+    v3.7.8：**编码错误不会**触发本异常——``_read`` 用 ``errors="ignore"`` 容忍
+    编码异常（读得到，只是个别坏字节被跳过）；只有 ``open``/``read`` 抛的
+    ``OSError``（权限被拒 / 文件被占用等）才抛 ``ReadError``。
+    """
+
+
 def _read(path: str) -> Optional[str]:
+    """读文本（utf-8-sig 容错、忽略编码错误、不翻译换行）。
+
+    文件**不存在** → ``None``（上层视作空库）；文件**存在但读取失败** → 抛
+    ``ReadError``（绝不静默把「读不到」当「空库」，以免后续整体覆盖丢数据）。
+    """
+    if not os.path.exists(path):
+        return None
     try:
         with open(path, "r", encoding="utf-8-sig", errors="ignore",
                   newline="") as fh:
             return fh.read()
-    except OSError:
-        return None
+    except OSError as exc:
+        raise ReadError("%s: %s" % (path, exc))
 
 
 def _is_comment_or_blank(line: str) -> bool:
@@ -207,6 +229,10 @@ def render_library(header: List[str], entries: List[Entry],
 
 
 def _atomic_write(path: str, text: str) -> bool:
+    # v3.7.7 写盘兜底：无论调用方传进来的是 LF / CRLF / 裸CR，落盘一律纯 LF。
+    # 读时归一化（v3.7.5）已是硬兜底，这里再加一道，保证本文件永不因写入侧产出
+    # CRLF 而触发 doctor 的「含 CRLF」念叨。
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
     tmp = path + ".tmp"
     try:
         d = os.path.dirname(path)
@@ -397,6 +423,12 @@ def record(kind: str, value: str, source: str = "",
     except Exception as exc:  # noqa: BLE001
         result["detail"] = "parse failed: %r" % exc
         return result
+    # v3.7.8 写前守卫：库结构损坏时拒绝改写（fail loud），文件一个字节都不动。
+    ok_lib, lib_problems = verify(result["path"])
+    if not ok_lib:
+        result["detail"] = ("自学习库结构损坏，拒绝写入（fail loud）: %s"
+                            % "; ".join(lib_problems[:3]))
+        return result
     if not header:
         header = list(_LIBRARY_HEADER)
 
@@ -487,6 +519,12 @@ def forget(kind: str, value: str, path: Optional[str] = None) -> dict:
     except Exception as exc:  # noqa: BLE001
         result["detail"] = "parse failed: %r" % exc
         return result
+    # v3.7.8 写前守卫：库结构损坏时拒绝改写（fail loud），文件一个字节都不动。
+    ok_lib, lib_problems = verify(target)
+    if not ok_lib:
+        result["detail"] = ("自学习库结构损坏，拒绝写入（fail loud）: %s"
+                            % "; ".join(lib_problems[:3]))
+        return result
     result["total_before"] = len(entries)
     kept = [e for e in entries if not (e.kind == kind_l and e.value == val)]
     result["removed"] = len(entries) - len(kept)
@@ -539,7 +577,12 @@ def verify(path: Optional[str] = None,
     allowed = kinds or C.JUNK_LIBRARY_KINDS
     problems: List[str] = []
     target = path or junklib_path()
-    raw = _read(target)
+    try:
+        raw = _read(target)
+    except ReadError as exc:
+        # v3.7.7：文件存在但读不到 → 视为「不健康」并拒跑（fail loud），绝不
+        # 当成空库放过（否则 run/clean-junk 会照着空库把数据学到坏文件上）。
+        return False, ["文件存在但不可读（权限/锁）: %s" % exc]
     if raw is None:
         return True, []            # 还没建库 = 健康
 
@@ -563,6 +606,12 @@ def verify(path: Optional[str] = None,
                             % (_n, _line[:60]))
         elif not _parts[0].strip().isdigit():
             problems.append("数据行计数非整数: %s" % _line[:60])
+        elif _n == 6 and _parts[5].strip() not in DELETE_WHEN_VALUES:
+            # v3.7.7：value 内嵌一个 TAB，恰好把 5 字段行凑成 6 字段——第 6 段就
+            # 被误当 delete_when，value 被静默截断。第 6 段非合法删除时机即判
+            # 「字段错位」，拦住这种漏网（旧逻辑对 n==6 直接放行）。
+            problems.append("疑似 value 含 TAB 导致字段错位（第6段非合法删除时机）: %s"
+                            % _line[:60])
 
     entries = read_entries(target)
     seen = set()
