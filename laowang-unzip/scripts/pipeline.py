@@ -45,6 +45,7 @@ import os
 import re
 import shutil
 import sys
+from typing import List, Tuple
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -549,7 +550,10 @@ def cmd_add_password(args) -> int:
             with open(lib_path, "rb") as fh:
                 fh.seek(-1, os.SEEK_END)
                 needs_newline = fh.read(1) != b"\n"
-        with open(lib_path, "a", encoding="utf-8") as fh:
+        # v3.7.8 (P1-②)：加 newline=""，杜绝 Windows 文本模式把 \n 写成
+        # \r\n（与 v3.7.5 事故同源；虽是 passwords.local.txt 非 learned 库，
+        # 同源坑一并堵）。
+        with open(lib_path, "a", encoding="utf-8", newline="") as fh:
             if needs_newline:
                 fh.write("\n")
             fh.write(args.password + "\n")
@@ -717,41 +721,64 @@ def cmd_collect(args) -> int:
         db.close()
 
 
-def _preflight_learned_libs() -> List[str]:
-    """v3.7.6 fail-loud 硬闸：跑批/清垃圾前校验两个自学习库结构完整。
+def _preflight_learned_libs(which: Tuple[str, ...] = ("junk", "pw")) -> List[str]:
+    """v3.7.6 fail-loud 硬闸（v3.7.8 按库参数化）：校验 ``which`` 点名的自学习库。
 
-    返回非空 list = 有损坏，调用方应中止并提示修复。绝不抛。
+    ``which`` 取 ``"junk"`` / ``"pw"`` 的子集（默认两库都查）。返回非空 list = 有
+    损坏，调用方应中止并提示修复。绝不抛。
     """
     problems: List[str] = []
-    try:
-        ok_j, pj = junklib_mod.verify()
-    except Exception as exc:  # noqa: BLE001
-        ok_j, pj = False, ["junk.learned.txt 自检异常: %r" % exc]
-    if not ok_j:
-        problems.append("[junk.learned.txt] " + ("; ".join(pj) or "结构异常"))
-    try:
-        ok_p, pp = pwstats_mod.verify()
-    except Exception as exc:  # noqa: BLE001
-        ok_p, pp = False, ["passwords.learned.txt 自检异常: %r" % exc]
-    if not ok_p:
-        problems.append("[passwords.learned.txt] " + ("; ".join(pp) or "结构异常"))
+    if "junk" in which:
+        try:
+            ok_j, pj = junklib_mod.verify()
+        except Exception as exc:  # noqa: BLE001
+            ok_j, pj = False, ["junk.learned.txt 自检异常: %r" % exc]
+        if not ok_j:
+            problems.append("[junk.learned.txt] " + ("; ".join(pj) or "结构异常"))
+    if "pw" in which:
+        try:
+            ok_p, pp = pwstats_mod.verify()
+        except Exception as exc:  # noqa: BLE001
+            ok_p, pp = False, ["passwords.learned.txt 自检异常: %r" % exc]
+        if not ok_p:
+            problems.append("[passwords.learned.txt] " + ("; ".join(pp) or "结构异常"))
     return problems
+
+
+def _preflight_gate_and_rc(which: Tuple[str, ...] = ("junk", "pw")) -> int:
+    """v3.7.6 fail-loud 硬闸（v3.7.7 单入口；v3.7.8 按库参数化）。
+
+    返回 ``0``=通过，``2``=中止。只校验 ``which`` 点名的库，修复指引也**只打印相关
+    库**那几行。调用方（``cmd_run`` / ``cmd_clean_junk`` / ``cmd_retry_failed`` /
+    ``cmd_pw_stats --rebuild`` / ``cmd_junk_stats --forget`` / ``cmd_junk_learn``）
+    据此拒跑——避免静默把数据学到坏文件里 / 静默丢数据。
+    """
+    probs = _preflight_learned_libs(which)
+    if not probs:
+        return 0
+    warn("⚠ 自学习库自检未通过，本次操作中止（fail loud，不静默跑）：")
+    for gp in probs:
+        warn("   - %s" % gp)
+    if "pw" in which:
+        warn("⚠ 修复密码库：结构损坏（字段数异常/合并/截断）请手动编辑 "
+             "assets/passwords.learned.txt 删除/拆分坏行，或备份后删除该文件让下次 "
+             "run 重建；`pw-stats --rebuild` 仅按 DB 单调校正 count，不修结构损坏。")
+    if "junk" in which:
+        warn("⚠ 修复垃圾库：junk-stats --verify 仅报告不修复；请手动编辑 "
+             "assets/junk.learned.txt 删除坏行，或 junk-learn --dry-run 复核；"
+             "清垃圾可加 --no-learn 仅删不学。")
+    return 2
 
 
 def cmd_run(args) -> int:
     cfg = build_config(args)
     pipe = Pipeline(cfg)
-    # v3.7.6 · fail-loud 硬闸：跑批前先校验两个自学习库结构完整，
-    # 损坏则中止并提示修复，避免静默把数据学到坏文件里 / 静默丢数据。
-    gate = _preflight_learned_libs()
-    if gate:
-        warn("⚠ 自学习库自检未通过，本批中止（fail loud，不静默跑）：")
-        for gp in gate:
-            warn("   - %s" % gp)
-        warn("⚠ 修复密码库：python pipeline.py pw-stats --rebuild")
-        warn("⚠ 修复垃圾库：python pipeline.py junk-stats --verify "
-             "（按提示 junk-learn --dry-run / forget；清垃圾可加 --no-learn 仅删不学）")
-        return 2
+    # v3.7.7 · fail-loud 硬闸（v3.7.6 抽成单入口 _preflight_gate_and_rc）：跑批前
+    # 先校验两个自学习库结构完整，损坏即中止并提示修复，避免静默把数据学到坏文件
+    # 里 / 静默丢数据。
+    rc = _preflight_gate_and_rc()
+    if rc:
+        return rc
     summary = pipe.run()
     print("batch %s finished in %ds (sweeps: %d)" %
           (summary["batch"], summary["seconds"], summary["sweep_rounds"]))
@@ -971,17 +998,11 @@ def cmd_resolve_dup(args) -> int:
 def cmd_clean_junk(args) -> int:
     cfg, db = _open_db(args)
     learned = 0
-    # v3.7.6 · fail-loud 硬闸：清垃圾也会写 junk.learned.txt（learn_this），
-    # 库损坏则中止并提示修复，避免静默把脏数据学到坏文件里。
-    gate = _preflight_learned_libs()
-    if gate:
-        warn("⚠ 自学习库自检未通过，本批中止（fail loud，不静默跑）：")
-        for gp in gate:
-            warn("   - %s" % gp)
-        warn("⚠ 修复密码库：python pipeline.py pw-stats --rebuild")
-        warn("⚠ 修复垃圾库：python pipeline.py junk-stats --verify "
-             "（按提示 junk-learn --dry-run / forget；清垃圾可加 --no-learn 仅删不学）")
-        return 2
+    # v3.7.7 · fail-loud 硬闸（单入口）：清垃圾也会写 junk.learned.txt
+    # （learn_this），库损坏则中止并提示修复，避免静默把脏数据学到坏文件里。
+    rc = _preflight_gate_and_rc()
+    if rc:
+        return rc
     try:
         where = "WHERE status='JUNK_PENDING'" + (" AND batch=?" if args.batch else "")
         params = (args.batch,) if args.batch else ()
@@ -1117,6 +1138,11 @@ def cmd_junk_stats(args) -> int:
             print("--forget expects KIND:VALUE — e.g. "
                   "--forget name:最新地址.txt  /  --forget hash:<md5>")
             return 2
+        # v3.7.8 fail-loud 硬闸（E）：--forget 会写垃圾库；写前校验结构，损坏即中止。
+        # 只读路径（默认 / --verify / --json）一律**不接闸**（坏库也要能出诊断）。
+        rc = _preflight_gate_and_rc(("junk",))
+        if rc:
+            return rc
         res = junklib_mod.forget(kind, value)
         if res["removed"]:
             print("forgot %s=%s  (%d -> %d entries)"
@@ -1206,6 +1232,12 @@ def cmd_junk_learn(args) -> int:
         print("\ndry run: nothing written.")
         return 0
 
+    # v3.7.8 fail-loud 硬闸（E）：真正落库前校验垃圾库结构，损坏即中止。--dry-run 是
+    # 复核工具、不写盘，故**不接闸**。
+    rc = _preflight_gate_and_rc(("junk",))
+    if rc:
+        return rc
+
     recorded = 0
     for kind, value in plan:
         rec = junklib_mod.record(kind, value, source="MANUAL")
@@ -1270,6 +1302,11 @@ def cmd_prune_empty(args) -> int:
 
 
 def cmd_retry_failed(args) -> int:
+    # v3.7.8 fail-loud 硬闸（E）：retry-failed 是跑批变体，会经 pipe.run() 调
+    # record_success 写密码库；写前先校验密码库结构，损坏即中止（绝不静默丢数据）。
+    rc = _preflight_gate_and_rc(("pw",))
+    if rc:
+        return rc
     cfg = build_config(args)
     db = Database(cfg.db_path)
     try:
@@ -1564,6 +1601,12 @@ def cmd_pw_stats(args) -> int:
 
     rebuild_result = None
     if getattr(args, "rebuild", False):
+        # v3.7.8 fail-loud 硬闸（E）：--rebuild 会写密码库；写前校验结构，损坏即中止。
+        # **只读路径（--verify / 默认 / 无 --rebuild 的 --json）一律不接闸**——坏库上
+        # `--verify` 必须仍能跑出诊断。
+        rc = _preflight_gate_and_rc(("pw",))
+        if rc:
+            return rc
         db_counts = _readonly_db_counts(root)
         rebuild_result = pwstats_mod.rebuild_counts(learned, db_counts)
         if not getattr(args, "json", False) and not getattr(args, "verify", False):
