@@ -187,18 +187,39 @@
 - 指纹：archive_corrupt
 - 复现：4 次
 
-### [LES-20260916-01] bug P0 open
+### [LES-20260916-01] bug P2 resolved（重复草稿：与同 ID 已结案条目同根因）
 - 现象：自动采集：本批出现 ARCHIVE_CORRUPT ×4 次
-- 根因：待定位（机器草稿，需人工/助手补写）
-- 处置：待办（机器草稿）
-- 关联：ARCHIVE_CORRUPT
+- 根因：与同 ID 已结案条目同根因——carve 残骸尾部截断导致的 ARCHIVE_CORRUPT（真损坏，非管线 bug）；该域判据早已见 pitfalls #51 与 v3.7.2 分卷守卫，本草稿无新增信息。
+- 处置：结案（resolved）。本条系机器按批聚合出的**重复草稿**（occ=17 为同指纹跨批累计），承已结案条目定级 P2（不丢用户数据、不整批失败），不再新建判据。⚠ 附注：本条与人工结案条目**撞号**（同为 LES-20260916-01），编号唯一性问题已另案登记。
+- 关联：pitfalls #51；v3.7.2 分卷守卫；同 ID 已结案条目（本文件上文 [LES-20260916-01] data P2 resolved）
 - 指纹：archive_corrupt
 - 复现：17 次
 
-### [LES-20260916-02] ops P2 open
-- 现象：自动采集：本批出现 UNKNOWN_BINARY ×6 次（待判：需人工确认类型）
-- 根因：待判：需人工确认是未知私有格式还是真问题（非必然代码缺陷）
-- 处置：待办：人工确认类型后再决定是否建正式判据（机器草稿）
-- 关联：UNKNOWN_BINARY
+### [LES-20260916-02] ops P2 resolved（正常终态：UNKNOWN_BINARY = 识别不出的成品内容，SKIP 保守正确）
+- 现象：自动采集：本批出现 UNKNOWN_BINARY ×6 次（待判：需人工确认类型）。**人工确认已完成**：全库抽检 624 条 UNKNOWN_BINARY，全部是 APK 解包后的内部成品（res/*.xml、classes.dex、*.kotlin_builtins、AndroidManifest.xml）与非压缩包内容（.mp4、废文件.bin）——即「本来就不是压缩包」。
+- 根因：**非缺陷**。UNKNOWN_BINARY = 整文件扫不到任何已知签名（failure-matrix #5）；对「筛压缩包」的流水线而言它就是「不是压缩包」的正常终态，SKIP 属保守正确行为。
+- 处置：结案（resolved）。判据早已存在（failure-matrix #5 + config.py FAIL_UNKNOWN_BINARY），且同指纹、同数量（×6）的案子此前已结案（LES-20260915-10）。**不提升、不新建判据**；若日后要降低草稿噪音，另案讨论是否把 UNKNOWN_BINARY 移出 evolve 的 JUDGEMENT 档。
+- 关联：failure-matrix #5；LES-20260915-10；evolve.py JUDGEMENT_FAIL_REASONS
 - 指纹：unknown_binary
 - 复现：6 次
+
+### [LES-20260917-01] bug P1 open
+- 现象：自学习库被静默改写：库结构已损坏（合并/错位坏行）时，未被 run/clean-junk 闸覆盖的写入口（retry-failed / pw-stats --rebuild / junk-learn / junk-stats --forget）仍会照常写回，把坏行里的数据段静默吞掉。QA 最小复现：合并行 5\tpw1\t…\t9\tpw2\t… 经 record_success 写回后 pw2 消失。
+- 根因：fail-loud 只接在「入口」（run/clean-junk），闸与写手不是一一对应；写库函数本身没有写前自检，任何遗漏或新增的入口都绕过闸。典型「只在入口接闸 = 打地鼠」。
+- 处置：v3.7.8 把守卫下沉到写函数本身：record_success/rebuild_counts/record/forget 写盘前先 verify()，库损坏即 written=False 并直接 return（文件字节不动）；_preflight_learned_libs/_preflight_gate_and_rc 加 which 参数并补接 4 个入口，只读诊断路径（pw-stats --verify、junk-stats 默认/--json、junk-learn --dry-run）刻意不接闸。test_write_guard.py 锁死「坏库字节不变 + 健康库照常写」。
+- 关联：LES-20260917-02（同族：静默失败）；v3.7.8；pitfalls #50（判据/终态治理）
+- 复现：1 次
+
+### [LES-20260917-02] bug P1 open（第二方复核：P0 降为 P1）
+- 现象：自学习库可能被整体覆盖清空：_read 把「文件存在但读不到」（权限/锁，本工作区在网盘同步盘上尤其现实）与「文件不存在」都返回 None；上层把 None 当空库，随后 record_success/record 用空结构 render 并整体写回，整库被静默清空。
+- 根因：读失败的语义被降级成「不存在」，错误被 except 吞掉；写路径没有区分「真无库」与「读不到」。
+- 处置：v3.7.7 两模块新增 ReadError(IOError)；_read 仅在 os.path.exists 为假时返回 None，open 抛 OSError 时抛 ReadError；parse_learned/parse_library 让它向外传播，record_success/rebuild_counts/record/forget 落 written=False 而不覆盖；verify() 捕 ReadError 返回 (False, [...])。独立复现（用目录冒充库路径）确认：parse 抛错、写入被拒、文件字节不动。 第二方复核（QA，SKILL.md §3.2 硬约束②）**反对 P0**：影响面虽为整库静默清空，但属潜在、从未实际发生（复现 1 次系单元复现而非现场事故）、且可恢复——passwords 可经 pw-stats --rebuild 从只读 DB 重建，junk 库丢失属 fail-safe。援引本项目先例（LES-20260916-01 因「不丢用户数据、不整批失败」由 P0 主动降 P2）。据此**降为 P1、保持 open 待 occ≥2**；若要把「读失败≠空库」这一通用反模式写进 pitfalls，须按硬约束① **破格提升**并在条目内写明破格理由。
+- 关联：LES-20260917-01（同族：静默失败）；v3.7.7
+- 复现：1 次
+
+### [LES-20260917-03] ops P2 open
+- 现象：机器草稿与人工条目标识撞号：references/lessons.md 中同时存在两条 [LES-20260916-01]——一条人工结案（data P2 resolved，carve 残骸真截断），一条机器草稿（bug P0 open，ARCHIVE_CORRUPT ×4）。同一 ID 指向两条不同条目，教训库标识不可追溯。
+- 根因：evolve 生成机器草稿编号 LES-YYYYMMDD-NN 时按当日序号自增，未校验该 ID 是否已被人工写入的条目占用；人工按批补写与机器按指纹聚合落草稿是两条独立编号路径，缺全局唯一性校验。
+- 处置：待修（本条只登记不修）：生成草稿编号前扫描 lessons.md + lessons-archive.md 已用 ID 并跳过占用号，并补测试锁「ID 全局唯一」。本轮已手工把撞号的机器草稿判为 resolved（重复）并在条目内加附注，避免继续误导。
+- 关联：
+- 复现：1 次
