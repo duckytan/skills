@@ -2275,6 +2275,43 @@ class Pipeline:
                     paths.append(rp)
                     rows.append(m)
 
+        # §fix(b): disk-truth sibling-volume scan (补充 §4.1 的 DB 分组删卷).
+        # The DB-group delete above can miss a secondary whose row is absent or
+        # misgrouped (the real-world orphan case: .002 / .part2 / .z02 left
+        # behind after the primary .001 / .part1 / .z01 is deleted).  Re-scan
+        # the source directory on DISK and collect every genuine volume PART of
+        # the same set, so a secondary is never left behind just because its
+        # DB row is missing or wrong.  Additive only — it only ADDS same-set
+        # secondaries to the delete list; the normal probe/guard machinery in
+        # _delete_one below still governs each removal.
+        if row["volume_group"]:
+            base_group = row["volume_group"]
+            d = os.path.dirname(target_path)
+            for s in fsutil.list_top_level(d):
+                if fsutil.isdir(s):
+                    continue  # never delete directories, only files
+                name = os.path.basename(s)
+                role, g = header.volume_info(name)
+                if role == "NONE":
+                    continue  # plain archive, not a volume part — never touch
+                if g != base_group:
+                    continue
+                if s in paths or not fsutil.exists(s):
+                    continue
+                if not self._delete_allowed(s):
+                    continue  # never widen the source-root guard
+                r = self.db.get_by_path(s)
+                if r is None:
+                    # Synthetic row: file was never in the DB (grouping miss).
+                    # _delete_one can still probe/delete it; with id=None there
+                    # is no audit row to update — acceptable.  size_bytes defaults
+                    # to 0 so the batch byte-counter stays correct on the
+                    # permanent-delete route (bump_batch reads row["size_bytes"]).
+                    r = {"id": None, "source_deleted": 0, "path": s,
+                         "file_name": name, "size_bytes": 0}
+                paths.append(s)
+                rows.append(r)
+
         # §fix①: also delete carved/repair artifacts (REPAIR_ORIGINS descendants)
         # together with their source.  This is what closes the ~7.4GB leftover
         # gap — carved .7z/.rar/.zip were never collected for deletion before.

@@ -156,3 +156,42 @@
 - 指纹：unknown_binary
 - 复现：11 次
 
+### [LES-20260917-04] ops P2 resolved（判定为重复：与 LES-20260916-02 同指纹 unknown_binary；本批 9 例全属正常终态）
+- 现象：本批 9 例 UNKNOWN_BINARY，类型探测判不出 real_type，终态**全部是 SKIPPED**（原文件保留，无数据丢失、不整批失败）。其中 5 例是**分卷第二片**（风景.7z.002 ×3、MLGM.7z.002、mxnxbjx0915.002，其 .001 已被消费），4 例是解压树内的 mp4 内容（（T179）古代史1_carved\…\真的她 (4)-(7).mp4）。
+- 根因：不是代码缺陷。UNKNOWN_BINARY 是「类型探测判不了」的诚实标号，终态为 SKIPPED（保留）。与 LES-20260916-02（已结案：unknown_binary = 正常终态）属同一形态。
+- 处置：结案（resolved），判定为重复。**附（新缺陷，已另立登记）**：evolve 的分类器只把 NOT_ARCHIVE 放进「正常终态（不建草稿）」表，UNKNOWN_BINARY 仍在「真失败（值得建教训）」表里，于是每批都会重新起草噪声草稿——分类器的良性终态表与已结案教训没有联动。
+- 关联：LES-20260916-02（同指纹）；NOT_ARCHIVE（同属正常终态）
+- 指纹：unknown_binary
+- 复现：9 次
+
+### [LES-20260917-05] bug P2 resolved（判定为重复：与 LES-20260916-01 同指纹 archive_corrupt；定级修正 P0→P2）
+- 现象：本批 5 例 ARCHIVE_CORRUPT，**全部 rc=None（解压前即失败）**、real_type=ZIP、文件名均为 `*_carved.zip`：8完结  P52-8.4 恒定磁场…_carved.zip（119.85MB）、1-3  P53-8.5 带电粒子…_carved.zip（953.52MB）、杨幂-…服装诱惑_carved.zip（29.80MB）、真人奴可梦训练大师_第6集_carved.zip（22.31MB）、[AI短剧] 天魔种…第1集_carved.zip（210.53MB）。
+- 根因：carve（从 mp4 里按魔数抠出来的）残骸尾部边界不准 → 中央目录截断，**数据本身残缺，非管线 bug**。用项目标准手段 7z t 一锤定音（#18315）：`Open ERROR: Cannot open the file as [zip] archive` + `Is not archive` + `Headers Error`，与 LES-20260916-01 的判据（分卷三判据全不中 + Headers Error）逐字一致。
+- 处置：结案（resolved），判定为重复。**定级修正 P0→P2**：机器草稿自动标 P0 属**定级虚高**——单文件损坏、不丢用户数据、不整批失败；依据本项目定级先例（LES-20260916-01 由 P0 主动降 P2）。**附（新缺陷，已另立登记）**：evolve 对「指纹已结案」的形态仍会重新起草新草稿并自动标 P0，从而**虚假触发提升阈值**（本次就撞了 `evolve --check` 的闸口）。
+- 关联：LES-20260916-01（同指纹）；pitfalls #51；v3.7.2 分卷守卫
+- 指纹：archive_corrupt
+- 复现：5 次
+
+### [LES-20260917-06] bug P1 promoted（破格提升：数据丢失向量 + 判据可泛化；经第二方 QA 变异验证）
+- 现象：崩溃（或强杀 / 断电）撞在「解压器已返回、但 extract_rc 尚未回写」的窗口时，重启后的 _recover_states 会把该行按磁盘启发式（输出目录有非压缩内容且无 0 字节文件）提升为 EXTRACTED；随后 _is_fully_done 在 non_archive>0 分支用 all(k in TERMINAL for k in kids)，零子件时 all([])==True → 判「已完成」→ 删掉源包，只留半成品。历史触发 0 次，但链路可达。
+- 根因：两层判据都不可靠——① 用「磁盘长什么样」代替「执行者自己怎么说」：7z 先分配后写入，半成品尺寸非 0 使启发式成立；② 空集合的真空真值 all([])==True 被当成「子件全终态」。
+- 处置：v3.7.9 双修——提升只认 row["extract_rc"] == 0（NULL = 中途崩溃，一律回退 QUEUED），磁盘事实降为辅助记录；_is_fully_done 的 non_archive>0 分支加 len(kids)>0。QA 变异测试证明：把第一处换回旧启发式，test_1 立刻复现「源包被删」→ 第一处是唯一承重防线，两处缺一不可。规则已提升进 pitfalls #54。
+- 关联：pitfalls #54；LES-20260909-11 ①（不留永久搁浅行）；v3.7.9；tests/test_crash_recover_guard.py
+- 指纹：崩溃把没解完误判成已解完进而删掉源包磁盘启发式七z先分配后写入空集合真空真值allemptytrue
+- 复现：1 次
+
+### [LES-20260917-07] bug P1 promoted（破格提升：与 06 同族且造成永久搁浅；经第二方 QA 验证）
+- 现象：① 被 _recover_states 提升出的 EXTRACTED 行永久搁浅：EXTRACTED 不在 OPEN_STATES，唯一入队路径是显式 initial_ids，常规扫描只收 {DISCOVERED,QUEUED} → 恢复行永远不会再被捡起，_resume_extracted 永不执行 → 行停 EXTRACTED、源包永久留盘。② 更深一层：重启时 _resweep 递归扫源根（输出目录在源根之下），产物先被登记成「无父根行」(origin=DOWNLOAD,depth=0)，而 upsert_file 冲突时保留 lineage → _upsert_child 永远认领不到 → 父行零子件 → 依旧搁浅。
+- 根因：状态机的「可再次被处理」集合与恢复提升的目标状态不交集（提升到一个没人收的状态）；以及「谁是谁的子件」靠调用点自觉（隐式契约），缺少可校验的路径 / 命名断言。
+- 处置：v3.7.9 三段收口——① rc==0 提升后入队，交 _resume_extracted 收口；② _upsert_child 收养无父根行；③ 收养判据收成断言：路径须落在父行 extract_output_dir 之下（commonpath 逐段比较，禁裸 startswith）或与 dir_path 同级且名字以父行 stem 开头（对应 repair_artifacts 四命名）。已知边界：A.mp4 vs AB_carved.zip 会假命中（裸前缀固有），经复核生产不可达，test_9 如实钉住。规则进 pitfalls #54。
+- 关联：LES-20260917-06（同族：判据不可靠）；pitfalls #54 / #55；v3.7.9；tests/test_upsert_child_adopt.py、tests/test_crash_recover_guard.py
+- 指纹：extracted行永久搁浅不在openstates无入队路径resweep递归扫源根产物先登记为无父根行upsert保留lineage收养认领不到
+- 复现：1 次
+
+### [LES-20260918-01] bug P1 promoted（已修复 + 已补判据进 pitfalls #56；经第二方 QA 变异验证）
+- 现象：批次归集进 【done】\<date> 之后，clean-junk / resolve-dup 对已归集文件一律拒绝删除：每行只打印一行 delete refused (outside source root or protected)，退出码仍然 0 → 收尾清理静默失效、报告「待清理」那一节永远清不掉。本机实际滞留 6 天，由用户一句「你是不是忘了清理垃圾这个环节？」问出来——当时 3 个 junk_*.dat 全部未删、DB 里 status 仍是 JUNK_PENDING。
+- 根因：两个清理子命令的删除守卫用 cfg.src_dir，其来源是 --src > config.local.json 的 "src" > <root>/【new】；而 clean-junk / resolve-dup 根本没有 --src 参数，于是完全依赖那个会漂移的全局值——本机 config.local.json 的 src 停在上一批 【done】\2026-09-11，当前批次的文件却在 【done】\2026-09-17，于是全部落在守卫范围外。更深一层：批次自身的位置早就被记录在 batches.root_dir（db.begin_batch(cfg.batch, cfg.src_dir) 写入），收尾清理却从不去读它。拒绝形态本身也不合格——按行打印 + 退出码不变，脚本只看 rc 就会判「清理成功」。
+- 处置：v3.7.10 追加式修复（绝不放宽保护）：新增 scheduler.batch_guard_roots()（只接受合法批次容器——<root>/【new】 本身，或 <root>/【done】 之下的严格子孙，用 os.path.commonpath 逐段判定而非裸 startswith，故 【done】2 不会假命中；<root>、【done】 本身、<root>/pipeline 一律拒）+ delete_allowed_any() 多根判定 + db.batch_root() 读取器；clean-junk / resolve-dup 的守卫根改为 [cfg.src_dir] + 该行自己批次的记录根，多批次时逐行取根、不共用缓存；两个子命令补上 --src；拒绝信息改为指名「用了哪些守卫根」+ 给 --src 提示 + 末尾汇总拒绝条数（退出码语义不变）。delete_allowed() 一字未改。新增 tests/test_cleanup_guard_roots.py 18 例（含 8 例陈旧 src + 多批次端到端），全量 485 例全绿；QA 变异验证逐条回退都能让对应用例变红，其中「冻结每批缓存」一处暴露覆盖缺口、返工补出 test_8。规则进 pitfalls #56。
+- 关联：pitfalls #56；LES-20260917-06 / 07（同族：判据或守卫不可靠、失败还静默）；v3.7.10；tests/test_cleanup_guard_roots.py；config.local.json 的 src 漂移
+- 指纹：批次归集进donedate之后cleanjunkresolvedup对已归集文件一律拒绝删除每行只打印一行deleterefusedoutsidesourcer
+- 复现：1 次
