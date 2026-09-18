@@ -242,11 +242,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_add_password)
 
     p = sub.add_parser("collect",
-                       help="gather finished leaf content files into "
-                            "<root>/成品/<batch>/ (move by default)")
+                       help="verify finished leaf content files; products "
+                            "stay in 【done】 by default (no 成品 folder)")
     add_common(p)
     p.add_argument("--dest", default=None,
-                   help="collection root (default: <root>/成品)")
+                   help="explicit relocation target (opt-in). When omitted, "
+                        "collect does NOT move anything — products stay where "
+                        "extraction left them (in 【done】/<batch>)")
     p.add_argument("--batch", default=None,
                    help="limit to one batch YYYY-MM-DD (default: all batches)")
     p.add_argument("--copy", action="store_true",
@@ -607,16 +609,22 @@ def cmd_add_password(args) -> int:
 
 
 def cmd_collect(args) -> int:
-    """Gather finished leaf content files into ``<root>/成品/<batch>/…``.
+    """Verify finished leaf content files; relocation is opt-in (``--dest``).
 
-    Scope: DB rows that are non-archive leaf content (nothing references
-    them as parent), not junk-flagged, not themselves an extraction output
-    dir, and still on disk.  Batch-relative directory structure is kept
-    (paths are laid out relative to the working root).  Cross-batch hash
-    duplicates are skipped and listed (resolve-dup decides).  Default is
-    move (same-drive rename; cross-drive refused exit 2 like stage);
-    ``--copy`` copies instead.  Every transfer updates the DB path and is
-    audited as action=COLLECT.  Never overwrites (``_1``/``_2`` suffixes).
+    Project convention: all finished products live under
+    ``<root>/【done】/<batch>`` and there is NO separate ``成品`` tree.  The
+    user explicitly rejected the auto-created ``成品`` folder, so **by default
+    collect does NOT move or copy anything** — it only selects the leaf
+    content rows, reports them, and lists cross-batch hash duplicates for
+    resolve-dup to decide.  Products stay exactly where extraction left them.
+
+    The legacy relocation (move/copy into a target tree + DB path sync +
+    COLLECT audit) is kept ONLY when ``--dest`` is explicitly supplied.  This
+    is an opt-in escape hatch and must never be the default.
+
+    Selected rows: non-archive leaf content (no other row references them as
+    parent), not junk-flagged, not themselves an extraction output dir, and
+    still on disk.  Cross-batch hash duplicates are reported and skipped.
     """
     root, _local = resolve_root(args)
     db = Database(os.path.join(root, C.PIPELINE_DIRNAME, C.DB_DIRNAME,
@@ -656,8 +664,7 @@ def cmd_collect(args) -> int:
                 seen_hash[key] = row
             selected.append(row)
 
-        dest_root = os.path.abspath(args.dest or
-                                    os.path.join(root, C.COLLECTION_DIRNAME))
+        explicit_dest = bool(getattr(args, "dest", None))
         if not selected:
             print("无可归集成品（范围内没有叶子内容文件）。")
             for row, first in dup_skipped:
@@ -665,6 +672,21 @@ def cmd_collect(args) -> int:
                       % (row["id"], row["path"], first["id"]))
             return 0
 
+        # ---- default (no --dest): in-place, NO relocation, NO 成品 folder ----
+        if not explicit_dest:
+            verb = "would keep" if args.dry_run else "保留原位"
+            for row in selected:
+                print("  #%d %s (%s)" % (row["id"], row["path"], verb))
+            print("collect 默认不再搬运成品：%d 个叶子成品保持【done】原位，"
+                  "%d 个跨批次重复已跳过（resolve-dup 决定）。"
+                  % (len(selected), len(dup_skipped)))
+            for row, first in dup_skipped:
+                print("  dup skipped: #%d %s (same hash as #%d)"
+                      % (row["id"], row["path"], first["id"]))
+            return 0
+
+        # ---- explicit --dest: legacy relocation (opt-in only) ----
+        dest_root = os.path.abspath(args.dest)
         # containment guard: dest must not nest with any source dir
         for row in selected:
             if row["dir_path"] and (

@@ -146,7 +146,7 @@ IDLE_SWEEPS_TO_END = 2
 # ---------------------------------------------------------------------------
 SPACE_FACTOR = 1.5
 SPACE_RESERVE_BYTES = 6 * 1024 ** 3      # 6 GiB
-MIN_FREE_BYTES = 20 * 1024 ** 3          # hard abort floor: 20 GiB
+MIN_FREE_BYTES = 20 * 1024 ** 3          # restored to default after batch 2026-09-18
 
 # ---------------------------------------------------------------------------
 # Recycle-bin purge defaults (§4.3 / §11).  Only entries produced by this

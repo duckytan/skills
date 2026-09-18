@@ -1,9 +1,16 @@
 # -*- coding: utf-8 -*-
-"""Unit tests for `collect` (成品归集: leaf content -> <root>/成品/<batch>/).
+"""Unit tests for `collect`.
 
-Covers: move + DB path sync + COLLECT audit; junk/archive/parent/output-dir
-exclusions; cross-batch hash duplicate skipping; dry-run no-op; --copy;
-cross-drive refusal (mocked, nothing moves).
+NEW behavior (project convention: no 成品 folder):
+  * Default (no --dest): collect does NOT move/copy anything.  Products stay
+    where extraction left them (inside 【done】/<batch>).  No 成品 tree is
+    created and no COLLECT event is emitted for the in-place pass.
+  * Explicit --dest: legacy relocation (move/copy + DB path sync + COLLECT
+    audit) is preserved as an opt-in escape hatch.
+
+Covers: default in-place (no relocation, exclusions, hash-dup skip, dry-run);
+explicit --dest relocation + DB sync + COLLECT audit; cross-drive refusal
+(mocked, nothing moves).
 
 Run:  python -m unittest tests.test_collect -v   (from scripts/)
 """
@@ -62,6 +69,7 @@ class CollectTests(unittest.TestCase):
         return fid
 
     def _dest(self):
+        # legacy constant — only relevant if someone passes it explicitly
         return os.path.join(self.root, C.COLLECTION_DIRNAME)
 
     def _events(self, fid):
@@ -70,21 +78,18 @@ class CollectTests(unittest.TestCase):
             (fid, C.ACTION_COLLECT)).fetchall()
 
     # ------------------------------------------------------------------
-    def test_1_move_leaf_with_db_sync_and_audit(self):
+    def test_1_default_in_place_keeps_products(self):
         fid = self._seed("剧/名.txt", batch=B1)
         rc = pipeline.cmd_collect(_mk_args(self.root))
         self.assertEqual(rc, 0)
-        new_path = os.path.join(self._dest(), B1, C.DEFAULT_SRC_DIRNAME,
-                                "剧", "名.txt")
-        self.assertTrue(os.path.isfile(new_path))
-        self.assertFalse(os.path.exists(os.path.join(self.src, "剧", "名.txt")))
+        # file stays exactly where it was; no 成品 tree; no COLLECT event
+        self.assertTrue(os.path.isfile(os.path.join(self.src, "剧", "名.txt")))
+        self.assertFalse(os.path.exists(self._dest()))
         row = self.db.get(fid)
-        self.assertEqual(row["path"], new_path)
-        self.assertEqual(os.path.dirname(row["path"]),
-                         row["dir_path"])
-        self.assertEqual(len(self._events(fid)), 1)
+        self.assertEqual(row["path"], os.path.join(self.src, "剧", "名.txt"))
+        self.assertEqual(len(self._events(fid)), 0)
 
-    def test_2_exclusions_junk_archive_parent_output_dir(self):
+    def test_2_exclusions_stay_in_place(self):
         self._seed("junk.txt", is_junk=1, junk_rule="TINY_TXT")
         self._seed("包.zip", status=C.STATUS_COMPLETE,
                    fail_reason=C.FAIL_NONE, is_archive=1,
@@ -103,23 +108,23 @@ class CollectTests(unittest.TestCase):
                            "seed", fail_reason=C.FAIL_NOT_ARCHIVE)
         rc = pipeline.cmd_collect(_mk_args(self.root))
         self.assertEqual(rc, 0)
-        # junk (excluded), archive (excluded) and 中间.zip (has a child →
-        # not a leaf) all STAY; only the leaf under 中间/ was collected
+        # in-place: EVERYTHING stays in src; nothing moved to 成品
         self.assertTrue(os.path.isfile(os.path.join(self.src, "junk.txt")))
         self.assertTrue(os.path.isfile(os.path.join(self.src, "包.zip")))
         self.assertTrue(os.path.isfile(os.path.join(self.src, "中间.zip")))
         self.assertTrue(os.path.isfile(os.path.join(
-            self._dest(), B1, C.DEFAULT_SRC_DIRNAME, "中间", "leaf.txt")))
+            self.src, "中间", "leaf.txt")))
+        self.assertFalse(os.path.exists(self._dest()))
 
-    def test_3_cross_batch_hash_duplicate_skipped(self):
+    def test_3_cross_batch_hash_duplicate_stays(self):
         fid1 = self._seed("one.bin", batch=B1)
         self.db.update_fields(fid1, hash="abc123", hash_mode="FULL")
         fid2 = self._seed("two.bin", batch=B2)
         self.db.update_fields(fid2, hash="abc123", hash_mode="FULL")
         rc = pipeline.cmd_collect(_mk_args(self.root))
         self.assertEqual(rc, 0)
-        # first (by batch,id) collected; duplicate stays put
-        self.assertFalse(os.path.exists(os.path.join(self.src, "one.bin")))
+        # in-place: both copies stay put (resolve-dup decides later)
+        self.assertTrue(os.path.isfile(os.path.join(self.src, "one.bin")))
         self.assertTrue(os.path.isfile(os.path.join(self.src, "two.bin")))
 
     def test_4_dry_run_touches_nothing(self):
@@ -132,25 +137,26 @@ class CollectTests(unittest.TestCase):
         self.assertNotIn(C.COLLECTION_DIRNAME, row["path"])
         self.assertEqual(len(self._events(fid)), 0)
 
-    def test_5_copy_mode_keeps_original(self):
+    def test_5_explicit_dest_relocates_with_audit(self):
+        dest = os.path.join(self.dir, "explicit_dest")   # opt-in escape hatch
         fid = self._seed("copy.bin")
-        rc = pipeline.cmd_collect(_mk_args(self.root, copy=True))
+        rc = pipeline.cmd_collect(_mk_args(self.root, dest=dest))
         self.assertEqual(rc, 0)
-        self.assertTrue(os.path.isfile(os.path.join(self.src, "copy.bin")))
-        self.assertTrue(os.path.isfile(os.path.join(
-            self._dest(), B1, C.DEFAULT_SRC_DIRNAME, "copy.bin")))
+        new_path = os.path.join(dest, B1, C.DEFAULT_SRC_DIRNAME, "copy.bin")
+        self.assertTrue(os.path.isfile(new_path))
+        self.assertFalse(os.path.exists(os.path.join(self.src, "copy.bin")))
         row = self.db.get(fid)
-        self.assertEqual(row["path"],
-                         os.path.join(self._dest(), B1,
-                                      C.DEFAULT_SRC_DIRNAME, "copy.bin"))
+        self.assertEqual(row["path"], new_path)
+        self.assertEqual(len(self._events(fid)), 1)
 
     def test_6_cross_drive_refused_before_any_move(self):
+        dest = os.path.join(self.dir, "explicit_dest")
         self._seed("xd.bin")
         with mock.patch.object(pipeline, "_same_drive", return_value=False):
-            rc = pipeline.cmd_collect(_mk_args(self.root))
+            rc = pipeline.cmd_collect(_mk_args(self.root, dest=dest))
         self.assertEqual(rc, 2)
         self.assertTrue(os.path.isfile(os.path.join(self.src, "xd.bin")))
-        self.assertFalse(os.path.exists(self._dest()))
+        self.assertFalse(os.path.exists(dest))
 
 
 if __name__ == "__main__":
