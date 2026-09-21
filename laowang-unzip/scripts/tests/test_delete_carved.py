@@ -38,6 +38,7 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 import unittest
 import zipfile
 
@@ -46,6 +47,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from pipeline_lib import config as C
 from pipeline_lib.scheduler import Pipeline, PipelineConfig
 from pipeline_lib.db import Database
+from pipeline_lib import hasher
 
 BATCH = "2026-09-15"
 
@@ -174,8 +176,13 @@ class DeleteCarvedTests(unittest.TestCase):
         leaf_id, _ = self.db.upsert_file(leaf, batch=BATCH, origin="EXTRACTED",
                                          depth=1, parent_id=sid, root_id=sid)
         self.db.transition(leaf_id, C.STATUS_COMPLETE, C.ACTION_VERIFY, "seed leaf")
+        # v3.8.3: the F1 primitive gate demands a whole-file digest for any
+        # size>0 real row; real pipeline rows always carry one (§2b).  Seed
+        # source + ready carved so the fixture models real hashed rows.
         self.db.update_fields(sid, extract_rc=0, extract_output_dir=out,
-                              status=C.STATUS_COMPLETE)
+                              status=C.STATUS_COMPLETE,
+                              hash=hasher.compute_md5(sp),
+                              hash_mode=C.HASH_MODE)
         if carved_rel:
             cp = self._put(carved_rel)
             cid, _ = self.db.upsert_file(cp, batch=BATCH, origin="CARVED",
@@ -192,7 +199,9 @@ class DeleteCarvedTests(unittest.TestCase):
                 self.db.transition(cleaf_id, C.STATUS_COMPLETE, C.ACTION_VERIFY,
                                    "seed carved leaf")
                 self.db.update_fields(cid, extract_rc=0, extract_output_dir=cout,
-                                      status=C.STATUS_COMPLETE)
+                                      status=C.STATUS_COMPLETE,
+                                      hash=hasher.compute_md5(cp),
+                                      hash_mode=C.HASH_MODE)
             else:
                 # pending: no output dir, still EXTRACTED (not terminal-verified)
                 self.db.update_fields(cid, extract_rc=0,
@@ -280,7 +289,24 @@ class DeleteCarvedTests(unittest.TestCase):
                                      depth=1, parent_id=fid, root_id=fid)
         self.db.transition(lid, C.STATUS_COMPLETE, C.ACTION_VERIFY, "seed leaf")
         self.db.update_fields(fid, is_archive=is_archive, extract_rc=0,
-                              extract_output_dir=out, status=status)
+                              extract_output_dir=out, status=status,
+                              # v3.8.2: reconcile's DELETED branch now requires
+                              # a CONTENT proof (a FULL digest), because size
+                              # alone cannot prove the occupant is this row's
+                              # file.  Seed the digest so this fixture models
+                              # a real hashed row.
+                              hash=hasher.compute_md5(p),
+                              hash_mode=C.HASH_MODE)
+        if status == C.STATUS_DELETED:
+            # v3.8.2 P0-A: reconcile now requires evidence that a deletion was
+            # actually DECIDED (a real run reaches DELETED via _delete_one /
+            # db.transition, which stamps deleted_at and writes an event).
+            # Seed it so this fixture models real production state instead of
+            # the pure-bookkeeping artefact the fix deliberately refuses —
+            # i.e. the 199 production rows whose status says DELETED while
+            # their event stream still says DUPLICATE_PENDING / SKIPPED.
+            self.db.update_fields(fid,
+                                  deleted_at=time.strftime("%Y-%m-%d %H:%M:%S"))
         return fid, p
 
     def _reconcile_spy(self):

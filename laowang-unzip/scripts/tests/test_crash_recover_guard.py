@@ -33,6 +33,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from pipeline_lib import config as C                    # noqa: E402
 from pipeline_lib import fsutil                         # noqa: E402
+from pipeline_lib import hasher                         # noqa: E402
 from pipeline_lib import scheduler as scheduler_mod     # noqa: E402
 from pipeline_lib.db import Database                    # noqa: E402
 from pipeline_lib.scheduler import Pipeline, PipelineConfig  # noqa: E402
@@ -200,8 +201,15 @@ class CrashRecoverGuardTests(unittest.TestCase):
         lid, _ = self.db.upsert_file(leaf, batch=BATCH, origin="EXTRACTED",
                                      depth=1, parent_id=fid, root_id=fid)
         self.db.transition(lid, C.STATUS_COMPLETE, C.ACTION_VERIFY, "seed leaf")
+        # v3.8.3: the F1 primitive gate demands a whole-file digest for any
+        # size>0 real row; a row that reached deletion via the real pipeline
+        # always carries one (hashing stage §2b).  Seed it so the fixture
+        # models a real hashed row instead of a state the pipeline cannot
+        # produce.
         self.db.update_fields(fid, is_archive=1, extract_rc=0,
-                              extract_output_dir=out, status=C.STATUS_EXTRACTED)
+                              extract_output_dir=out, status=C.STATUS_EXTRACTED,
+                              hash=hasher.compute_md5(sp),
+                              hash_mode=C.HASH_MODE)
         stat = fsutil.scan_output(out)
         self.assertTrue(self._pipe()._is_fully_done(fid, stat),
                         "有全终态子件时仍应判 fully done（正向不许回归）")

@@ -37,6 +37,7 @@ import zipfile
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from pipeline_lib import config as C
+from pipeline_lib import hasher
 from pipeline_lib.scheduler import Pipeline, PipelineConfig
 from pipeline_lib.db import Database
 
@@ -87,11 +88,25 @@ class CascadeDeleteTests(unittest.TestCase):
         pipe.cfg = self.cfg
         return pipe
 
+    def _stamp_digest(self, fid, path):
+        """Give a real DB row the genuine whole-file MD5 of its on-disk file.
+
+        v3.8.3 F1: ``_delete_one`` refuses to delete a real, non-empty row that
+        carries no FULL digest — a bare size match is not proof of identity
+        (a DIFFERENT same-size file could be re-occupying the path).  Every row
+        the deletion path will actually remove therefore needs its REAL digest;
+        never a placeholder.  ``_resolve_candidate_ok`` re-reads and compares
+        this digest, so it must be the hash of the actual bytes on disk.
+        """
+        self.db.update_fields(fid, hash=hasher.compute_md5(path),
+                              hash_mode=C.HASH_MODE)
+
     def _seed_source(self, rel, status=C.STATUS_EXTRACTED, is_archive=1):
         p = self._put_zip(rel)
         fid, _ = self.db.upsert_file(p, batch=BATCH, origin="DOWNLOAD")
         self.db.update_fields(fid, is_archive=is_archive, extract_rc=0,
                               status=status)
+        self._stamp_digest(fid, p)
         return fid, p
 
     def _seed_child(self, parent_id, rel, is_archive=1, group=None,
@@ -101,6 +116,7 @@ class CascadeDeleteTests(unittest.TestCase):
                                      parent_id=parent_id, root_id=parent_id)
         self.db.update_fields(cid, is_archive=is_archive, volume_group=group,
                               status=status)
+        self._stamp_digest(cid, p)
         return cid, p
 
     def _seed_leaf(self, parent_id, rel, content=b"real content" * 100):
@@ -247,6 +263,10 @@ class CascadeDeleteTests(unittest.TestCase):
         self.db.update_fields(fid, is_archive=1, extract_rc=0,
                               status=C.STATUS_EXTRACTED, path=os.path.join(stale_dir, "ghost.zip"),
                               dir_path=stale_dir, file_name="ghost.zip")
+        # F1: the row is a real, non-empty DB row that WILL be deleted, so it
+        # needs its genuine whole-file digest (of the real file, not the stale
+        # path) — size alone is not proof of identity.
+        self._stamp_digest(fid, real)
         # a valid child so cascade passes
         self._seed_leaf(fid, "leaf.txt")
         pipe = self._pipe()

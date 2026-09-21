@@ -3,19 +3,24 @@
 Candidate order (cheap & specific first):
 
 1. ``("", NONE)``      — unencrypted archives pass ``7z t`` immediately
-2. ``INHERITED``       — the password that opened the PARENT archive (套娃常
+2. ``USER``            — the passwords the user explicitly supplied for this
+                          batch (``--passwords``, §4.1 step 2).  Tried BEFORE
+                          ``INHERITED`` (§8 decision 6): an explicit instruction
+                          outranks an inherited prior.
+3. ``INHERITED``       — the password that opened the PARENT archive (套娃常
                           常同一个密码)
-3. ``BRACKET`` / ``DIR_NAME`` / ``FILE_NAME`` — codes scraped from names, e.g.
+4. ``BRACKET`` / ``DIR_NAME`` / ``FILE_NAME`` — codes scraped from names, e.g.
    「（5656456）」 or 「解压码：维生素」 or 「口令：abc123」 or 「密码=xyz789」
    (v1 pitfall 13: full-width brackets!)
-4. ``LIBRARY``         — the **merged, count-sorted** library: the self-learned
-                          layer (``<skill>/assets/passwords.learned.txt``) +
-                          the bundled passwords.txt + the user's own
-                          ``<workdir>/password.txt`` etc.  v3.6.0: entries are
+5. ``LIBRARY``         — the **merged, count-sorted** library: the per-root
+                          MASTER library
+                          (``<root>/.pipeline/passwords.master.txt``, v3.8.0:
+                          self-learned + user-added) + the bundled read-only
+                          ``passwords.txt`` seeds.  v3.6.0: entries are
                           ordered by *successful-extraction count* (most
                           successful tried first); the **source order below**
                           only breaks ties.
-5. ``TXT_MINED``       — LAST RESORT (§fix⑥): when 1-4 all fail, mine
+6. ``TXT_MINED``       — LAST RESORT (§fix⑥): when 1-5 all fail, mine
                           already-extracted ``.txt`` docs (a 密码.txt that came
                           out of a friend/parent archive, or any line carrying a
                           密码/解压码/提取码/口令 hint).  See ``mine_txt_passwords``.
@@ -39,6 +44,7 @@ pitfall 14: ``7z l`` succeeds on encrypted headers and lies to you).
 
 from __future__ import annotations
 
+import datetime
 import os
 import re
 from typing import Dict, List, Optional
@@ -106,24 +112,43 @@ LOCAL_ROOT_PASSWORDS = ".pipeline" + os.sep + "passwords.local.txt"
 LEARNED_SKILL_PASSWORDS = os.path.join(SKILL_ROOT, "assets",
                                        "passwords.learned.txt")
 
+# v3.8.0 (password-library-redesign): the single writable MASTER library, per
+# processing-root.  All user-entered / self-learned / root-local passwords
+# converge here.  The read-only built-in seed (BUILTIN_PASSWORDS) stays a
+# separate source and is merged at runtime, never written.
+MASTER_ROOT_PASSWORDS = os.path.join(".pipeline", "passwords.master.txt")
+
+
+def master_path(root: Optional[str] = None) -> Optional[str]:
+    """Absolute path of the per-root MASTER library.
+
+    With ``root`` the master lives at ``<root>/.pipeline/passwords.master.txt``.
+    Without ``root`` (skill-level / legacy test context) it falls back to the old
+    skill-local learned file so library-reading code keeps working until the
+    migration script has run.  See ``migrate_passwords``.
+    """
+    if root:
+        return os.path.join(root, MASTER_ROOT_PASSWORDS)
+    return LEARNED_SKILL_PASSWORDS
+
 
 def describe_sources(passwords_file: Optional[str] = None,
                      workdir: Optional[str] = None,
                      root: Optional[str] = None) -> list:
     """Return ``[(label, path)]`` in merge priority order (for doctor output).
 
-    v3.6.0 merge order (label ``learned`` added)::
+    v3.8.0 (password-library-redesign): the writable library is a SINGLE master
+    file plus the read-only built-in seed::
 
-        external -> local(skill) -> learned -> local(root .pipeline)
-        -> workdir password.txt -> builtin
+        external -> master(root-level, writable) -> builtin(read-only seed)
+
+    The old scattered local/learned/root-local/workdir files are deprecated and
+    no longer read here; ``migrate_passwords`` folds them into the master once.
     """
     out = [("external", passwords_file or "")]
-    out.append(("local", LOCAL_SKILL_PASSWORDS))
-    out.append(("learned", LEARNED_SKILL_PASSWORDS))
-    if root:
-        out.append(("local", os.path.join(root, LOCAL_ROOT_PASSWORDS)))
-    if workdir:
-        out.append(("workdir", os.path.join(workdir, C.PASSWORD_FILE_BASENAME)))
+    mp = master_path(root)
+    if mp:
+        out.append(("master", mp))
     out.append(("builtin", BUILTIN_PASSWORDS))
     return out
 
@@ -163,6 +188,45 @@ def _load_file_into(path: str, ordered: List[str], seen: set,
         pass
 
 
+# ---------------------------------------------------------------------------
+# v3.8.0 phase 4 — 密码库防劣化（降权）：单一判据 + 稳定分区重排
+# ---------------------------------------------------------------------------
+
+# v3.8.0 phase 4 返工：日期合法性判定**全仓唯一一处**在 ``pwstats._coerce_date``。
+# 原实现此处另有一份逐字拷贝（连同 ``_recent_added`` 里的内联解析，全仓共 3 处）
+# = 判据漂移源，已全部删除。此处只留别名，既有调用方不受影响。
+_as_date = pwstats._coerce_date
+
+
+# v3.8.0 phase 4 返工：判据**下沉到 pwstats**（全仓唯一一处）。此处保留名字作别名，
+# 既有调用方与用例零改动；逻辑**不再复制**（禁止两套判据）。
+# 下沉的原因：pwstats 是零项目内依赖的底层模块，而 passwords 单向 import 它；判据若
+# 留在本模块，pwstats.library_metrics 就得「惰性 import passwords」绕环，而那个
+# except 会把异常吞掉 → 静默把 decayed 报成 0（静默失真）。下沉后两者一起消失。
+_is_decayed = pwstats.is_decayed
+
+
+def _partition_decay(lib: List[str], counts: Dict[str, int],
+                     last_dates: Dict[str, str], today, cfg,
+                     added_dates: Optional[Dict[str, str]] = None) -> List[str]:
+    """在 ``lib`` 上做一次**稳定分区重排**（设计 §3.2 的 φ）::
+
+        φ(L) = [ p ∈ L\\D 保持原相对顺序 ] ++ [ p ∈ D 保持原相对顺序 ]
+
+    ``D`` = 被 :func:`_is_decayed` 判为劣化的条目。**纯运行期**：不改集合、不写盘、
+    返回新的 ``List[str]``；``DECAY_ENABLED=False`` 时逐元素等于入参顺序。
+    ``counts`` 传 merged 有效字典，``last_dates`` 传 ``{password: last_date}``，
+    ``added_dates`` 传 ``{password: added_date}``（缺省 ``None`` → 无可疑证据，
+    全部按衰减判据走）。
+
+    **薄封装**：判据与分区逻辑的唯一实现已下沉 :func:`pwstats.decay_partition`
+    （返工后此处**不再复制任何逻辑**）。本函数只取 ``ordered``；``decayed`` /
+    ``suspicious`` 由 ``pwstats.decay_partition`` 直接上抛给 ``library_metrics``。
+    """
+    return pwstats.decay_partition(lib, counts, last_dates, added_dates,
+                                   today, cfg)["ordered"]
+
+
 def load_library(passwords_file: Optional[str] = None,
                  workdir: Optional[str] = None,
                  root: Optional[str] = None,
@@ -172,11 +236,11 @@ def load_library(passwords_file: Optional[str] = None,
 
     Merge order (each deduplicated, order-preserving):
       1. ``--passwords`` external file
-      2. ``<skill>/assets/passwords.local.txt``   (user lib, not in git)
-      3. ``<skill>/assets/passwords.learned.txt`` (self-learned, count-sorted)
-      4. ``<root>/.pipeline/passwords.local.txt`` (per-root user lib, SKILL.md §5)
-      5. ``<root>/password.txt``                  (convenience working lib)
-      6. ``<skill>/assets/passwords.txt``         (read-only community seeds)
+      2. ``<root>/.pipeline/passwords.master.txt`` (v3.8.0 MASTER: self-learned
+         + user-added, count-sorted; per processing-root. Falls back to the
+         skill-level legacy ``assets/passwords.learned.txt`` when ``root`` is
+         None, i.e. before migration has run.)
+      3. ``<skill>/assets/passwords.txt``         (read-only community seeds)
 
     v3.6.0: when ``prioritize_by_count`` is true the merged list is re-sorted
     **descending by successful-extraction count** (``pwstats.prioritize``); counts
@@ -188,19 +252,38 @@ def load_library(passwords_file: Optional[str] = None,
     ordered: List[str] = []
     seen: set = set()
     for label, path in describe_sources(passwords_file, workdir, root):
-        _load_file_into(path, ordered, seen, learned=(label == "learned"))
+        _load_file_into(path, ordered, seen, learned=(label in ("learned", "master")))
 
     if not prioritize_by_count:
         return ordered
 
-    merged: Dict[str, int] = dict(pwstats.read_counts(LEARNED_SKILL_PASSWORDS))
+    merged: Dict[str, int] = dict(pwstats.read_counts(master_path(root)))
     if counts:
         for k, v in counts.items():
             try:
                 merged[k] = int(v)      # DB 口径覆盖同名键
             except (TypeError, ValueError):
                 continue
-    return pwstats.prioritize(ordered, merged)
+    # v3.8.0 phase 4 防劣化：把「久未成功且次数低」的密码**稳定**沉到库尾（→
+    # pass2 长尾）。纯运行期重排：不改集合、不写盘、返回类型仍 List[str]；
+    # DECAY_ENABLED=False 时与改动前**逐元素相同**（§1 范围锁定 ①-④）。
+    # last_date 经 parse_learned 投影（复用既有读取器，**零新增解析器** · §1 ⑤）。
+    ordered_sorted = pwstats.prioritize(ordered, merged)
+    last_dates: Dict[str, str] = {}
+    added_dates: Dict[str, str] = {}
+    try:
+        _lh, _lentries, _lf = pwstats.parse_learned(master_path(root))
+        # 同一次解析同时投影两个字典（绝不多调一次解析器）。
+        for _e in _lentries:
+            if _e.password:
+                last_dates[_e.password] = _e.last_date
+                if _e.added_date:
+                    added_dates[_e.password] = _e.added_date
+    except Exception:  # noqa: BLE001 — a broken master must not break loading
+        last_dates = {}
+        added_dates = {}
+    return _partition_decay(ordered_sorted, merged, last_dates,
+                            datetime.date.today(), C, added_dates)
 
 
 def library_password_set(passwords_file: Optional[str] = None,
@@ -268,17 +351,92 @@ def scrape_trailing_password(file_name: str,
     return out
 
 
-def candidates_for(row, parent_row, library: List[str]) -> List[tuple]:
-    """Build the ordered candidate list ``[(password, password_source)]``."""
-    cands: List[tuple] = []
+def read_plain_passwords(path: Optional[str]) -> List[str]:
+    """Read a plain one-password-per-line file (``#`` comments, blanks skipped).
+
+    Returns ``[]`` for a missing path or a read error — never raises.  This is
+    the reader for the batch's **user-supplied** ``--passwords`` file (§4.1 step
+    2); its semantics deliberately mirror ``migrate_passwords._read_plain`` so
+    the two never disagree about what "a plain password file" is (``utf-8-sig``
+    BOM tolerance, stripped lines, full-line ``#`` comments).
+    """
+    if not path or not os.path.isfile(path):
+        return []
+    out: List[str] = []
+    try:
+        with open(path, "r", encoding="utf-8-sig", errors="ignore") as fh:
+            for line in fh:
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    out.append(line)
+    except OSError:
+        return []
+    return out
+
+
+def candidates_for(row, parent_row, library: List[str],
+                   user_passwords: Optional[List[str]] = None,
+                   added_dates: Optional[Dict[str, str]] = None):
+    """Build the two-pass candidate lists ``(pass1, pass2)`` (§4.5).
+
+    ``pass1`` — high-confidence + hot sources, tried first::
+
+        1. ``("", NONE)``      — the unencrypted fast path
+        2. ``USER``            — the passwords the user explicitly supplied for
+                                 this batch (``--passwords``, §4.1 step 2); they
+                                 precede everything but the empty fast path
+        3. ``INHERITED``       — the parent archive's password (§8 decision 6:
+                                 user-specified is tried BEFORE inherited)
+        4. ``TRAIL_BRACKET`` / ``DIR_NAME`` — filename/dir trailing bracket
+        5. ``FILE_NAME`` / ``DIR_NAME``     — brackets + hint keywords
+        6. ``LIBRARY``         — the first ``config.TOP_K`` library passwords
+                                 (the library arrives count-descending, so this
+                                 is the top-K most-successful — §4.1 step 5)
+        7. ``RECENT``          — library passwords whose ``added_date`` is within
+                                 ``config.RECENT_DAYS`` (§4.1 step 6, A-enh);
+                                 tried AFTER top-K and BEFORE the scheduler's
+                                 txt-mine fallback
+
+    ``pass2`` — the LIBRARY LONG TAIL, i.e. every library password NOT already
+    in ``pass1``, kept in its count-descending order (§8 decision 7).  It is
+    tried only after ALL files' pass1 has run (the batch-finish sweep).
+
+    Invariant (§4.5 明辨决): ``pass1 ∪ pass2`` covers EVERY candidate — the
+    non-library sources (user/INHERITED/name/txt) live in ``pass1`` and the
+    library is ``(topK ∪ recentN) ⊆ pass1`` ∪ ``long tail = pass2`` — so no
+    password is ever permanently skipped.  ``recentN ⊆ library`` by construction,
+    so adding it can never break the union.  The existing ``seen`` dedup
+    semantics are preserved: a password already emitted in ``pass1`` (from ANY
+    source) is never emitted again in ``pass2``.
+
+    ``added_dates`` is an OPTIONAL ``{password: added_date}`` map (from
+    ``pwstats.read_added_dates``) used ONLY for the step-7 ``RECENT`` slice; it
+    deliberately does NOT change ``library``'s ``List[str]`` type (avoids a wide
+    ripple).  When it is empty/absent — e.g. a legacy 4-field library with no
+    dates — the ``RECENT`` slice is empty and behaviour is IDENTICAL to before
+    A-enh (graceful degradation, §4.1).
+    """
+    pass1: List[tuple] = []
     seen = set()
 
     def add(pwd: str, src: str) -> None:
         if pwd not in seen:
             seen.add(pwd)
-            cands.append((pwd, src))
+            pass1.append((pwd, src))
 
     add("", "NONE")                                   # unencrypted fast path
+
+    # pass1 step 2 (§4.1 step 2 / §8 decision 2): the passwords the USER
+    # explicitly supplied for this batch (``--passwords``).  They are tried
+    # right after the empty fast path and BEFORE the inherited/parent password
+    # (§8 decision 6) — a hand-written batch password is an explicit instruction
+    # and must not sort into the pass2 long tail just because it has no success
+    # count.  Routed through add() so a duplicate is neither emitted twice nor
+    # leaked into pass2 (dedup also keeps it out of the long tail).
+    for pwd in (user_passwords or []):
+        if pwd:
+            add(pwd, "USER")
+
     if parent_row is not None and parent_row["password"]:
         add(parent_row["password"], "INHERITED")
 
@@ -301,9 +459,54 @@ def candidates_for(row, parent_row, library: List[str]) -> List[tuple]:
     for pwd, src in scrape_from_names([dir_base], "DIR_NAME"):
         add(pwd, src)
 
-    for pwd in library:
+    # pass1 step 5: the top-K hottest library passwords (the library is already
+    # count-descending — see load_library/prioritize).  Everything left over is
+    # the pass2 long tail (still count-descending).
+    for pwd in library[:C.TOP_K]:
         add(pwd, "LIBRARY")
-    return cands
+
+    # pass1 step 7 (§4.1 step 6, A-enh): the "recently added" library passwords
+    # — those whose added_date is within RECENT_DAYS.  Placed AFTER top-K and
+    # (in the scheduler) BEFORE the txt-mine fallback.  Routed through add() so a
+    # password already in top-K is not re-emitted; anything it emits is thereby
+    # also excluded from pass2.  A library with no dates yields an empty slice,
+    # so behaviour degrades EXACTLY to the pre-A-enh pass1.  INVARIANT (§4.5):
+    # recentN ⊆ library, so pass1 ∪ pass2 still covers every candidate.
+    for pwd in _recent_added(library, added_dates):
+        add(pwd, "RECENT")
+
+    pass2: List[tuple] = [(pwd, "LIBRARY") for pwd in library
+                          if pwd not in seen]
+    return pass1, pass2
+
+
+def _recent_added(library: List[str], added_dates: Optional[Dict[str, str]],
+                  days: Optional[int] = None) -> List[str]:
+    """Library passwords whose ``added_date`` is within the last ``days`` days.
+
+    A-enh (§4.1 step 6 / §5).  Only entries with a NON-EMPTY ``added_date``
+    qualify (the ``IS NOT NULL`` rule — an empty date must never count, else
+    legacy unknowns pollute "recent").  ``days`` defaults to
+    ``config.RECENT_DAYS``.  Result is in ``library`` order (already
+    count-descending) and never raises (bad/absent dates are skipped).  An empty
+    ``added_dates`` (legacy 4-field library) → ``[]`` (graceful degradation).
+    """
+    if not added_dates:
+        return []
+    n = C.RECENT_DAYS if days is None else days
+    if n <= 0:
+        return []
+    cutoff = datetime.date.today() - datetime.timedelta(days=n)
+    out: List[str] = []
+    for pwd in library:
+        raw = added_dates.get(pwd)
+        if not raw:
+            continue
+        # 日期合法性判定统一走 pwstats._coerce_date（全仓唯一一处）：不可解析 → None → 跳过。
+        d = pwstats._coerce_date(raw)
+        if d is not None and d >= cutoff:
+            out.append(pwd)
+    return out
 
 
 # ---------------------------------------------------------------------------

@@ -226,3 +226,110 @@
 - 关联：WRONG_PASSWORD
 - 指纹：wrong_password
 - 复现：1 次
+
+### [LES-20260919-01] bug P1 open（第二方复核：同意 P1，不合 P0/P2）
+- 现象：批次收尾 sweep 把本可解出的包静默判 FAILED：对「递延次数已达 DEFERRED_MAX_RETRY」的行先行降级，跳过了它应得的 pass2 尝试。源包未被删（FAILED 行不删源），但被静默标成失败，用户无从知晓本可解出。注意**缺陷代码下 retry-failed 救不回来**（第二方复核补正）：count 已 ≥2，pass1 阶段即被内联降级，连 PASSWORD_DEFERRED 都进不去——「可经 retry-failed 复原」只在**修复后**成立。
+- 根因：把「递延次数上限」误当「不必再试」的判据。_defer_count 数的是跨 run 持久化的 PW_DEFERRED 事件，而 retry-failed 复用旧计数，故上限可在该行从未跑过任何一次 pass2 时就被命中；上限的语义本应只限制「跨轮递延次数」，不应剥夺单次 deferred pass。
+- 处置：删除 _finish_deferred_sweep 的 step-1 预降级；改为无条件 requeue 每一行（含已达上限者）跑它那一遍，跑完仍失败才由安全网降级为 FAILED+WARN。补测试 C1 锁住（旧 step-1 下变红、修复后变绿）。第二方变异复验确认 FIX A 为真修复（无需任何崩溃，经 retry-failed 即可达），非防御性修补。
+- 关联：v3.8.0 阶段 1.5+2；方案 §4.3；同族：静默失败（LES-20260917-01/02）
+- 指纹：批次收尾sweep把本可解出的包静默判failed对递延次数已达deferred_max_retry的行先行降级跳过了它应得的pass2尝试源包未被删faile
+- 复现：1 次
+
+### [LES-20260919-02] ops P2 open（第二方复核：同意 P2）
+- 现象：两条测试是假阳性：它们的「通过」并非因为被测行为正确，而是数据构造把断言旁路了。其一，USER 去重测试把被测密码放在库头部（top-K 之内），后续 LIBRARY 分支顺手把它塞回 seen，于是「USER 是否被排除出 pass2」这条断言恒为真，同用例也从未断言 pass1 内 USER 唯一；其二，_finishing_deferred 守卫删掉后全量仍全绿，因为收尾安全网把外部可观测差异抹平了。
+- 根因：断言只钉「终态/汇总」，不钉「该行为是否真的发生过」；且测试数据落在边界之内，使被测路径被下游去重意外覆盖。缺「可观测行为」类断言（事件计数、序列唯一性）。
+- 处置：补测并做红验证：G1 断言收尾 sweep 不产生新的 PW_DEFERRED 事件；G2 长尾分支断言 USER 不出现在 pass2、唯一性分支断言 pass1 内 USER 计数为 1。作者自证不算数，红验证由第二方独立复现。
+- 关联：v3.8.0 阶段 1.5+2；LES-20260919-01；pitfalls 判据治理
+- 指纹：两条测试是假阳性它们的通过并非因为被测行为正确而是数据构造把断言旁路了其一user去重测试把被测密码放在库头部topk之内后续library分支顺手把它塞回se
+- 复现：1 次
+
+### [LES-20260919-03] design P2 open（发现方=第二方 QA；评级待第三方复核）
+- 现象：阶段 3 的完整性防线在设计稿里只写了一半——「**空** last_date 不衰减」，漏了「**非 ISO 日期**也不衰减」。同时 `verify()` 对「4 字段行多一个尾随 TAB」会放行，被误解析行的 `last_date` 变成来源标签（如 `SRC`）——而这正好是阶段 4 衰减判据要读的字段。实测：`1\tpw\t2026-01-01\tSRC\t` → `verify()=(True,[])`，解析 `last_date='SRC'`。
+- 根因：设计复核只覆盖了「正常形态 × 边界值」，没覆盖「**同一形态由损坏产生**」。更深一层：合法「5 字段 + sources 为空」的渲染**本身就是尾 TAB 结尾**（`Entry.line()`），于是「尾随 TAB」既是合法格式的标记、又是污染后的样子 → **列数这一判据在此处彻底失去判真伪的能力**。
+- 处置：**不做** `verify()` 硬闸（会把手工损坏升级为**整批拒跑**，违背本项目「闸门不得获得非必要阻断权」的既有教训），改为**消费端 fail-soft**：`_is_decayed` 对空/非日期 `last_date` 一律返回不衰减；`library_metrics` 增加 `suspicious` 计数，**非阻断**告警。pitfalls #57/#58 已登记，并写明「剥尾部空列」会把合法 5 字段反判成 4 字段（更危险）、「日期形状消歧」因来源标签可能是日期串而不可判定——**阻止后人再试一遍**。
+- 迁移教训：**合法性判据不能只看列数**。当某特征既是「合法格式的标记」又是「污染后的样子」时，要么换语义判据（并证明无歧义），要么承认不可判、把防线放到**消费端**而不是**闸门端**。
+- 关联：v3.8.0 阶段 3/4；pitfalls #57/#58；同族：静默失败/静默失真（LES-20260917-01/02）
+- 复现：1 次
+
+### [LES-20260921-01] ops P2 resolved（team-lead 终裁 2026-09-21：resolved，不提升）
+- 现象：自动采集：本批出现 VOLUME_MISSING ×1 次
+- 根因：待定位（机器草稿，需人工/助手补写）
+- 处置：**resolved（team-lead 终裁，2026-09-21，不选 promoted）** —— 本条机器草稿的「根因/处置」两栏本身仍是“待补写”（空壳），不得以空壳冒充已提升。其真实教训被 **LES-20260921-03（改分类却不改触发集，净效果为负）** 吸收；处置落点 = **pitfalls #62 / #63** 与 **failure-matrix §2b**（`VOLUME_MISSING` 处置）。上述交叉引用即本条的可追溯依据。
+- 关联：**LES-20260921-03（吸收方）**；pitfalls #62 / #63；failure-matrix §2b；VOLUME_MISSING
+- 指纹：volume_missing
+- 复现：7 次
+
+### [LES-20260921-02] bug P0 promoted（team-lead 终裁 2026-09-21：P0 确认）
+- 现象：同一次事故里并存**两类本质不同的失败**——(a) **名字伪装**（SFX / 双点改名导致分卷归一失效）；(b) **触发点缺失**（归一逻辑本身正确，却**没有任何代码路径会调用它**）。后者更危险，因为它**看起来已经做完**：函数写好了、单测也过了，但对本案的家族**零作用**。
+- 根因：全码改名触发点仅三处（首卷门控需 `is_archive`、密码类失败需 `cls∈{WRONG_PASSWORD,ENCRYPTED_HEADER}`、7Z 需 `is_archive` 且仅 7Z）；SFX 首卷 `is_archive=False` → 三处皆不命中 → `_handle_repair_or_skip` 的"非归档早退"直接 `return` → U2 的识别结果**无处消费**。会审② 第四条硬约束：凡"写了不会被自动触发"的改动一律视为**未完成**。
+- 处置：v3.9.0 U2-c 补齐四处触发点（`embedded_volume` 字段 + 门控放宽 + 触发集扩展 + 首卷整组归名），并新增端到端用例（真 SFX 脏名走**非归档**路径，防假绿）。
+- 关联：pitfalls #65；SKILL.md §0.2 硬约束 4；tests/test_volume_rename_v390.py
+- 指纹：trigger_point_absence
+- 证据：`实查记录-20260921.md` §A.1（触发点实读仅三处）+ 会审② 三司一致判定「U2 无触发点，对本案零作用」。
+- 定级：P0（整批失败级：该家族全部被判"解不开"）；**已终裁（team-lead 2026-09-21 确认 P0；会审② 三司一致判定 P0）**。
+- 复现：1 次
+
+### [LES-20260921-03] limit P1 promoted（team-lead 终裁 2026-09-21：P1 确认）
+- 现象：**只改分类、不改触发集**是净负操作——U1 单独上线后，家族从「误判密码（但仍会尝试改名）」退化为「正确判缺卷（永久 FAILED、不重试）」。
+- 根因：`FAIL_VOLUME_MISSING` 不在旧触发集 `(FAIL_WRONG_PASSWORD, FAIL_ENCRYPTED_HEADER)` 内 → 归一永不触发 → 一族可解包被永久判死。
+- 处置：U1 与 U2-c 的触发集扩展**绑死同批**（扩展后的触发集含 `FAIL_VOLUME_MISSING`）；`sz.py` 注释写明宽的 `Cannot find` 网 "do NOT move"。
+- 关联：pitfalls #62 / #63；SKILL.md §3.2；tests/test_classify_volume_missing.py
+- 指纹：classification_without_trigger_set
+- 证据：会审② 五行金维① / 破妄 P1；`sz.py::classify_extract_fail` 判序实读（`Missing volume` 上移至 `encrypted archive` 之前）。
+- 定级：**P1，已终裁（team-lead 2026-09-21；会审② 五行金维① / 破妄 P1 亦一致）**（大批次产出错误；未丢数据）。
+- 复现：1 次
+
+### [LES-20260921-04] limit P1 promoted（team-lead 终裁 2026-09-21：P1 确认）
+- 现象：**不得把 DB 派生列当真相**——方案 v3 曾据 DB 一条陈旧行（id=21007）判定「`real_type` 是 RAR」并据此设计修法，被物理实测推翻；DB 的 `volume_role` 同样陈旧（盘面名可算出 `FIRST`，DB 却钉着 `NONE`）。
+- 根因：`real_type` / `volume_role` 是 `analyze` 时按**当时名字**（`.exe` / 双点）算出的**派生值**；手工改名只同步了 `file_name`，未重算派生字段。拿记录当事实 = **用脏数据推结论**。
+- 处置：① `analyze` 对 SFX **保留外壳类型**（真 SFX → `real_type=EXE / sig_offset=2048`），判据改用 **`sig_offset>0`（是否内嵌档案）** 而非 `real_type`；② `consistency-check` **重算派生字段**（`real_type/is_archive/volume_role/volume_group/normalized_path`）并把"名字已变但角色仍旧"单列一类漂移。
+- 关联：pitfalls #64；failure-matrix §2b；pipeline_lib/consistency.py `DERIVED_FIELDS`；`实查记录-20260921.md` §B/§C
+- 指纹：stale_derived_column
+- 证据：`实查记录-20260921.md` §B（`1 57286 400 − 156 841 984 = 444 416` → SFX）与 §C（同名直调 `volume_info` 得 `('FIRST',…)`，DB 钉 `NONE`）。
+- 定级：**P1，已终裁（team-lead 2026-09-21）**（方案级误判，幸在上线前被独立实测拦下）。
+- 复现：1 次
+
+### [LES-20260921-05] ops P1 promoted（team-lead 终裁 2026-09-21：P1 确认）
+- 现象：`scripts/` 里遗留的**调试垃圾直接决定了测试结果**——2 个零字节调试文件（`diag_probe2.txt` / `diag_py.txt`）经"空路径 → CWD"这条隐藏通路，让 check#4 看到幻影零字节 → 6 个用例连锁变红，且结果随进程启动目录漂移。
+- 根因：删文件时"空路径被解析成进程 CWD"（`fsutil.isdir("")==True`）→ 清理判定**扫错对象** → **环境洁净度在本项目是正确性因素，不是风格问题**。
+- 处置：U0-a 从根因修（空路径永不是目录 / 永不可列 / 全零 stat）；同时清理 19 个遗留调试文件；`scripts/` 顶层不再残留会污染判定的零字节文件。
+- 关联：pitfalls #68；U0-a；`实查记录-20260921.md` §G
+- 指纹：env_cleanliness_is_correctness
+- 证据：`实查记录-20260921.md` §G.2 三层剥洋葱（`scan_output("")` → `non_archive=117, zero_byte=2`）+ §G.4 修复实证（同场景恢复为 `source deleted (rc=0, mode=RECYCLE)`）。
+- 定级：**P1，已终裁（team-lead 2026-09-21）**（令基线非确定性变红、掩盖真实问题）。
+- 复现：1 次
+
+### [LES-20260921-06] ops P0 resolved（team-lead 终裁 2026-09-21：由 P1 升为 P0 → 同日复裁 resolved）
+- 现象：**无版本控制下，"从兄弟 `.bak` 还原再回写生产文件"是隐式回滚**——`pipeline_lib/scheduler.py.bak` 是缺 v3.8.3 F1-intent 安全闸与 U0-a 修复的陈旧快照，而 3 个脚本（`run_mutation.py` / `mutate_tmp.py` / `diag_cascade.py`）都会「读该 `.bak`(pristine) → 回写 `scheduler.py`」。
+- 根因：本目录**非 git 仓库**，把"同目录隐式 `.bak`"当 pristine 基线，等于让一次工具运行**静默回退真实安全修复**——而且回退后测试仍可能"全绿"（因为闸被删了），错误**不可观测**。
+- 处置（运维，已落地）：该 `.bak` 已移出代码树至备份目录（改名 `scheduler.py.bak.STALE-20260920-DO-NOT-RESTORE`）；变异测试改用**基于当前现役文件**的显式副本，**禁止**在生产路径上回写。**Skill 层判据已落地 → 本条 resolved**：① SKILL.md §3.2 **硬约束③**（禁止隐式 `.bak` 回写生产）；② **pitfalls #70**（通用禁令 + 变异/基线工具正确形态 + 锚点缺失须硬错 + 树内 `<name>.py.bak` 并存即可疑）；③ `run_mutation.py` 已重建为「现役文件取 pristine + 整树副本施加变异 + 树外 OUT_DIR + 哈希自证未变」，旧隐式 `.bak` 路径彻底消失（team-lead 独立实测：5 个变异体全被检出、`p0` 对照组绿、连跑 6 轮后现役 `scheduler.py` 字节未变）。**树根另发现同型快照 `.lead-gapfix-backup/scheduler.py.bak` （少 538 行、零引用）→ 已随 41 项树根残留一并移出。**
+- 关联：方案 §U0-d / §0.3；LES-20260915-01（本机删除语义与生产不同）
+- 指纹：stale_bak_implicit_rollback
+- 证据：方案 §U0-d 实读表（3 脚本的 `BAK = SCHED + ".bak"` 与 docstring）+ 旧 `.bak`（170 112 B）比现役 `scheduler.py`（174 118 B）少 79 行差异。
+- 定级：**P0，已终裁（team-lead 2026-09-21；由 P1 升为 P0）** —— 其回退内容**包含数据安全闸**且回退是**静默**发生的；在**没有版本控制**的目录里，“静默回退安全闸”必须按最高级别标注。原 P1 初判所引的降格先例 LES-20260917-02 在此不适用（那条系“潜在且从未发生且可恢复”；本条静默抹掉的是**现存**安全闸）。
+- Skill 层落点：**SKILL.md §3.2 硬约束③**（禁止隐式 `.bak` 回写生产）。
+- 复现：1 次
+
+### [LES-20260921-07] ops P1 open（方法学：判据类修复须穷举「输出域」，且作者自证不算、须第二方变异验证）
+- 现象：**D1 第一轮修复"看起来对"，被 30 格穷举矩阵证伪**——黑名单版（`NON_ARCHIVE_CONTAINER_TYPES`）在手头几个样本上通过，却在 `probe_magic_only` 的**未枚举取值**（`UNKNOWN`：MKV / AVI / 无头 / 未登记格式）上漏网 4 格；真媒体仍被规划改名成 `.rar`。**同一事故形态，换了个容器。**
+- 根因：修的是**判据**（`_is_renameable_volume_member` 的成员纳入条件），却只按**手头样本**验证、只按**排除法**设计。① 判据输出域含开放式取值（`UNKNOWN`）时，黑名单在**结构上不可能闭合**；② 名单是**照文档抄的**（MOV / M4V / WEBP 在 `_match_magic` 里根本无签名）——**名单与实现脱节**未被发现。
+- 处置：**第二轮改白名单**（`head ∈ {RAR, RAR5}`，或 `EXE` 头 + 偏移>0 内嵌归档；其余一律拒绝＝fail-closed），删 `_is_volume_member_content` 与 `config.NON_ARCHIVE_CONTAINER_TYPES`（删后 config.py 与原件逐字节相同）；Skill 层落点 = **pitfalls #71 / #72**。**验收方式**改为**穷举判据输出域**（30 格矩阵）＋**第二方独立变异验证**（M1 / M2 / M3 / M4 四种变异全部按预期变红）。
+- 关联：pitfalls #71 / #72；D1 / D13；`verify_v391_d1b.py`（30 格矩阵）/ `probe_d13_two_paths.py` / `probe_mp4_misrename.py`；SKILL.md 步骤 5。
+- 指纹：exhaustive_output_domain_verification
+- 证据：30 格穷举矩阵把黑名单版打出 **4 格 ❌**；第二方变异 M1(`return False`) / M2(装回原始 bug) / M3 / M4(黑名单) 四者**全部变红**；无头用例显式断言 `probe_magic_only == "UNKNOWN"`（**不是空壳**）；`Ran 704 tests / OK`。
+- 定级（第二方终裁，2026-09-21）：**维持 P1，不升格**——升格随 v3.9.1 发布签字；本批 Skill 落点（#71/#72）已写好但尚未发布，按未发布计；且本条系方法论教训（P1），不必为其破格提升。
+- 复现：1 次
+
+
+
+### [LES-20260922-01] bug P0 promoted（判据强度必须与危险度匹配）
+- 现象：**「按名字猜」的弱判据接上全自动删除 → 静默删真数据**。垃圾自学习库条目 `namepart  老王论坛`（2026-09-18 手工入册，原意清理论坛广告 `txt` / `apk`）把文件名带该前缀的 **43 个真视频 mp4（38.23 GB）**删除，波及 `2026-09-20` 的 **5 个子批 / 8 个组**（`b2` / `b3` / `b6` / `b7` / `b8`），且**连源分卷与父压缩包一并删除 → 不可逆**。全程 `extract_rc=0`、DB 记 `DELETED`、事件链**一路 INFO**，**零告警**；由**盘上校验**暴露。**误差伤只限于 mp4**，其余被 junk 删的均为 KB 级广告文件（`txt` / `url` / `zip` / `exe` / 0 字节），无价值。
+- 根因：**判据强度与危险度不匹配**。三类判据强度悬殊——`hash`（内容指纹，改多少遍名字都认得出＝**强**）、`name`（完整文件名＝弱）、`namepart`（名称片段＝**最弱**，不读内容、对同名真文件零分辨力）。而 `junk.is_auto_rule()` 把**所有 `LIBRARY:*` 命中**一律判为零风险自动删，**不经人工确认**。设计上**缺一张「判据强度 → 允许的危险动作」对照表**，一个布尔值把三类判据**压平**成同一档危险度。次生原因：① **记账不校验盘面**——每层只验证"自己这步做完了"，无一层验证"做完之后盘上还剩什么"；② **损失被二次放大**——首次 kill 没杀干净（只杀主 PID，另一实例跑到 00:52），误以为已停手就去改代码，**又多删 34 个**（9 → 43）；**改代码对已在跑的进程无效**（Python 早已把旧模块加载进内存）。
+- 处置：v3.9.2 落地（**不动强判据，只给弱判据装闸门**）——① `config.py` 新增 `JUNK_NAMERULE_MEDIA_EXTS`（音视频扩展名 30 个）与 `JUNK_NAMERULE_MAX_BYTES = 8 MiB`；② `junklib.name_rule_applies(path, size)`：媒体扩展名→不适用、≥8 MiB→不适用、否则适用、**绝不抛异常**；③ `lookup()` 的 `name` / `namepart` 分支**前置**该闸门，`hash` 分支**不受限**；④ `junklib.py` docstring 新增 **§G**（与 §E 密码载体永久豁免并列）；⑤ 测试 `tests/test_junklib.py::WeakRuleScopeTests`（7 用例）＋事故本体回归 `test_accident_regression_namepart_never_hits_video`，全量 **713 绿**。**合成硬性质**：叠加 `JUNK_HASH_MAX_BYTES = 1 MiB` 后，**≥ 8 MiB 的文件不可能被自动判为垃圾**，要删只能走人工确认。
+- 关联：pitfalls **#73**；`junklib.name_rule_applies` / `junklib.lookup` / `junk.is_auto_rule`；`config.JUNK_NAMERULE_MEDIA_EXTS` / `JUNK_NAMERULE_MAX_BYTES` / `JUNK_HASH_MAX_BYTES`；`junklib.py` docstring §G；事故报告 `F:\BaiduNetdiskDownload\pipeline\reports\09-22-P0-垃圾库误删视频-事故报告.md`；CHANGELOG v3.9.2
+- 指纹：evidence_strength_vs_action_risk_mismatch
+- 证据：**43 个 mp4 / 38.23 GB**（b2 7/10.53、b3 2/5.75、b6 xiaoyalaoshi 6/4.36、b6 小球 10/4.16、b7 06清纯安静 4/3.53、b7 可可乖乖 4/3.47、b7 boluo520 7/3.27、b8 小咪咪咯 3/3.15）；全部 `junk_rule=LIBRARY:NAMEPART` + `is_junk=1` + `source_deleted=1`；DB 比对：现存未删 mp4 行 1030 条，被删 43 个中**有同名同大小副本残留的 0 个**；09-20 盘上现存视频 49 个 / 46.83 GB。
+- 定级：**P0**（不可逆数据丢失 38.23 GB；且**静默**、记账全绿，同类事故可反复发生而不被察觉）。
+- 遗留（**不挽回任何数据**）：38.23 GB 须重新下载源；43 行逐文件明细未落盘（以 DB 查询为准）**待补**；首次删除精确时刻 / 首次 kill 时刻**待补**；`is_auto_rule()` 的「判据强度分级」尚未落成显式字段（建议后续项）；流水线 **kill 不彻底**（多实例并存）这一运维缺陷**未修复**（损失放大器，建议后续项）。
+- 复现：1 次
+

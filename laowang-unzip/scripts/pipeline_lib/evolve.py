@@ -579,18 +579,22 @@ def _empty_mine(batch) -> dict:
                         "db_success_total": 0}}
 
 
-def _pw_gaps(conn) -> dict:
+def _pw_gaps(conn, root: Optional[str] = None) -> dict:
     """v3.6.0: 密码学习缺口（DB 成功过、但不在 learned 库里的密码）。
 
     **只读**，DB/learned 不可用一律降级为空结构，绝不抛。
+    v3.8.0：库改由 per-root 主库承载（``<root>/.pipeline/passwords.master.txt``）；
+    给 root 读主库，缺省回退 skill 级旧文件（迁移尚未跑时的兼容路径）。
     """
     empty = {"db_only": [], "learned_total": 0, "db_success_total": 0}
     if conn is None:
         return empty
     try:
         from . import pwstats
+        from . import passwords as _pw_mod
         db_counts = pwstats.counts_from_db(conn)
-        learned = pwstats.read_counts(pwstats.learned_path())
+        lp = _pw_mod.master_path(root) if root else pwstats.learned_path()
+        learned = pwstats.read_counts(lp)
     except Exception:  # noqa: BLE001
         return empty
     db_only = []
@@ -601,7 +605,8 @@ def _pw_gaps(conn) -> dict:
             "db_success_total": sum(db_counts.values())}
 
 
-def mine_from_db(conn, batch: Optional[str] = None) -> dict:
+def mine_from_db(conn, batch: Optional[str] = None,
+                 root: Optional[str] = None) -> dict:
     """**只读**挖掘本批候选教训素材（表/列不存在时降级为空结构，绝不抛）。
 
     返回（v3.7.1 新增三分类与历史基线键，原有键全部保留、向后兼容）::
@@ -743,7 +748,7 @@ def mine_from_db(conn, batch: Optional[str] = None) -> dict:
             "SELECT COUNT(*) FROM files WHERE batch=?", (b,))
 
         # -- v3.6.0: 密码学习缺口（DB 成功过但不在 learned 库） --------------
-        out["pw_gaps"] = _pw_gaps(conn)
+        out["pw_gaps"] = _pw_gaps(conn, root)
 
     except sqlite3.Error as exc:
         out["detail"] = "db error: %s" % exc
@@ -1018,7 +1023,8 @@ def health(skill_root: str, root: Optional[str] = None, conn=None) -> dict:
     try:
         from . import pwstats as _pwstats
         from . import passwords as _pw_mod
-        lp = _pwstats.learned_path(skill_root)
+        lp = _pw_mod.master_path(root) if root \
+            else _pwstats.learned_path(skill_root)
         _ph, pw_entries, _pf = _pwstats.parse_learned(lp)
         pw_list = [e.password for e in pw_entries if e.password]
         dup_pw = len(pw_list) != len(set(pw_list))
@@ -1048,6 +1054,68 @@ def health(skill_root: str, root: Optional[str] = None, conn=None) -> dict:
             hint))
     except Exception as exc:  # noqa: BLE001 — 降级：不因密码库崩溃
         checks.append(_chk("密码库", True, "skipped (%s)" % exc, ""))
+
+    # 11) 密码库防劣化 (v3.8.0 phase 4) -------------------------------------
+    # 决定3：**恒 ok=True，永不阻断**（绝不改 evolve --check 退出码）。只读
+    # library_metrics + 最近一条 PW_STAT 事件；命中率/降权占比/库量/月增全部只写进
+    # detail+hint。任何失败降级为 ok=True, detail="skipped (...)"，绝不抛。
+    try:
+        from . import pwstats as _pwstats
+        from . import passwords as _pw_mod
+        _mp = _pw_mod.master_path(root) if root \
+            else _pwstats.learned_path(skill_root)
+        _m = _pwstats.library_metrics(_mp, conn, None)
+        # 返工后契约：解析不了（库读不到/结构坏）→ 所有计数返回 None + error，
+        # 表示**不可得**（绝不返 0）。必须显式处理：直接 int(None) 会抛 TypeError，
+        # 被外层 except 兜成 "skipped (TypeError...)" —— 那是把「数据不可得」误报成
+        # 「程序出错」，detail 会误导排查（静默失真的一种）。
+        if _m.get("error"):
+            raise RuntimeError("库不可得: %s" % _m["error"])
+        total = int(_m.get("total", 0))
+        month_new = _m.get("month_new")
+        decayed = int(_m.get("decayed", 0))
+        suspicious = int(_m.get("suspicious", 0))
+        # pass1 命中率：取最近一条 PW_STAT 的稳定令牌 p1=<hit>/<att>（无则 n/a）。
+        rate = None
+        sample = 0
+        try:
+            if conn is not None:
+                _row = conn.execute(
+                    "SELECT message FROM events WHERE action=?"
+                    " ORDER BY id DESC LIMIT 1",
+                    (C.ACTION_PW_STAT,)).fetchone()
+                _msg = (_row[0] if _row is not None else "") or ""
+                _mm = re.search(r"p1=(\d+)/(\d+)", _msg)
+                if _mm:
+                    _hit, _att = int(_mm.group(1)), int(_mm.group(2))
+                    sample = _att
+                    rate = (float(_hit) / _att) if _att else None
+        except Exception:  # noqa: BLE001
+            rate, sample = None, 0
+        detail = ("库量 %d / 月增 %s / pass1命中率 %s(a=%d) / 降权 %d"
+                  % (total,
+                     ("不可得" if month_new is None else str(month_new)),
+                     ("n/a" if rate is None else "%.0f%%" % (100.0 * rate)),
+                     sample, decayed))
+        hints = []
+        if (rate is not None and sample >= C.PASS1_HIT_RATE_MIN_SAMPLE
+                and rate < C.PASS1_HIT_RATE_MIN):
+            hints.append("pass1 命中率偏低（<%.0f%%）——top-K 可能失准"
+                         % (100.0 * C.PASS1_HIT_RATE_MIN))
+        if total and decayed >= C.DECAY_FRACTION_ALARM * total:
+            hints.append("降权占比 ≥%.0f%%（大面积误伤？可 DECAY_ENABLED=False 回退）"
+                         % (100.0 * C.DECAY_FRACTION_ALARM))
+        if month_new is not None and month_new > C.LIBRARY_MONTH_GROWTH_MAX:
+            hints.append("月增 %d 超上限 %d"
+                         % (month_new, C.LIBRARY_MONTH_GROWTH_MAX))
+        if total > C.LIBRARY_SIZE_MAX:
+            hints.append("库量 %d 超上限 %d" % (total, C.LIBRARY_SIZE_MAX))
+        if suspicious:
+            hints.append("%d 行 added_date>last_date（自相矛盾，非阻断）"
+                         % suspicious)
+        checks.append(_chk("密码库防劣化", True, detail, "；".join(hints)))
+    except Exception as exc:  # noqa: BLE001 — 恒不阻断
+        checks.append(_chk("密码库防劣化", True, "skipped (%s)" % exc, ""))
 
     # 10) Skill层只增不减 (v3.6.0) -----------------------------------------
     # 铁律「只补丁不重写」的机械护栏：pitfalls.md 编号须连续无重复（缺号=被删、
@@ -1354,7 +1422,7 @@ def evolve(root: Optional[str] = None, skill_root: Optional[str] = None,
 
     try:
         h = health(skill_root, root=root, conn=conn)
-        mine = mine_from_db(conn, batch)
+        mine = mine_from_db(conn, batch, root=root)
 
         header, lessons, footer = "", [], ""
         try:

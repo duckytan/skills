@@ -19,6 +19,9 @@ from typing import Optional
 
 from . import config as C
 from . import fsutil
+# U5 (v3.9.0): the machine-artifact origin set is the SINGLE source of truth
+# (``scheduler.REPAIR_ORIGINS``) — reused here, never duplicated (§0.1 硬约束 2).
+from .scheduler import REPAIR_ORIGINS
 
 
 def _fmt_bytes(n) -> str:
@@ -101,11 +104,16 @@ def generate_report(pipe) -> str:
         L.append("| %d | %d | %s | %s |" % (r["depth"], r["n"], r["ef"] or 0, r["f"]))
     L.append("")
 
-    # -- 三、失败清单 --------------------------------------------------------
-    L.append("## 三、失败清单（按 fail_reason 分组）")
+    # -- 三、失败清单（U5 v3.9.0：源文件 / 机器产物 / 未穷尽 三分类） -----------
+    # 旧版把所有 FAILED 行混为一栏，混同了三种本质不同的情况：
+    #   ① 源文件失败（origin='DOWNLOAD'）—— 用户可行动（补密码 / 补卷 / 重下）；
+    #   ② 机器产物失败（origin ∈ REPAIR_ORIGINS）—— 本工具 carve/patch/concat/
+    #      rename 的中间产物，**不是用户下载的源**，用户无从处理；
+    #   ③ 未穷尽（仍处 PASSWORD_DEFERRED）—— 两遍试密尚未跑完，此刻判失败是错的。
+    # 判定口径（§U5）：仅当「① 存在」且「两遍试密已跑完」时才判最终失败。
+    # 三分类全部取自既有字段 origin/status/fail_reason —— 不新增列、不造平行真相源。
+    L.append("## 三、失败清单（三分类：源文件 / 机器产物 / 未穷尽）")
     L.append("")
-    L.append("| fail_reason | 数量 | 涉及体积 | 典型文件 | 建议动作 |")
-    L.append("|---|---|---|---|---|")
     advice = {
         C.FAIL_WRONG_PASSWORD: "补密码后 `retry-failed`",
         C.FAIL_PASSWORD_NOT_FOUND: "补密码后 `retry-failed`",
@@ -117,12 +125,87 @@ def generate_report(pipe) -> str:
         C.FAIL_OUTPUT_ZERO_ROOTS: "磁盘曾写满；输出体积与源相差<2%时已自动判成功转正常链，其余清理磁盘后重跑",
         C.FAIL_UNSAFE_PATH: "源包已保留，人工核查越界产物（见 zip-slip 告警）",
     }
-    for r in q("SELECT fail_reason, COUNT(*) n, SUM(size_bytes) s, MIN(file_name) f"
-               " FROM files WHERE batch=? AND status='FAILED' GROUP BY fail_reason"
-               " ORDER BY n DESC", (batch,)):
-        L.append("| %s | %d | %s | %s | %s |" %
-                 (r["fail_reason"], r["n"], _fmt_bytes(r["s"]), r["f"],
-                  advice.get(r["fail_reason"], "查看 last_error")))
+    fail_rows = q("SELECT fail_reason, origin, COUNT(*) n, SUM(size_bytes) s,"
+                  " MIN(file_name) f FROM files WHERE batch=? AND status='FAILED'"
+                  " GROUP BY fail_reason, origin ORDER BY n DESC", (batch,))
+    source_fail = [r for r in fail_rows if r["origin"] == "DOWNLOAD"]
+    machine_fail = [r for r in fail_rows if (r["origin"] or "") in REPAIR_ORIGINS]
+    other_fail = [r for r in fail_rows
+                  if r["origin"] != "DOWNLOAD"
+                  and (r["origin"] or "") not in REPAIR_ORIGINS]
+    # 未穷尽 = 本批仍处 PASSWORD_DEFERRED 的行。批次收尾 sweep 正常跑完会把它们
+    # 全部落定（解出或降级为 FAILED），故「本批无 DEFERRED 残留」即 pass2 已跑完。
+    deferred_batch = q("SELECT COUNT(*) n, SUM(size_bytes) s FROM files"
+                       " WHERE batch=? AND status='PASSWORD_DEFERRED'",
+                       (batch,))[0]
+    deferred_n = deferred_batch["n"] or 0
+    pass2_done = (deferred_n == 0)
+    src_fail_n = sum(r["n"] for r in source_fail)
+
+    L.append("### 3.1 源文件失败（origin=DOWNLOAD — 需要你处理）")
+    L.append("")
+    L.append("> 这些是你下载进来的真实源包。按「建议动作」处理（补密码 / 补卷 / 重下）。")
+    L.append("")
+    if source_fail:
+        L.append("| fail_reason | 数量 | 涉及体积 | 典型文件 | 建议动作 |")
+        L.append("|---|---|---|---|---|")
+        for r in source_fail:
+            L.append("| %s | %d | %s | %s | %s |" %
+                     (r["fail_reason"], r["n"], _fmt_bytes(r["s"]), r["f"],
+                      advice.get(r["fail_reason"], "查看 last_error")))
+    else:
+        L.append("（无）")
+    L.append("")
+
+    L.append("### 3.2 机器产物失败（origin ∈ REPAIR_ORIGINS — 工具自身中间产物，"
+             "**无需你处理**）")
+    L.append("")
+    L.append("> 这些是本工具 carve / patch / concat / rename 产生的中间产物，"
+             "**不是你下载的源文件**，你无法对它们采取任何动作 —— 故**不列入**"
+             "「需要人工介入」，也**不计入**最终失败判定。")
+    L.append("")
+    if machine_fail:
+        L.append("| fail_reason | origin | 数量 | 涉及体积 | 典型文件 |")
+        L.append("|---|---|---|---|---|")
+        for r in machine_fail:
+            L.append("| %s | %s | %d | %s | %s |" %
+                     (r["fail_reason"], r["origin"], r["n"],
+                      _fmt_bytes(r["s"]), r["f"]))
+    else:
+        L.append("（无）")
+    L.append("")
+
+    L.append("### 3.3 未穷尽（PASSWORD_DEFERRED — 两遍试密尚未跑完，此刻**不判失败**）")
+    L.append("")
+    if deferred_n:
+        L.append("⚠ 本批仍有 **%d** 个包（%s）**未穷尽两遍试密** —— pass2 长尾未跑完，"
+                 "**暂不作最终失败判定**；批次正常收尾会自动落定这些行，"
+                 "亦可重跑 `run` 接续。" % (deferred_n, _fmt_bytes(deferred_batch["s"])))
+    else:
+        L.append("（无 — 本批两遍试密已跑完，无 PASSWORD_DEFERRED 残留）")
+    L.append("")
+
+    if other_fail:
+        L.append("### 3.4 其他来源失败（非源包 / 非机器产物）")
+        L.append("")
+        L.append("| fail_reason | origin | 数量 | 涉及体积 | 典型文件 |")
+        L.append("|---|---|---|---|---|")
+        for r in other_fail:
+            L.append("| %s | %s | %d | %s | %s |" %
+                     (r["fail_reason"], r["origin"], r["n"],
+                      _fmt_bytes(r["s"]), r["f"]))
+        L.append("")
+
+    # 「解不开」判定的**唯一出口**：① 有源文件失败 且 两遍试密已跑完（② 机器产物
+    # 与 ③ 未穷尽都不计入）。这是 U5 的核心纠错：不得在选项尚未穷尽时谎报失败。
+    if src_fail_n and pass2_done:
+        L.append("**结论：两遍试密已跑完，以上 %d 个源文件失败包确为「解不开」"
+                 "（缺卷 / 损坏 / 密码不在库）——请人工定夺。**" % src_fail_n)
+    elif deferred_n:
+        L.append("**结论：本批两遍试密**尚未穷尽**（仍有 %d 个 PASSWORD_DEFERRED），"
+                 "不得据此下最终失败结论。**" % deferred_n)
+    else:
+        L.append("**结论：本批无源文件失败包。**")
     L.append("")
 
     # -- 三·附：zip-slip 安全告警（P1-1） -----------------------------------
@@ -259,10 +342,14 @@ def generate_report(pipe) -> str:
                    " JOIN files f ON e.file_id=f.id"
                    " WHERE e.batch=? AND e.message LIKE '%mtime too fresh%'"
                    " AND f.status='DISCOVERED' ORDER BY f.id", (batch,))
+    # U5: 「待人工定夺」只列**源文件失败**（origin='DOWNLOAD' 且 FAILED）。
+    # 机器产物（origin ∈ REPAIR_ORIGINS）是工具自身中间产物，用户无从处理，
+    # 不得出现在此处（见 §三 3.2）；PASSWORD_DEFERRED 非失败、亦不在此列。
     for r in q("SELECT fail_reason, COUNT(*) n, SUM(size_bytes) s FROM files"
-               " WHERE batch=? AND status='FAILED' GROUP BY fail_reason", (batch,)):
+               " WHERE batch=? AND status='FAILED' AND origin='DOWNLOAD'"
+               " GROUP BY fail_reason", (batch,)):
         n += 1
-        L.append("%d. %d 个失败包（%s）— fail_reason=%s，`retry-failed` 或补密码/补卷"
+        L.append("%d. %d 个源文件失败包（%s）— fail_reason=%s，`retry-failed` 或补密码/补卷"
                  % (n, r["n"], _fmt_bytes(r["s"]), r["fail_reason"]))
     for r in q("SELECT COUNT(*) n FROM files WHERE batch=?"
                " AND status='DUPLICATE_PENDING'", (batch,)):
@@ -346,6 +433,12 @@ def generate_report(pipe) -> str:
                 " WHERE status='DUPLICATE_PENDING' ORDER BY batch, id")
     junk_all = q("SELECT id, path, size_bytes, batch FROM files"
                  " WHERE status='JUNK_PENDING' ORDER BY batch, id")
+    # v3.8.0 (§4.3): PASSWORD_DEFERRED is NON-terminal but must never vanish
+    # silently.  A normally-finished batch resolves it in-run, so any row left
+    # here means the batch was interrupted mid pass2 — surface it explicitly as
+    # "pending pass2" (NOT a failure).
+    def_all = q("SELECT id, path, size_bytes, batch FROM files"
+                " WHERE status='PASSWORD_DEFERRED' ORDER BY batch, id")
     L.append("## 十、全库 pending 汇总（跨批）")
     L.append("")
     L.append("| 待办类型 | 数量 | 体积 |")
@@ -356,7 +449,23 @@ def generate_report(pipe) -> str:
     L.append("| 垃圾待清理（JUNK_PENDING） | %d | %s |"
              % (len(junk_all), _fmt_bytes(sum(r["size_bytes"] or 0
                                               for r in junk_all))))
+    L.append("| 密码待二遍（PASSWORD_DEFERRED，非失败） | %d | %s |"
+             % (len(def_all), _fmt_bytes(sum(r["size_bytes"] or 0
+                                             for r in def_all))))
     L.append("")
+    if def_all:
+        L.append("### 密码待二遍明细（PASSWORD_DEFERRED）")
+        L.append("")
+        L.append("⚠ 以下文件第一遍未解开、正等待 pass2 长尾补刀（**非失败**）。"
+                 "批次正常结束会自动收尾；若长期停留，重跑 `run` 即会接续 pass2。")
+        L.append("")
+        L.append("| 批次 | 文件 id | 路径 | 大小 |")
+        L.append("|---|---|---|---|")
+        for r in def_all:
+            L.append("| %s | %d | %s | %s |"
+                     % (r["batch"] or "-", r["id"], r["path"],
+                        _fmt_bytes(r["size_bytes"])))
+        L.append("")
     if dup_all:
         L.append("### 去重待定夺明细（全库）")
         L.append("")
@@ -457,6 +566,58 @@ def generate_report(pipe) -> str:
     except Exception as exc:  # noqa: BLE001 — 自省失败绝不能让报告失败
         L.append("自省模块未运行：%s" % exc)
     L.append("")
+
+    # -- 十二、结构视图（只读 · v3.9.0 §U2-f） -------------------------------
+    # 纯只读：数据全部取自 files 表既有字段；不写库、不作闸门、不阻塞批次。
+    # 整段包 try/except —— 结构视图任何异常都不得让报告生成失败。
+    L.append("## 十二、结构视图（只读）")
+    L.append("")
+    L.append("> 仅供查看（家族/卷组 × 套娃层 × 重复族）。**不作任何判定或闸门**，"
+             "数据全部取自 files 表既有字段。")
+    L.append("")
+    try:
+        vol_rows = q("SELECT volume_group g, COUNT(*) n,"
+                     " SUM(CASE WHEN volume_role='FIRST' THEN 1 ELSE 0 END) f,"
+                     " SUM(CASE WHEN volume_role='CONTINUE' THEN 1 ELSE 0 END) c"
+                     " FROM files WHERE batch=? AND volume_group IS NOT NULL"
+                     " AND volume_group <> '' GROUP BY volume_group"
+                     " ORDER BY n DESC, g LIMIT 50", (batch,))
+        L.append("### 卷组（volume_group × 角色）")
+        L.append("")
+        if vol_rows:
+            L.append("| 卷组 | 成员数 | FIRST | CONTINUE |")
+            L.append("|---|---|---|---|")
+            for r in vol_rows:
+                L.append("| %s | %d | %d | %d |"
+                         % (r["g"], r["n"], r["f"] or 0, r["c"] or 0))
+        else:
+            L.append("（本批无卷组成员）")
+        L.append("")
+        depth_rows = q("SELECT depth d, COUNT(*) n FROM files WHERE batch=?"
+                       " GROUP BY depth ORDER BY depth", (batch,))
+        L.append("### 套娃层级（depth 分布）")
+        L.append("")
+        L.append("| 层级 | 文件数 |")
+        L.append("|---|---|")
+        for r in depth_rows:
+            L.append("| %d | %d |" % (r["d"], r["n"]))
+        L.append("")
+        dup_rows = q("SELECT COALESCE(dup_group,'(未分组)') g, COUNT(*) n"
+                     " FROM files WHERE batch=? AND dup_of_id IS NOT NULL"
+                     " GROUP BY dup_group ORDER BY n DESC LIMIT 50", (batch,))
+        L.append("### 重复家族（dup_group）")
+        L.append("")
+        if dup_rows:
+            L.append("| 重复组 | 成员数 |")
+            L.append("|---|---|")
+            for r in dup_rows:
+                L.append("| %s | %d |" % (r["g"], r["n"]))
+        else:
+            L.append("（本批无重复成员）")
+        L.append("")
+    except Exception as exc:  # noqa: BLE001 — 结构视图绝不阻断报告
+        L.append("结构视图未生成：%s" % exc)
+        L.append("")
 
     text = "\n".join(L)
     with open(path, "w", encoding="utf-8") as fh:

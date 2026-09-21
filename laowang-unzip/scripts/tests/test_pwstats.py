@@ -312,9 +312,9 @@ class PasswordsIntegrationTests(unittest.TestCase):
         # assert the learned-only password is still present and no password lost.
         self.assertIn("sX8uRvp4Ld73", lib)
 
-    def test_describe_sources_has_learned_label(self):
+    def test_describe_sources_has_master_label(self):
         labels = [label for label, _p in pw_mod.describe_sources(root="R")]
-        self.assertIn("learned", labels)
+        self.assertIn("master", labels)
 
 
 class PwStatsCliTests(unittest.TestCase):
@@ -334,7 +334,7 @@ class PwStatsCliTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         out = buf.getvalue()
         self.assertIn("共", out)
-        self.assertIn("passwords.learned.txt", out)
+        self.assertIn("passwords.master.txt", out)
 
     def test_cli_stats_top(self):
         buf = io.StringIO()
@@ -356,8 +356,7 @@ class PwStatsCliTests(unittest.TestCase):
         tmp = os.path.join(self.dir, "learned_bad.txt")
         with open(tmp, "w", encoding="utf-8", newline="") as fh:
             fh.write("5\tabc\t2026-01-01\tA\n5\tabc\t2026-01-02\tB\n")
-        with mock.patch.object(P, "learned_path", return_value=tmp), \
-                mock.patch.object(pw_mod, "LEARNED_SKILL_PASSWORDS", tmp), \
+        with mock.patch.object(pw_mod, "master_path", return_value=tmp), \
                 contextlib.redirect_stdout(io.StringIO()):
             rc = pipeline.main(["pw-stats", "--verify", "--root", self.root])
         self.assertEqual(rc, 1)
@@ -386,7 +385,7 @@ class PwStatsCliTests(unittest.TestCase):
         conn.commit()
         conn.close()
         buf = io.StringIO()
-        with mock.patch.object(P, "learned_path", return_value=tmp), \
+        with mock.patch.object(pw_mod, "master_path", return_value=tmp), \
                 contextlib.redirect_stdout(buf):
             rc = pipeline.main(["pw-stats", "--rebuild", "--root", self.root])
         self.assertEqual(rc, 0)
@@ -442,7 +441,7 @@ class SchedulerLearnTests(unittest.TestCase):
             lp = os.path.join(d, "learned.txt")
             pipe = self._pipe(d)
             buf = io.StringIO()
-            with mock.patch.object(P, "learned_path", return_value=lp), \
+            with mock.patch.object(pw_mod, "master_path", return_value=lp), \
                     contextlib.redirect_stdout(buf):
                 pipe._learn_password(7, "sX8uRvp4Ld73", "FILE_NAME")
             self.assertTrue(os.path.isfile(lp))
@@ -456,7 +455,7 @@ class SchedulerLearnTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             lp = os.path.join(d, "learned.txt")
             pipe = self._pipe(d)
-            with mock.patch.object(P, "learned_path", return_value=lp), \
+            with mock.patch.object(pw_mod, "master_path", return_value=lp), \
                     contextlib.redirect_stdout(io.StringIO()):
                 pipe._learn_password(7, "abc", "LIBRARY")
                 pipe._learn_password(7, "abc", "LIBRARY")     # same file_id
@@ -468,7 +467,7 @@ class SchedulerLearnTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             lp = os.path.join(d, "learned.txt")
             pipe = self._pipe(d, dry_run=True)
-            with mock.patch.object(P, "learned_path", return_value=lp), \
+            with mock.patch.object(pw_mod, "master_path", return_value=lp), \
                     contextlib.redirect_stdout(io.StringIO()):
                 pipe._learn_password(7, "abc", "LIBRARY")
             self.assertFalse(os.path.exists(lp))               # P0: no writes
@@ -478,7 +477,7 @@ class SchedulerLearnTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             lp = os.path.join(d, "learned.txt")
             pipe = self._pipe(d)
-            with mock.patch.object(P, "learned_path", return_value=lp):
+            with mock.patch.object(pw_mod, "master_path", return_value=lp):
                 pipe._learn_password(7, "", "NONE")
             self.assertFalse(os.path.exists(lp))
             self.assertEqual(pipe.db.events, [])
@@ -490,7 +489,7 @@ class SchedulerLearnTests(unittest.TestCase):
                 fh.write("x")
             bad = os.path.join(blocker, "learned.txt")
             pipe = self._pipe(d)
-            with mock.patch.object(P, "learned_path", return_value=bad), \
+            with mock.patch.object(pw_mod, "master_path", return_value=bad), \
                     contextlib.redirect_stdout(io.StringIO()):
                 pipe._learn_password(7, "abc", "LIBRARY")      # must not raise
 

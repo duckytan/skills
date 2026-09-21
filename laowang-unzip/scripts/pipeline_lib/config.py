@@ -9,6 +9,8 @@ No absolute paths are allowed in this file: every path is derived from the
 
 from __future__ import annotations
 
+import os
+
 # ---------------------------------------------------------------------------
 # Storage layout (relative to the user-provided workdir)
 # ---------------------------------------------------------------------------
@@ -31,6 +33,12 @@ STATUS_QUEUED = "QUEUED"
 STATUS_HASHING = "HASHING"
 STATUS_DUPLICATE_PENDING = "DUPLICATE_PENDING"
 STATUS_PASSWORD_TESTING = "PASSWORD_TESTING"
+# v3.8.0 (password-library-redesign §4.3): a MID-FLIGHT holding state entered
+# only AFTER pass1 (the high-confidence + top-K + name-derived candidates) is
+# exhausted while the archive is still password-blocked AND a pass2 long tail
+# exists.  It is deliberately NOT terminal (the run must finish it in the same
+# batch) and NOT open (the main loop must not re-run pass1 on it).
+STATUS_PASSWORD_DEFERRED = "PASSWORD_DEFERRED"
 STATUS_EXTRACTING = "EXTRACTING"
 STATUS_EXTRACTED = "EXTRACTED"
 STATUS_COMPLETE = "COMPLETE"
@@ -46,6 +54,18 @@ OPEN_STATES = {STATUS_DISCOVERED, STATUS_QUEUED}
 TERMINAL_STATES = {STATUS_FAILED, STATUS_SKIPPED, STATUS_DELETED, STATUS_LOST, STATUS_COMPLETE}
 # Semi-terminal: waiting for the user; the loop must not act on them.
 PENDING_USER_STATES = {STATUS_DUPLICATE_PENDING, STATUS_JUNK_PENDING}
+# v3.8.0: non-terminal, needs FINISHING (pass2 sweep / resume).  A row here is
+# neither a failure nor a nothing-to-do: the batch-finish sweep must resolve it
+# within the same run (see scheduler._finish_deferred_sweep).  Kept OUT of
+# TERMINAL_STATES (so *we* never treat it as done) and OUT of OPEN_STATES (so
+# the main pass1 loop never re-runs pass1 on it).  status/evolve/report must
+# treat it as "pending pass2", never as a failure.
+DEFERRED_STATES = {STATUS_PASSWORD_DEFERRED}
+# Every state that is neither terminal nor a dead-end pending-user state.  Used
+# as the canonical "the loop still owns this row" set (OPEN + mid-flight).
+NON_TERMINAL_STATES = (set(OPEN_STATES) | set(DEFERRED_STATES)
+                       | {STATUS_ANALYZING, STATUS_HASHING,
+                          STATUS_PASSWORD_TESTING, STATUS_EXTRACTING})
 
 # ---------------------------------------------------------------------------
 # Event actions (§2.8.3 / §11.3)
@@ -70,7 +90,33 @@ ACTION_COLLECT = "COLLECT"             # 成品归集 move/copy of a leaf conten
 # v3.6.0 Part A: a winning password was recorded into the self-learning library.
 # Doubles as the idempotency credential (one PW_LEARNED event per file_id).
 ACTION_PW_LEARNED = "PW_LEARNED"
+# v3.8.0 (§4.2/§4.3 two-pass): a pass1 failure that was held over as
+# PASSWORD_DEFERRED (waiting for the batch-finish pass2 long tail, or — for an
+# internal failure — a pass1 replay).  The COUNT of these events per file_id is
+# the deferral counter (no schema change needed).
+ACTION_PW_DEFERRED = "PW_DEFERRED"
+# v3.8.0 (§4.6): a pre-existing DEFERRED row was picked up and requeued to run
+# its pass2/replay (crash/interrupt recovery — the same requeue idiom as
+# _resume_extracted, since DEFERRED is not in OPEN_STATES).
+ACTION_PW_DEFERRED_RESUME = "PW_DEFERRED_RESUME"
+# v3.8.0 (§4.3 anti-hang): a DEFERRED row that pass2 could not solve was
+# downgraded to FAILED so a normally-finished batch never leaves a DEFERRED
+# residue.  Always emitted at WARN level.
+ACTION_PW_DEFERRED_DOWNGRADE = "PW_DEFERRED_DOWNGRADE"
+# v3.8.0 phase 4 (防劣化): the batch-end埋点 summary (pass1/pass2 hit rate,
+# library size / month-new entries / decayed count).  Level INFO.
+ACTION_PW_STAT = "PW_STAT"
+# v3.8.0 phase 4 (防劣化): a password in the library was DECAYED (ranked into the
+# pass2 long tail this batch).  Always WARN — the only "toothed" decay signal
+# (health item 11 is ok=True forever; §12 decision 3).
+ACTION_PW_DECAY = "PW_DECAY"
 ACTION_PRUNE = "PRUNE"                 # v3.7.0: empty-directory removal (§6.6)
+# v3.9.0 (U4-c): the DB<->disk consistency sweep (manual `consistency-check`
+# AND the automatic batch-close pass).  Carries the drift summary.
+ACTION_DB_CONSISTENCY = "DB_CONSISTENCY"
+# v3.9.0 (U4-a): a machine artifact's own output directory (`_ext` dir incl.
+# non-empty residue) removed together with its source (lineage-scoped).
+ACTION_RMDIR = "RMDIR"
 # v3.7.x: a pre-existing unparented root row was NOT adopted by a re-sweep's
 # product because its path is outside the parent's product scope (DEBUG note).
 ACTION_ADOPT_SKIP = "ADOPT_SKIP"
@@ -112,6 +158,87 @@ FAIL_VOLUME_INCOMPLETE = "VOLUME_INCOMPLETE"
 # P1-1: a product path escaped the extraction root (zip-slip).  The archive
 # is judged FAILED and its source is NEVER deleted.
 FAIL_UNSAFE_PATH = "UNSAFE_PATH"
+
+# ---------------------------------------------------------------------------
+# Two-pass failure classification (§4.2) — password vs internal
+# ---------------------------------------------------------------------------
+# A pass1 failure must be split into two kinds so the deferred pass knows what
+# to do (design §4.2):
+#   * PASSWORD-kind — the archive is genuinely blocked on a password.  The
+#     deferred pass runs the pass2 LIBRARY LONG TAIL (never the already-tried
+#     high-confidence sources).
+#   * INTERNAL-kind — an IO / watchdog / disk / unsafe-path style error whose
+#     cause may have recovered.  An internal error is NOT evidence the password
+#     was wrong, so the deferred pass must REPLAY the pass1 candidates instead
+#     of skipping to the tail; otherwise a real failure can be silently unsolved
+#     (破妄决 戳破的假设 5).
+#
+# FAIL_INTERNAL is a CLASSIFICATION SENTINEL, not a row fail_reason we persist
+# for these cases (we keep the concrete reason, e.g. TIMEOUT / IO_ERROR, so the
+# report stays honest); it exists for callers/messages that need a single tag.
+FAIL_INTERNAL = "INTERNAL"
+
+# Reasons that mean "this may recover; the password is not yet disproven".
+INTERNAL_FAIL_REASONS = frozenset({
+    FAIL_TIMEOUT,
+    FAIL_HANG_KILLED,
+    FAIL_IO_ERROR,
+    FAIL_DISK_FULL,
+    FAIL_DISK_GUARD_SKIP,
+    FAIL_UNSAFE_PATH,
+    FAIL_INTERNAL,
+})
+
+# Reasons that mean "the archive is blocked on a password" (§4.2 pass2 source).
+PASSWORD_FAIL_REASONS = frozenset({
+    FAIL_WRONG_PASSWORD,
+    FAIL_ENCRYPTED_HEADER,
+    FAIL_PASSWORD_NOT_FOUND,
+})
+
+
+def is_internal_failure(fail_reason) -> bool:
+    """True when *fail_reason* is an INTERNAL (possibly-recoverable) failure."""
+    return (fail_reason or "") in INTERNAL_FAIL_REASONS
+
+
+def is_password_failure(fail_reason) -> bool:
+    """True when *fail_reason* means the archive is blocked on a password."""
+    return (fail_reason or "") in PASSWORD_FAIL_REASONS
+
+
+# ---------------------------------------------------------------------------
+# Two-pass strategy knobs (§4.4 / §8 decision 4)
+# ---------------------------------------------------------------------------
+# pass1 tries the first TOP_K library passwords (count-descending); the rest go
+# to the pass2 long tail.  RECENT_DAYS is reserved for the optional A-enh
+# (added_date) enhancement — defined here but not implemented in A-core.
+TOP_K = 10
+RECENT_DAYS = 7
+# §8 decision 4: a row may be held as PASSWORD_DEFERRED at most this many
+# times before the batch-finish sweep downgrades it to FAILED (§4.3 anti-hang).
+DEFERRED_MAX_RETRY = 2
+
+# ---------------------------------------------------------------------------
+# v3.8.0 phase 4 — 密码库防劣化（降权）+ 埋点阈值 (§4 / §12 裁定)
+# ---------------------------------------------------------------------------
+# 降权 = 在 load_library 出参上做一次**纯运行期**的稳定分区重排：把「久未成功
+# 且成功次数低」的密码沉到库尾（→ 落进 pass2 长尾）。**不删库、不写盘、无状态**，
+# 只改库内相对顺序；DECAY_ENABLED=False 立即完全恢复。
+DECAY_ENABLED = True          # 降权总开关（误伤回退杀开关）
+DECAY_DAYS = 90               # 「久未成功」天数阈值（> 才降权）
+DECAY_MIN_COUNT = 3           # 次数下限（< 才降权）；count 用 merged 有效口径
+# 空 last_date 是否视为已劣化（默认否 · 决定1）：rebuild_counts 对新条目写
+# last_date=""（这些恰是 DB 证实用过的），当「已 90 天未成功」会大面积误降权。
+DECAY_EMPTY_LAST_DATE_DECAYS = False
+# 降权占比告警线（≥ 该比例触发「大面积误伤」告警）——**仅告警，无阻断力**（决定3）。
+DECAY_FRACTION_ALARM = 0.5
+# pass1 命中率告警下限 / 命中率样本不足此数则不判（避免小样本误报）。
+PASS1_HIT_RATE_MIN = 0.5
+PASS1_HIT_RATE_MIN_SAMPLE = 10
+# 库异常膨胀哨兵（仅告警）。
+LIBRARY_MONTH_GROWTH_MAX = 50
+LIBRARY_SIZE_MAX = 200
 
 # Retention / rotation (P1-3 / P1-4)
 EVENTS_KEEP_BATCHES = 50     # keep events of the newest N batches
@@ -219,6 +346,13 @@ CONTENT_KEYWORDS = ["加微信", "加qq", "扫码", "资源尽在", "解压密�
 PASSWORD_HINT_WORDS = ["解压码", "密码", "提取码", "解压密码"]
 PASSWORD_FILE_BASENAME = "password.txt"
 
+# v3.8.0 (password-library-redesign): the single writable MASTER library, per
+# processing-root.  Replaces the old scattered local/learned/root-local/workdir
+# password files.  The built-in seed library (``passwords.txt``) remains a
+# SEPARATE read-only source, merged at runtime, never written here.
+MASTER_PASSWORD_BASENAME = "passwords.master.txt"
+MASTER_PASSWORD_REL = os.path.join(".pipeline", MASTER_PASSWORD_BASENAME)
+
 # Advertisement *directory* keywords (§6.1 rule 8).
 # v3.7.0: moved here from a hard-coded tuple inside junk.py so that users can
 # extend the list without touching code.  Edit freely — matching is on the
@@ -242,6 +376,36 @@ JUNK_LIBRARY_KINDS = ("hash", "name", "namepart")
 # floor only exists to stop a single character ("a", "的") from becoming a
 # blanket rule — and fragments can only be added by hand anyway.
 JUNK_NAMEPART_MIN_CHARS = 2
+
+# --- v3.9.2 事故修复（2026-09-22）：名称类规则的作用域闸门 ------------------
+#
+# 事故：库里一条手工 `namepart  老王论坛`（用户为清论坛广告 txt/apk 而加），
+# 把解出来的真视频 `老王论坛3184065655 (1).mp4` …(7).mp4 当成广告删了
+# —— 09-20 批次共 **9 个 mp4 / 16.29 GB**，源分卷已删、不可恢复。
+#
+# 根因不在那条规则本身，而在**判据强度与危险度不匹配**：
+#   * `hash`   = 看内容认人（改多少遍名字都跑不掉，但也绝不会认错人）→ 强判据
+#   * `name` / `namepart` = 按名字**猜**（"含有这个词就是广告"）→ 弱判据
+# 弱判据被直接接上了「发现即删」这条全自动链路，于是名字撞车的真数据被静默杀掉。
+#
+# 修复：给弱判据加两道作用域闸门，命中任一即**不适用** name / namepart 规则
+# （hash 规则不受影响——它是强判据，本来也不会认错）：
+#   ① 音视频媒体：广告绝不会是几 GB 的视频，但**真视频常常带广告站名前缀**，
+#      这正是本次事故的形态。
+#   ② 大文件：广告文件一律是 KB 级。任何 ≥ JUNK_NAMERULE_MAX_BYTES 的文件
+#      都不接受"按名字猜"的判决。
+# ①+② 叠上 JUNK_HASH_MAX_BYTES（>1 MiB 不算指纹）后得到一个硬性质：
+#   **≥ JUNK_NAMERULE_MAX_BYTES 的文件从此不可能被自动判为垃圾**，
+#   要删只能走人工确认。删错大文件是不可逆的，宁可漏判。
+JUNK_NAMERULE_MEDIA_EXTS = {
+    # video
+    ".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv", ".webm", ".mpg", ".mpeg",
+    ".m4v", ".rmvb", ".rm", ".3gp", ".vob", ".m2ts", ".ts", ".divx", ".asf",
+    ".f4v", ".mts", ".ogv",
+    # audio
+    ".mp3", ".wav", ".flac", ".aac", ".ogg", ".wma", ".m4a", ".ape", ".opus",
+}
+JUNK_NAMERULE_MAX_BYTES = 8 * 1024 * 1024
 
 # ---------------------------------------------------------------------------
 # Empty-directory pruning (§6.6, v3.7.0)

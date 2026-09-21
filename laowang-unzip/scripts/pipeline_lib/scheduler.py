@@ -23,7 +23,7 @@ import os
 import sys
 import time
 from collections import deque
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from . import config as C
 from . import fsutil
@@ -39,6 +39,21 @@ from . import sz as sz_mod
 from .db import Database
 
 REPAIR_ORIGINS = {"CARVED", "MAGIC_PATCHED", "CONCATENATED", "RENAMED"}
+
+
+def _rowget(row, key, default=None):
+    """Read *key* from a sqlite3.Row **or** a plain dict without raising.
+
+    v3.8.2 F2 follow-up: the delete path can be handed a SYNTHESISED row —
+    e.g. an unregistered volume found by the disk-truth sibling scan — which
+    is a dict carrying only a few keys.  ``row["dir_path"]`` on such a row
+    used to be unreachable (step 0 always returned first), so the KeyError
+    stayed latent until identity checking made the fall-through reachable.
+    """
+    try:
+        return row[key]
+    except (KeyError, IndexError):
+        return default
 
 
 def _emit(msg: str) -> None:
@@ -257,6 +272,43 @@ class Pipeline:
         self._deferred_junk_deletes: List = []   # [(fid, path), ...]
         self.deferred_junk_deletes: int = 0
         self.prune_removed: List[str] = []     # empty dirs removed at batch end
+        # -- v3.8.0 (§4.2/§4.3 two-pass) ------------------------------------
+        # Per-run hint: fid -> the pass a requeued DEFERRED row must run
+        # ("pass2" == library long tail, "pass1" == replay for an internal
+        # failure).  Populated by _finish_deferred_sweep, consumed by
+        # _process_one.  Never persisted (the durable intent lives in the row's
+        # status/fail_reason + the PW_DEFERRED events).
+        self._deferred_resume: dict = {}
+        # True while the batch-finish sweep runs: no NEW deferrals may be
+        # created, so a normally-finished batch can NEVER leave a
+        # PASSWORD_DEFERRED residue (§4.3 anti-hang).
+        self._finishing_deferred: bool = False
+        # v3.8.0 (§4.1 step 2): the user-supplied ``--passwords`` passwords,
+        # loaded once per run (see _run_locked) and always tried in pass1 right
+        # after the empty fast path — before INHERITED.  Defaulted here so a
+        # Pipeline built without a full run() still has a usable value.
+        self.user_passwords: List[str] = []
+        # v3.8.0 A-enh (§4.1 step 6): {password: added_date} read once per run
+        # from the master library; feeds candidates_for's "recently added"
+        # (RECENT) pass1 slice.  Defaulted so a Pipeline built without a full
+        # run() still has a usable value; {} degrades to pre-A-enh behaviour.
+        self.added_dates: Dict[str, str] = {}
+        # v3.8.0 phase 4 (防劣化·埋点 §5.1): per-batch pass1/pass2 attempt+hit
+        # counters, folded into ONE ``PW_STAT`` summary event at batch end.
+        # Pure in-memory; never persisted, never changes any decision.
+        self._pw_stat: Dict[str, int] = {
+            "p1_att": 0, "p1_hit": 0, "p2_att": 0, "p2_hit": 0}
+        # -- v3.9.0 (U4-a/U4-c) ---------------------------------------------
+        # Lineage-scoped cleanup collected by _collect_deletable_tree for the
+        # CURRENT deletion: a machine artifact's own extract_output_dir (dirs)
+        # and its EXTRACTED descendants (products).  Both are deliberately
+        # transient and reset on every _collect_deletable_tree call — never a
+        # second source of truth.
+        self._deletable_dirs: List[str] = []
+        self._deletable_products: List[str] = []
+        # Last DB<->disk consistency report from the automatic batch-close
+        # sweep (U4-c).  In-memory only; the audit event is the durable trace.
+        self.consistency_report = None
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -295,6 +347,25 @@ class Pipeline:
                                                workdir=cfg.workdir,
                                                root=cfg.workdir,
                                                counts=db_counts)
+            # v3.8.0 (§4.1 step 2): keep the USER-supplied ``--passwords`` list
+            # separate from the merged library so candidates_for can place it
+            # right after NONE (before INHERITED) without disturbing the
+            # library's count ordering.  Read errors degrade to [] (never
+            # raises) — the library merge below still carries them.
+            try:
+                self.user_passwords = pw_mod.read_plain_passwords(
+                    cfg.passwords_file)
+            except Exception:  # noqa: BLE001 — never break a batch over this
+                self.user_passwords = []
+            # v3.8.0 A-enh (§4.1 step 6): read {password: added_date} from the
+            # per-root master so candidates_for can prioritise "recently added"
+            # passwords in pass1.  Read-only, never raises; a legacy 4-field
+            # master yields {} and pass1 is byte-for-byte the same as before.
+            try:
+                self.added_dates = pwstats.read_added_dates(
+                    pw_mod.master_path(cfg.workdir))
+            except Exception:  # noqa: BLE001 — never break a batch over this
+                self.added_dates = {}
             return self._run_locked(initial_ids)
         finally:
             if self.db is not None:
@@ -391,33 +462,19 @@ class Pipeline:
             self.sweep_round = 1
 
         # -- 2. main loop (§3.2 convergence: 2 idle sweeps or round cap) ------
-        idle_sweeps = 0
-        aborted = False
-        try:
-            while True:
-                if not self.queue:
-                    # A deferred (still-downloading) file just bounced: give
-                    # the writer a short breather instead of burning sweep
-                    # rounds on a busy re-enqueue loop.
-                    if self._deferred_recently:
-                        self._deferred_recently = False
-                        time.sleep(min(5.0, max(1.0, self.cfg.fresh_sec / 4.0)))
-                    idle_sweeps += 1
-                    if idle_sweeps >= C.IDLE_SWEEPS_TO_END or self.sweep_round >= C.MAX_SWEEP_ROUNDS:
-                        break
-                    self.sweep_round += 1
-                    got = self._resweep()
-                    if got:
-                        idle_sweeps = 0
-                    continue
-                fid = self.queue.popleft()
-                idle_sweeps = 0
-                self._process_one(fid)
-        except BatchAborted as exc:
-            self.db.event(None, C.ACTION_SPACE_CHECK,
-                          "batch aborted: %s" % exc, level="ERROR",
-                          batch=self.cfg.batch)
-            aborted = True
+        aborted = self._drain_queue()
+
+        # -- 2b. v3.8.0 (§4.3): batch-finish pass2 sweep.  Any row still
+        #     PASSWORD_DEFERRED after pass1 (or left behind by an interrupted
+        #     prior run) is resolved HERE — within the same run — so a normally
+        #     finished batch can never leave a hidden DEFERRED residue (§4.3
+        #     P0 anti-hang).  Runs BEFORE the final re-check so any output the
+        #     sweep produces is judged by it.
+        self._finish_deferred_sweep()
+
+        # -- 2c. v3.8.0 phase 4: batch-end 埋点汇总（PW_STAT + 视情 PW_DECAY）。
+        #     只读、只落事件，绝不改任何判定 / 流程 / 退出码。
+        self._emit_pw_stat()
 
         # -- 3. final full re-check of EXTRACTED rows (revision C2 bottom line) -
         self._final_recheck()
@@ -450,6 +507,12 @@ class Pipeline:
         # -- 4c. §6.6 (v3.7.0): remove the empty shells this batch left behind
         self.prune_removed = self._prune_empty_dirs()
 
+        # -- 4d. U4-c (v3.9.0): DB<->disk consistency sweep (automatic, never
+        #     blocking).  Runs AFTER every judge/cleanup step and BEFORE the
+        #     report, so the recomputed derived columns are what the report
+        #     describes — and a diagnostic failure can never affect the batch.
+        self._consistency_check_at_close()
+
         # -- 5. report (§8) ----------------------------------------------------
         # Settle the batch row FIRST, then render the report — the report reads
         # batches.status / free_bytes_end / finished_at, so finalising last made
@@ -470,6 +533,81 @@ class Pipeline:
             "library_hits": len(self.library_hits),
             "pruned_dirs": len(self.prune_removed),
         }
+
+    def _emit_pw_stat(self) -> None:
+        """批次末落一条 ``PW_STAT``(INFO) 埋点；有降权或命中率偏低时补 ``PW_DECAY``(WARN)。
+
+        **只读埋点**：绝不改任何判定 / 流程 / 退出码；任何异常一律吞掉（不因埋点
+        崩一批）。消息内嵌稳定的 ``p1=<hit>/<att>`` 令牌，供 ``evolve.health``
+        第 11 项解析 pass1 命中率（§5.1 / §5.2）。
+        """
+        try:
+            st = self._pw_stat
+            p1a, p1h = st.get("p1_att", 0), st.get("p1_hit", 0)
+            p2a, p2h = st.get("p2_att", 0), st.get("p2_hit", 0)
+            try:
+                metrics = pwstats.library_metrics(
+                    pw_mod.master_path(self.cfg.workdir))
+            except Exception:  # noqa: BLE001
+                metrics = {"total": 0, "month_new": None, "decayed": 0,
+                           "empty_dates": 0, "suspicious": 0}
+            total = int(metrics.get("total", 0))
+            month_new = metrics.get("month_new")
+            decayed = int(metrics.get("decayed", 0))
+            rate = (float(p1h) / p1a) if p1a else None
+            rate_txt = ("%.0f%%" % (100.0 * rate)) if rate is not None else "n/a"
+            msg = ("p1=%d/%d (%s) p2=%d/%d total=%d month_new=%s decayed=%d"
+                   % (p1h, p1a, rate_txt, p2h, p2a, total,
+                      ("n/a" if month_new is None else str(month_new)), decayed))
+            self.db.event(None, C.ACTION_PW_STAT, msg, batch=self.cfg.batch)
+            low_rate = (rate is not None
+                        and p1a >= C.PASS1_HIT_RATE_MIN_SAMPLE
+                        and rate < C.PASS1_HIT_RATE_MIN)
+            if decayed > 0 or low_rate:
+                self.db.event(
+                    None, C.ACTION_PW_DECAY,
+                    "降权 %d 条 / pass1 命中率 %s (p1=%d/%d)"
+                    % (decayed, rate_txt, p1h, p1a),
+                    level="WARN", batch=self.cfg.batch)
+        except Exception:  # noqa: BLE001 — 埋点绝不崩一批
+            pass
+
+    def _drain_queue(self) -> bool:
+        """Run the main processing loop until the queue converges.
+
+        Returns ``True`` when the batch was aborted (BatchAborted raised inside
+        a space gate).  Extracted verbatim from ``_run_locked_main`` so the
+        batch-finish pass2 sweep can REUSE the exact same loop to process the
+        requeued DEFERRED rows and any children they spawn.
+        """
+        idle_sweeps = 0
+        aborted = False
+        try:
+            while True:
+                if not self.queue:
+                    # A deferred (still-downloading) file just bounced: give
+                    # the writer a short breather instead of burning sweep
+                    # rounds on a busy re-enqueue loop.
+                    if self._deferred_recently:
+                        self._deferred_recently = False
+                        time.sleep(min(5.0, max(1.0, self.cfg.fresh_sec / 4.0)))
+                    idle_sweeps += 1
+                    if idle_sweeps >= C.IDLE_SWEEPS_TO_END or self.sweep_round >= C.MAX_SWEEP_ROUNDS:
+                        break
+                    self.sweep_round += 1
+                    got = self._resweep()
+                    if got:
+                        idle_sweeps = 0
+                    continue
+                fid = self.queue.popleft()
+                idle_sweeps = 0
+                self._process_one(fid)
+        except BatchAborted as exc:
+            self.db.event(None, C.ACTION_SPACE_CHECK,
+                          "batch aborted: %s" % exc, level="ERROR",
+                          batch=self.cfg.batch)
+            aborted = True
+        return aborted
 
     # ------------------------------------------------------------------
     # Discovery
@@ -679,7 +817,11 @@ class Pipeline:
         # with a FAKE WRONG_PASSWORD although the password was correct
         # (real case: 140889.part2.mp4 stuck 3 days).  Normalize our own
         # name first so the volume parsing below sees the true role.
-        if info.is_archive:
+        # ----
+        # U2-c.2 (v3.9.0): also enter the rename chain for an embedded-SFX
+        # FIRST volume (``is_archive`` is 0 because its head is an MZ stub, but
+        # ``embedded_volume`` marks it as a real part-N set member).
+        if info.is_archive or info.embedded_volume:
             if cfg.dry_run:
                 # ③ dry-run: skip the in-place volume-member rename (disk write);
                 # leave the row re-processable for the real run.
@@ -711,8 +853,14 @@ class Pipeline:
 
         # -- 4a. repair artifacts for non-archives (carve/patch/rename) ---------
         if not info.is_archive:
-            self._handle_repair_or_skip(fid, row, info, t0)
-            return
+            if self._handle_repair_or_skip(fid, row, info, t0):
+                return
+            # U2-c.4 (v3.9.0): an embedded-SFX FIRST volume whose volume set is
+            # already canonical returns False here so it is handed to the
+            # archive chain below instead of being carved (a carve would emit a
+            # *_carved.* artifact whose infix severs the set).  7z opens the
+            # MZ-stub SFX and links the renamed volumes.
+            row = db.get(fid) or row
 
         # -- legal installers: never extract, never junk (§6.2) -----------------
         if (row["declared_ext"] or "") in C.NO_EXTRACT_EXTS:
@@ -766,17 +914,26 @@ class Pipeline:
             self._on_terminal(fid)
             return
 
-        # -- 5. password testing: ONLY 7z t (§3.6 v1 pitfall 14) -----------------
+        # -- 5. password testing (two-pass, §4): ONLY 7z t (§3.6 pitfall 14) ----
         db.transition(fid, C.STATUS_PASSWORD_TESTING, C.ACTION_PW_TEST)
         parent = db.get(row["parent_id"]) if row["parent_id"] else None
-        candidates = pw_mod.candidates_for(row, parent, self.library)
+        pass1, pass2 = pw_mod.candidates_for(row, parent, self.library,
+                                             self.user_passwords,
+                                             self.added_dates)
+        # A row requeued by the batch-finish sweep runs its deferred pass
+        # directly (the pass2 long tail, or a pass1 replay after an internal
+        # failure); every other row runs pass1.  See _finish_deferred_sweep.
+        attempt_kind = self._deferred_resume.pop(fid, "pass1")
+        candidates = pass2 if attempt_kind == "pass2" else pass1
         hit, last_res = self.sz.test_passwords(row["path"], candidates)
-        if hit is None:
+        mined_nonempty = False
+        if hit is None and attempt_kind == "pass1":
             # §fix⑥ last-resort: mine passwords from ALREADY-EXTRACTED txt docs
-            # (e.g. a 密码.txt that came out of a friend/parent archive).  Only
-            # tried when standard sources 1-4 all failed — matches the user rule
-            # "都找不到密码的，再从解压出来的txt里找一下".
+            # (e.g. a 密码.txt that came out of a friend/parent archive).  This
+            # is a PASS1-only source — the pass2 long tail must not re-run it
+            # (§4.2: pass2 never re-tries the high-confidence pass1 sources).
             mined = pw_mod.mine_txt_passwords(self._txt_mine_roots(row, parent))
+            mined_nonempty = any(pw for pw, _ in mined)
             if mined:
                 db.event(fid, C.ACTION_PW_TEST,
                          "no std password; trying %d txt-mined candidate(s)"
@@ -788,12 +945,27 @@ class Pipeline:
                     if hit[0] and hit[0] not in self.library:
                         self.library.append(hit[0])
         non_empty_tried = any(pw for pw, _ in candidates)
+        # -- v3.8.0 phase 4 埋点（只累计，绝不改任何判定/流程） ----------------
+        # attempt 计「真正试过非空密码」的一次（txt-mined 计入 pass1）；hit 与
+        # attempt 同门 gate，保证 hit ≤ att（命中率不会 >100%）。
+        _pw_kind = "p2" if attempt_kind == "pass2" else "p1"
+        if non_empty_tried or mined_nonempty:
+            self._pw_stat[_pw_kind + "_att"] += 1
+            if hit is not None:
+                self._pw_stat[_pw_kind + "_hit"] += 1
         if hit is None:
             # Distinguish "no password worked" from "the archive is broken":
             # a corrupt archive also fails 7z t on every candidate, and must
             # NOT be reported as a password problem (§7.3).
             cls = sz_mod.classify_extract_fail(last_res, row["path"])
-            if cls in (C.FAIL_WRONG_PASSWORD, C.FAIL_ENCRYPTED_HEADER):
+            # U2-c.3 (v3.9.0): FAIL_VOLUME_MISSING joins the trigger set.  U1
+            # now classifies an encrypted set with a missing volume as
+            # VOLUME_MISSING (not the fake WRONG_PASSWORD); without this the
+            # normalization below would never fire and the family would regress
+            # from "misclassified but still renamed" to "correctly classified
+            # but permanently FAILED".
+            if cls in (C.FAIL_WRONG_PASSWORD, C.FAIL_ENCRYPTED_HEADER,
+                       C.FAIL_VOLUME_MISSING):
                 # Fake WRONG_PASSWORD guard (②): when a same-set member
                 # still wears a fake extension it cannot join the joint
                 # extraction, and 7z reports "Wrong password" for the SET
@@ -816,6 +988,35 @@ class Pipeline:
             if cls == C.FAIL_ARCHIVE_CORRUPT and info.is_archive:
                 if self._handle_disguised_split_set(fid, row, info):
                     return
+            # -- v3.8.0 two-pass classification (§4.2) --------------------------
+            # PASSWORD-kind (wrong/encrypted-header) failures are held over as
+            # PASSWORD_DEFERRED **only when a pass2 long tail exists**; the
+            # deferred pass then runs the tail.  INTERNAL failures (IO /
+            # watchdog / disk / unsafe-path — the password is NOT disproven)
+            # are held over too, but their deferred pass REPLAYS pass1 so a
+            # transient fault cannot silently strand a solvable archive.
+            # Anything else (corrupt/crc/volume/…) keeps today's honest FAILED.
+            defer_kind = None
+            pending_reason = None
+            if cls in (C.FAIL_WRONG_PASSWORD, C.FAIL_ENCRYPTED_HEADER):
+                pending_reason = (C.FAIL_WRONG_PASSWORD if non_empty_tried
+                                  else C.FAIL_PASSWORD_NOT_FOUND)
+                if pass2:
+                    defer_kind = "password"
+            elif C.is_internal_failure(cls):
+                defer_kind = "internal"
+                pending_reason = cls
+            if defer_kind is not None:
+                if self._should_defer(fid):
+                    self._enter_deferred(fid, row, pending_reason, defer_kind,
+                                         len(candidates), len(pass2))
+                    return
+                # Retry cap reached (or the batch is finishing): never leave the
+                # row pending — downgrade to FAILED (WARN) with an honest reason.
+                db.update_fields(fid, fail_reason=pending_reason)
+                self._downgrade_deferred(fid, db.get(fid))
+                return
+            # Not deferrable: today's honest terminal verdict.
             if cls in (C.FAIL_WRONG_PASSWORD, C.FAIL_ENCRYPTED_HEADER):
                 reason = C.FAIL_WRONG_PASSWORD if non_empty_tried \
                     else C.FAIL_PASSWORD_NOT_FOUND
@@ -829,7 +1030,10 @@ class Pipeline:
             self._on_terminal(fid)
             return
         if hit[0]:
-            db.update_fields(fid, password=hit[0], password_source=hit[1])
+            # v3.8.0: a hit also clears any stale DEFERRED pending marker (a
+            # requeued DEFERRED row carries its pending fail_reason until solved).
+            db.update_fields(fid, password=hit[0], password_source=hit[1],
+                             fail_reason=C.FAIL_NONE)
             db.event(fid, C.ACTION_PW_TEST, "password hit (source=%s)" % hit[1],
                      batch=cfg.batch)
         password = hit[0]
@@ -970,6 +1174,148 @@ class Pipeline:
         self._on_terminal(fid)
 
     # ------------------------------------------------------------------
+    # v3.8.0 two-pass DEFERRED state machine (§4.2/§4.3/§4.6)
+    # ------------------------------------------------------------------
+    def _defer_count(self, fid: int) -> int:
+        """How many times *fid* has been held as PASSWORD_DEFERRED so far.
+
+        Derived from the ``PW_DEFERRED`` audit events (one per deferral) rather
+        than a schema column — no migration, and the count is inherently
+        auditable.  Never raises (missing table -> 0).
+        """
+        try:
+            cur = self.db.conn.execute(
+                "SELECT COUNT(*) AS n FROM events WHERE file_id=? AND action=?",
+                (fid, C.ACTION_PW_DEFERRED))
+            r = cur.fetchone()
+            return int(r["n"]) if r is not None else 0
+        except Exception:  # noqa: BLE001
+            return 0
+
+    def _deferred_kind(self, row) -> str:
+        """Which deferred pass a DEFERRED row needs: ``password`` or ``internal``.
+
+        INTERNAL failures replay pass1 (the password was never disproven); every
+        other deferral runs the pass2 LIBRARY long tail (§4.2).
+        """
+        return "internal" if C.is_internal_failure(row["fail_reason"]) \
+            else "password"
+
+    def _should_defer(self, fid: int) -> bool:
+        """May *fid* be held as PASSWORD_DEFERRED again?
+
+        ``False`` while the batch-finish sweep runs (so a finished batch can
+        never leave a residue) and once the deferral count has reached
+        ``config.DEFERRED_MAX_RETRY`` (§4.3 anti-hang downgrade trigger).
+        """
+        if self._finishing_deferred:
+            return False
+        return self._defer_count(fid) < C.DEFERRED_MAX_RETRY
+
+    def _enter_deferred(self, fid: int, row, pending_reason: str,
+                        kind: str, tried: int, untried: int) -> None:
+        """Hold *fid* as PASSWORD_DEFERRED after a pass1 failure (§4.3).
+
+        Writes exactly ONE ``PW_DEFERRED`` event (via the transition) so
+        ``_defer_count`` stays accurate; the source is deliberately kept — the
+        deferred pass still needs it.  Never bumps ``n_failed`` (not a failure).
+        """
+        db = self.db
+        if kind == "password":
+            note = ("PASSWORD_DEFERRED: pass1 tried %d candidate(s); %d "
+                    "long-tail library password(s) pending pass2"
+                    % (tried, untried))
+        else:
+            note = ("PASSWORD_DEFERRED: pass1 internal failure (%s) — the "
+                    "deferred pass will replay pass1 (password not disproven)"
+                    % pending_reason)
+        db.transition(fid, C.STATUS_PASSWORD_DEFERRED, C.ACTION_PW_DEFERRED,
+                      note, fail_reason=pending_reason)
+
+    def _downgrade_deferred(self, fid: int, row) -> None:
+        """Resolve an unsolvable DEFERRED row to FAILED + a WARN event (§4.3).
+
+        The batch must never finish with a PASSWORD_DEFERRED residue.  An
+        INTERNAL deferral keeps its concrete (honest) reason; a PASSWORD
+        deferral lands on ``PASSWORD_NOT_FOUND`` (the pass2 long tail was
+        exhausted).  Always emits a WARNING-level audit event.
+        """
+        db, cfg = self.db, self.cfg
+        if row is None:
+            return
+        kind = self._deferred_kind(row)
+        if kind == "internal" and (row["fail_reason"] or C.FAIL_NONE) != C.FAIL_NONE:
+            reason = row["fail_reason"]
+        else:
+            reason = C.FAIL_PASSWORD_NOT_FOUND
+        db.transition(
+            fid, C.STATUS_FAILED, C.ACTION_PW_DEFERRED_DOWNGRADE,
+            "PASSWORD_DEFERRED downgraded to FAILED (%s pass unresolved, "
+            "retry cap %d)" % (kind, C.DEFERRED_MAX_RETRY),
+            fail_reason=reason, level="WARN")
+        db.bump_batch(cfg.batch, "n_failed")
+        self._on_terminal(fid)
+
+    def _finish_deferred_sweep(self) -> None:
+        """§4.3 batch-finish sweep: resolve EVERY PASSWORD_DEFERRED row.
+
+        Runs after the main pass1 loop.  Steps:
+
+          1. EVERY remaining DEFERRED row — including one already AT/OVER
+             ``DEFERRED_MAX_RETRY`` — is requeued with a per-row pass hint (the
+             pass2 long tail, or a pass1 replay after an internal failure) and
+             processed through the SAME main loop (``_drain_queue``), with new
+             deferrals disabled.  A capped row is NOT pre-downgraded: plan §4.3
+             downgrades only an *unresolved* pass, and the caps limit the number
+             of DEFERRALS across runs — never the single deferred-pass attempt
+             the sweep owes every row.
+          2. a final safety net downgrades anything still DEFERRED (i.e. whose
+             deferred pass also failed) to FAILED + WARN.
+
+        Guarantee: a normally-finished batch NEVER leaves a PASSWORD_DEFERRED
+        row behind.  Under ``--dry-run`` this is a complete no-op (dry-run never
+        reaches the password path, and must never write the DB).
+        """
+        db, cfg = self.db, self.cfg
+        if cfg.dry_run:
+            return
+        deferred = db.all_with_status(C.STATUS_PASSWORD_DEFERRED)
+        if not deferred:
+            return
+        # 1) requeue EVERY remainder for its final pass; forbid NEW deferrals so
+        #    this sweep is guaranteed to terminate with no residue.  NOTE: a row
+        #    at/over the retry cap is deliberately NOT downgraded here — doing so
+        #    would FAIL a row without ever attempting its deferred pass, which
+        #    could silently lose a solvable archive whose password sits in the
+        #    pass2 long tail (the sweep may be the row's first pass2 attempt,
+        #    e.g. after a crash between deferral and sweep).  It is downgraded
+        #    only by step 2 if its deferred pass also fails.
+        self._finishing_deferred = True
+        try:
+            for row in db.all_with_status(C.STATUS_PASSWORD_DEFERRED):
+                fid = row["id"]
+                kind = self._deferred_kind(row)
+                self._deferred_resume[fid] = "pass2" if kind == "password" \
+                    else "pass1"
+                db.transition(
+                    fid, C.STATUS_QUEUED, C.ACTION_PW_DEFERRED_RESUME,
+                    "deferred: entering %s"
+                    % ("pass2 long tail" if kind == "password"
+                       else "pass1 replay (internal failure)"))
+                # ALWAYS enqueue: the row was already in self.seen from its
+                # pass1 run, so a "not in seen" guard would strand it QUEUED
+                # forever (the main loop would never pick it up again).
+                self.seen.add(row["path"])
+                self.queue.append(fid)
+            if self.queue:
+                self._drain_queue()
+        finally:
+            self._finishing_deferred = False
+        # 2) safety net — absolutely no residue may survive the batch.
+        for row in db.all_with_status(C.STATUS_PASSWORD_DEFERRED):
+            self._downgrade_deferred(row["id"], db.get(row["id"]) or row)
+
+    # ------------------------------------------------------------------
     def _learn_password(self, fid: int, password: str, source: str) -> None:
         """Part A (v3.6.0): record a successful password into the learned library.
 
@@ -1003,7 +1349,7 @@ class Pipeline:
             except Exception:  # noqa: BLE001 — be conservative, no false "new"
                 was_in_library = True
 
-            r = pwstats.record_success(pwstats.learned_path(), password, src)
+            r = pwstats.record_success(pw_mod.master_path(cfg.workdir), password, src)
             if not r.get("written"):
                 _emit("⚠ 密码学习写入失败（已忽略）：%s"
                       % (r.get("detail") or "unknown"))
@@ -1016,9 +1362,10 @@ class Pipeline:
                      batch=cfg.batch)
 
             if r.get("is_new") or not was_in_library:
-                _emit("🔑 新密码入库: '%s' (来源 %s) 累计 %d 次 "
-                      "-> assets/passwords.learned.txt"
-                      % (password, src, r.get("new_count", 0)))
+                _emit("🔑 新密码入库: '%s' (来源 %s) 累计 %d 次 -> %s"
+                      % (password, src, r.get("new_count", 0),
+                         pw_mod.master_path(cfg.workdir) or
+                         "passwords.master.txt"))
         except Exception as exc:  # noqa: BLE001 — never break a batch over this
             try:
                 _emit("⚠ 密码学习异常（已忽略）：%r" % exc)
@@ -1050,8 +1397,16 @@ class Pipeline:
         self._on_terminal(fid)
 
     # ------------------------------------------------------------------
-    def _handle_repair_or_skip(self, fid: int, row, info, t0: float) -> None:
-        """Non-archive branch: junk rules, repair artifacts, or plain skip."""
+    def _handle_repair_or_skip(self, fid: int, row, info, t0: float) -> bool:
+        """Non-archive branch: junk rules, repair artifacts, or plain skip.
+
+        Returns ``True`` when the row is fully handled here (terminal / requeued
+        / dry-run).  Returns ``False`` for one narrow case only: an embedded-SFX
+        FIRST volume whose volume set is already canonical — the caller must
+        then continue into the archive chain (password test + extraction),
+        because 7z opens the MZ-stub SFX and links the renamed volumes, whereas
+        the carve path would emit a severed ``*_carved.*`` artifact.
+        """
         db, cfg = self.db, self.cfg
 
         # Continuation volumes have no archive magic (they are mid-set data
@@ -1064,7 +1419,32 @@ class Pipeline:
             db.transition(fid, C.STATUS_SKIPPED, C.ACTION_ANALYZE,
                           "continuation volume (extract via first volume)")
             self._on_terminal(fid)
-            return
+            return True
+
+        # -- U2-c.4 (v3.9.0): whole-set rename for a disguised volume FIRST ----
+        # A disguised ``<base>.part<N>`` FIRST member — a canonical ``.part1.rar``
+        # OR the embedded-SFX first volume (whose name matches no volume regex,
+        # so volume_info() reports NONE; hence the embedded_volume arm) — must be
+        # renamed as a WHOLE SET before any carve runs, otherwise repair_artifacts
+        # produces a ``*_carved.*`` artifact whose infix permanently severs the
+        # set (the real 七天.11.part1_carved.rar case).  Plan-then-apply; on
+        # success the row is requeued for joint extraction.
+        if role == "FIRST" or getattr(info, "embedded_volume", False):
+            if self._normalize_volume_siblings(row):
+                retry = (row["retry_count"] or 0) + 1
+                db.update_fields(fid, retry_count=retry)
+                db.transition(fid, C.STATUS_QUEUED, C.ACTION_ANALYZE,
+                              "volume set normalized (rename); requeued for "
+                              "joint extraction")
+                self.queue.append(fid)
+                return True
+            if getattr(info, "embedded_volume", False) and not cfg.dry_run:
+                # A known SFX volume member that was NOT renamed — either the
+                # set is already canonical, or a target collision abandoned the
+                # whole set.  Either way it is a volume member and MUST NOT be
+                # carved (a *_carved.* artifact severs the set).  Hand it to the
+                # extraction chain, where 7z judges it honestly.
+                return False
 
         if cfg.dry_run:
             # ③ dry-run: never carve/patch/rename/concat — those WRITE
@@ -1077,7 +1457,7 @@ class Pipeline:
                           "dry-run: queued for real run (repair skipped)",
                           fail_reason=C.FAIL_NONE)
             self.seen.add(row["path"])
-            return
+            return True
         # Try the four repair kinds (§3.3 step 8b: they live OUT of out_dir).
         # repair_artifacts internally decides carve/patch/rename/concat; an
         # empty result means "nothing to repair" -> junk / plain skip path.
@@ -1090,7 +1470,7 @@ class Pipeline:
                 [p for p, _kind in arts], row["dir_path"])
             if not ok_contained:
                 self._fail_unsafe_path(fid, row["dir_path"], escaped)
-                return
+                return True
             hold = any(kind != "RENAMED" for _p, kind in arts)
             if not hold:
                 # Renamed in place: old path gone, drop its hash to avoid a
@@ -1105,7 +1485,7 @@ class Pipeline:
             for art_path, kind in arts:
                 self._upsert_child(art_path, row, origin=kind)
             self._on_terminal(fid)
-            return
+            return True
 
         # Junk rules (§6) — only zero-risk tier auto-deletes (§11.2).
         content_head = b""
@@ -1127,7 +1507,7 @@ class Pipeline:
                 rule, delete_when = jl
         if rule:
             self._apply_junk_rule(fid, row, rule, delete_when)
-            return
+            return True
 
         reason = info.fail_reason or C.FAIL_NOT_ARCHIVE
         note = info.skip_reason or "not an archive"
@@ -1142,6 +1522,7 @@ class Pipeline:
                           fail_reason=C.FAIL_NOT_ARCHIVE if reason == C.FAIL_NOT_ARCHIVE
                           else reason)
         self._on_terminal(fid)
+        return True
 
     # ------------------------------------------------------------------
     # Junk handling (§6 / §6.5) — shared by the dedup intercept and §6
@@ -1337,6 +1718,14 @@ class Pipeline:
         """
         db, cfg = self.db, self.cfg
         old = row["path"]
+        # U2-e (v3.9.0): dry-run gate pushed DOWN into the PRIMITIVE (the same
+        # convention documented on _delete_one) so no future call site can
+        # forget it — the analyze-stage caller has a gate, the others did not.
+        if cfg.dry_run:
+            db.event(fid, C.ACTION_RENAME,
+                     "dry-run: volume-member rename skipped %s -> %s (no-op)"
+                     % (old, new_path), batch=cfg.batch)
+            return False
         try:
             os.rename(fsutil.to_extended(old), fsutil.to_extended(new_path))
         except OSError as exc:
@@ -1357,39 +1746,53 @@ class Pipeline:
         return True
 
     def _normalize_volume_siblings(self, row) -> int:
-        """②: rename same-set siblings that still wear a fake extension.
+        """②: rename a disguised volume set — WHOLE set, plan-then-apply.
 
-        Returns the number of siblings fixed.  A sibling with an existing
-        row keeps it (path updated); a terminal non-pending row is requeued
-        for the joint extraction; pending-user rows keep their status (the
-        user decides).
+        U2-d (v3.9.0): the plan for the ENTIRE set (own + siblings) is computed
+        FIRST (``header.volume_set_rename_plan`` — NAMES + CONTENT only, never
+        ``loose_volume_group``, which returns ``None`` for the double-dot member
+        and would make the outcome depend on enumeration order), then applied.
+        A target collision abandons the WHOLE set, leaving every source in
+        place.  Never implemented as "rename one, re-check the next".
+
+        Returns the number of members renamed (0 when there is nothing to do,
+        or in dry-run — where no disk write happens and the row stays QUEUED).
+        A renamed sibling with an existing row keeps it (path updated); a
+        terminal non-pending row is requeued for the joint extraction;
+        pending-user rows keep their status (the user decides).
         """
         db, cfg = self.db, self.cfg
         own = row["path"]
-        group = header.loose_volume_group(os.path.basename(own))
-        if not group:
+        plan = header.volume_set_rename_plan(own)
+        if not plan:
             return 0
-        src_dir = os.path.dirname(own)
+        if cfg.dry_run:
+            # U2-e: dry-run MUST NOT write to disk.
+            db.event(row["id"], C.ACTION_RENAME,
+                     "dry-run: volume-set rename skipped (%d member(s)): %s"
+                     % (len(plan), ", ".join(os.path.basename(p)
+                                             for _o, p in plan)),
+                     batch=cfg.batch)
+            return 0
         fixed = 0
-        for entry in fsutil.list_top_level(src_dir):
-            name = os.path.basename(entry)
-            if name.lower() == os.path.basename(own).lower():
-                continue
-            if header.volume_info(name)[0] != "NONE":
-                continue                     # canonical member: fine already
-            if header.loose_volume_group(name) != group:
-                continue                     # not our set
-            rtype = header.probe_magic_only(entry)
-            if rtype not in C.ARCHIVE_TYPES:
-                continue                     # only true archives are renamed
-            target = header.volume_member_rename(entry, rtype)
-            if target and self._rename_sibling_row(entry, target):
+        for old_path, new_path in plan:
+            if os.path.normcase(old_path) == os.path.normcase(own):
+                if self._rename_volume_member(row["id"], row, new_path):
+                    fixed += 1
+                    row = db.get(row["id"]) or row     # path moved
+            elif self._rename_sibling_row(old_path, new_path):
                 fixed += 1
         return fixed
 
     def _rename_sibling_row(self, old_path: str, new_path: str) -> bool:
         """Rename one sibling + reconcile its DB row + requeue if needed."""
         db, cfg = self.db, self.cfg
+        # U2-e (v3.9.0): dry-run gate on the PRIMITIVE (no disk write).
+        if cfg.dry_run:
+            db.event(None, C.ACTION_RENAME,
+                     "dry-run: volume-sibling rename skipped %s -> %s (no-op)"
+                     % (old_path, new_path), batch=cfg.batch)
+            return False
         try:
             os.rename(fsutil.to_extended(old_path),
                       fsutil.to_extended(new_path))
@@ -1683,10 +2086,27 @@ class Pipeline:
         Returns a (possibly empty) list of paths otherwise; an empty list means
         "no carved descendants" (the source deletes normally on its own).
 
+        U4-a (v3.9.0) ADDS A SECTION to the EXISTING mechanism (no rewrite):
+        for every machine-artifact (REPAIR_ORIGINS) row it also collects
+
+          * the artifact's OWN ``extract_output_dir`` — the ``_ext`` directory
+            itself, which may hold non-empty residue and therefore needs an
+            ``rmdir``-style removal, and
+          * the artifact's EXTRACTED descendants (this helper previously
+            collected only the carved FILE, never its products).
+
+        Dirs are handed to the caller via ``self._deletable_dirs``; files are
+        returned.  STRICT ``parent_id`` LINEAGE ONLY: it is FORBIDDEN to
+        bulk-delete by matching a name containing ``_ext`` — a legitimate
+        extension-less archive's output dir is ALSO named ``_ext``, so a
+        name-based rule would delete real user data (explicit review finding).
+
         Reuses ``db.children_of`` / ``_is_fully_done`` / ``fsutil.scan_output``
         — never rewrites the existing delete logic.
         """
         db = self.db
+        self._deletable_dirs = []
+        self._deletable_products = []
         carved_ids: List[int] = []
         seen: set = set()
         stack = [fid]
@@ -1701,13 +2121,174 @@ class Pipeline:
                 if kid["id"] not in seen:
                     stack.append(kid["id"])
         ready: List[str] = []
+        dirs: List[str] = []
+        products: List[str] = []
         for cid in carved_ids:
             if not self._carved_subtree_ready(cid):
                 return None                         # P0 gate: abort ALL deletion
             crow = db.get(cid)
-            if crow is not None and crow["path"] not in ready:
+            if crow is None:
+                continue
+            if crow["path"] not in ready:
                 ready.append(crow["path"])
+            # -- U4-a: the artifact's own output dir + its EXTRACTED products -
+            out = crow["extract_output_dir"]
+            if out and fsutil.isdir(out) and out not in dirs:
+                dirs.append(out)
+            for desc in self._extracted_descendants(cid):
+                if desc["path"] not in products:
+                    products.append(desc["path"])
+        self._deletable_dirs = dirs
+        self._deletable_products = products
         return ready
+
+    def _extracted_descendants(self, fid: int) -> list:
+        """EXTRACTED-origin rows in *fid*'s subtree (strict parent_id lineage).
+
+        U4-a helper: a machine artifact's products are removed together with the
+        artifact.  Purely lineage-based — never a name match, never wider than
+        *fid*'s own descendant set.
+        """
+        db = self.db
+        out: list = []
+        seen: set = set()
+        stack = [fid]
+        while stack:
+            cur = stack.pop()
+            if cur in seen:
+                continue
+            seen.add(cur)
+            for kid in db.children_of(cur):
+                if kid["origin"] == "EXTRACTED":
+                    out.append(kid)
+                if kid["id"] not in seen:
+                    stack.append(kid["id"])
+        return out
+
+    def _machine_artifacts_provable(self, fid: int, carved_paths) -> bool:
+        """U4-b boundary (fail-closed, no data loss).
+
+        Every collected MACHINE ARTIFACT (a REPAIR_ORIGINS row with real bytes)
+        must be provable by the F1 primitive — a FULL whole-file digest, or 0
+        bytes — BEFORE we delete anything.  Otherwise F1 would refuse that
+        artifact's OWN removal *after* the source was already gone, leaving a
+        source-deleted / carved-kept state.  When this returns False the caller
+        must ABORT the WHOLE deletion (the source is kept as the re-derivation
+        path); F1 itself is never relaxed.  Deliberately NOT applied to
+        EXTRACTED products — they legitimately carry no digest and stay
+        individually F1-protected.
+        """
+        db = self.db
+        for p in carved_paths:
+            r = db.get_by_path(p)
+            if r is None or _rowget(r, "origin") not in REPAIR_ORIGINS:
+                continue
+            if (_rowget(r, "size_bytes") or 0) != 0 and not (
+                    _rowget(r, "hash")
+                    and (_rowget(r, "hash_mode") or "").upper()
+                    == C.HASH_MODE.upper()):
+                db.event(fid, C.ACTION_VERIFY,
+                         "delete skipped: machine artifact #%s carries no "
+                         "whole-file digest (F1 fail-closed) — keeping the "
+                         "source as well" % _rowget(r, "id"),
+                         batch=self.cfg.batch)
+                return False
+        return True
+
+    def _cleanup_artifact_trees(self) -> None:
+        """U4-a best-effort: remove the collected EXTRACTED products of the
+        machine artifacts and the artifacts' own output directories.
+
+        Deliberately NOT folded into any caller's ``ok_all``: the return value
+        of a delete answers "was the SOURCE deleted?" — a product F1 keeps (no
+        digest) must not turn a successful source deletion into a failure.  The
+        transient lists are populated by ``_collect_deletable_tree``.
+        """
+        db = self.db
+        for p in self._deletable_products:
+            r = db.get_by_path(p)
+            if r is None:
+                r = {"id": None, "source_deleted": 0, "path": p,
+                     "file_name": os.path.basename(p), "size_bytes": 0}
+            self._delete_one(p, r)
+        for d in self._deletable_dirs:
+            self._delete_artifact_dir(d)
+
+    def _artifact_dir_allowed(self, path: str) -> bool:
+        """§4.1 check#11 for DIRECTORIES (U4-a): strictly under the source root,
+        never the source root / the pipeline dir / an ancestor of either."""
+        if not path:
+            return False
+        if not _is_strictly_under(path, self.cfg.src_dir):
+            return False
+        pipe = self.cfg.pipeline_dir
+        if _norm_abs(pipe) == _norm_abs(path) or _is_strictly_under(pipe, path):
+            return False
+        return True
+
+    def _delete_artifact_dir(self, path: str) -> bool:
+        """U4-a: remove a machine artifact's own output directory tree.
+
+        Called ONLY with a path collected from a REPAIR_ORIGINS row's
+        ``extract_output_dir`` (never a name-based ``*_ext`` match).  Files
+        inside are removed through the SINGLE delete primitive ``_delete_one``
+        (so check#11 / the F1 whole-file-digest gate / the batch probe all still
+        govern each one); a registered, size>0 product with no FULL digest is
+        therefore REFUSED by F1 and kept, which in turn keeps the directory
+        (fail-closed).  Unregistered residue files are removed by ``_delete_one``
+        with ``row=None``.  Finally the (possibly non-empty) directory tree is
+        removed bottom-up with ``rmdir``.
+        """
+        db, cfg = self.db, self.cfg
+        if not fsutil.isdir(path):
+            return True
+        if cfg.dry_run:
+            db.event(None, C.ACTION_RMDIR,
+                     "DRY-RUN: would remove artifact dir %s (no-op)" % path,
+                     batch=cfg.batch)
+            return False
+        if not self._artifact_dir_allowed(path):
+            db.event(None, C.ACTION_RMDIR,
+                     "artifact-dir removal refused (outside source root or "
+                     "protected): %s" % path, level="ERROR", batch=cfg.batch)
+            return False
+        ok_all = True
+        for f in fsutil.real_list_files(path):
+            row = db.get_by_path(f)
+            if row is None:
+                # Unregistered residue: a synthetic row (id=None) lets the SINGLE
+                # delete primitive still govern it (guard + probe + audit); with
+                # id=None there is no DB identity to update, exactly like the
+                # disk-truth sibling-scan synthetic rows.
+                row = {"id": None, "source_deleted": 0, "path": f,
+                       "file_name": os.path.basename(f), "size_bytes": 0}
+            if not self._delete_one(f, row):
+                ok_all = False
+        # Bottom-up rmdir: deepest directories first, then the root itself.
+        try:
+            walk = list(os.walk(fsutil.to_extended(path), topdown=False))
+        except OSError:
+            walk = []
+        for root_dir, dirs, _files in walk:
+            for name in dirs:
+                sub = os.path.join(root_dir, name)
+                try:
+                    os.rmdir(sub)
+                except OSError as exc:
+                    ok_all = False
+                    db.event(None, C.ACTION_RMDIR,
+                             "artifact dir kept (rc=%s): %s"
+                             % (exc.errno, sub), level="WARN", batch=cfg.batch)
+        try:
+            os.rmdir(fsutil.to_extended(path))
+            db.event(None, C.ACTION_RMDIR, "artifact dir removed: %s" % path,
+                     batch=cfg.batch)
+        except OSError as exc:
+            ok_all = False
+            db.event(None, C.ACTION_RMDIR,
+                     "artifact dir kept (rc=%s): %s" % (exc.errno, path),
+                     level="WARN", batch=cfg.batch)
+        return ok_all
 
     def _carved_subtree_ready(self, cid: int) -> bool:
         """P0 误删闸门: has carved package *cid*'s ENTIRE content subtree been
@@ -1836,9 +2417,13 @@ class Pipeline:
         """④ DB↔disk reconciliation (start of run).
 
         Rows marked COMPLETE/DELETED in the DB but still physically on disk are
-        NOT blindly trusted: re-run the full 12-check delete path.  In dry-run
-        ``_maybe_delete_source`` / ``_delete_one`` are no-ops, so this only
-        audits; in a real run it actually re-judges and deletes if warranted.
+        NOT blindly trusted: they are re-judged instead of assumed.
+
+        In dry-run NOTHING is deleted here: ``_maybe_delete_source`` returns
+        early and ``_delete_one`` is gated at the primitive (v3.8.2 P0-B).  An
+        earlier revision of this docstring claimed a dry-run no-op that the
+        code did not implement — the claim was false and has been removed.
+        This is why "the docs say it is safe" is never evidence: verify.
 
         §fix⑨: the row filter is deliberately a strict superset of the original
         ``origin='DOWNLOAD'`` predicate.  COMPLETE is a TERMINAL state, so the
@@ -1866,6 +2451,57 @@ class Pipeline:
             if row["status"] == C.STATUS_COMPLETE:
                 self._maybe_delete_source(row["id"])
             elif row["status"] == C.STATUS_DELETED and self._delete_allowed(row["path"]):
+                # P0-A (v3.8.2): "the DB says DELETED but the path is still
+                # occupied" is NOT proof that the occupant is this row's own
+                # file.  Three ways that inference breaks, all observed in
+                # production:
+                #   * the path was re-occupied by a DIFFERENT file (netdisk
+                #     sync restore, manual put-back).  _delete_one's own
+                #     idempotency guard was written for exactly this case but
+                #     keys on ``source_deleted`` — which this query filters to
+                #     0, so the guard can never fire here;
+                #   * the row is a bookkeeping artefact: 199 of the 1,409
+                #     production rows carry NO delete event at all, and 153 of
+                #     those sit in DUPLICATE_PENDING — files still waiting for
+                #     the user's verdict, never judged;
+                #   * the "sealed ghost row" SQL surgery wrote delete_rc=0 and
+                #     deleted_at without ever deleting anything.
+                # So: prove the occupant IS this row (size + whole-file hash)
+                # before removing it, and refuse loudly when it cannot be
+                # proven.  Fail-closed — a stranded container is recoverable,
+                # a wrongly deleted file is not.
+                ok, why = self._resolve_candidate_ok(row["path"], row)
+                if not ok:
+                    db.event(row["id"], C.ACTION_DELETE,
+                             "reconcile refused: occupant not proven "
+                             "identical (%s)" % why, level="WARN",
+                             batch=cfg.batch)
+                    continue
+                # `_resolve_candidate_ok` only compares content when the row
+                # carries a FULL digest; without one it degrades to size alone,
+                # and equal size is NOT identity.  On this branch — which
+                # deletes rows the DB merely *believes* were already deleted —
+                # that silent degradation is not acceptable: require a content
+                # proof and refuse loudly when none exists.  Fail-closed.
+                if not (row["hash"] and
+                        (row["hash_mode"] or "").upper() == C.HASH_MODE.upper()):
+                    db.event(row["id"], C.ACTION_DELETE,
+                             "reconcile refused: no whole-file digest on "
+                             "record — identity would rest on size alone, "
+                             "which is not proof", level="WARN",
+                             batch=cfg.batch)
+                    continue
+                # Third gate: was a deletion ever DECIDED for this row?  A
+                # file waiting for the user's verdict must never disappear
+                # before the verdict is given.
+                if not self._has_delete_intent(row):
+                    db.event(row["id"], C.ACTION_DELETE,
+                             "reconcile refused: row is DELETED but no "
+                             "deletion was ever decided (no deleted_at, no "
+                             "DELETED event) — keeping it so the pending "
+                             "verdict is still possible", level="WARN",
+                             batch=cfg.batch)
+                    continue
                 self._delete_one(row["path"], row)
 
     # ------------------------------------------------------------------
@@ -1879,6 +2515,30 @@ class Pipeline:
     # archive (incl. a whole volume set) that can be re-extracted later without
     # the parent.  Repair/Carved artifacts keep the strict P0 误删闸门.
     # ------------------------------------------------------------------
+    def _has_delete_intent(self, row) -> bool:
+        """v3.8.2 P0-A: was a deletion of *row* ever actually DECIDED?
+
+        ``status='DELETED'`` by itself is NOT evidence.  Production holds 199
+        rows carrying that status with no delete event at all — 153 of them are
+        DUPLICATE_PENDING, i.e. files still waiting for the user's verdict.
+        Deleting those would destroy the very control group the verdict needs,
+        and would do it without asking.
+
+        A real deletion always leaves a mark: ``_delete_one`` stamps
+        ``deleted_at`` and transitions through ``db.transition(DELETED)``,
+        which writes an event.  Neither happens on the pure-bookkeeping path
+        (direct SQL status edits / ghost-row sealing surgery).
+
+        Both marks are checked so that a future sealing flow which sets only
+        one of them is still recognised — but a row with NEITHER is refused.
+        """
+        if row["deleted_at"]:
+            return True
+        cur = self.db.conn.execute(
+            "SELECT 1 FROM events WHERE file_id=? AND to_status=? LIMIT 1",
+            (row["id"], C.STATUS_DELETED))
+        return cur.fetchone() is not None
+
     def _resolve_candidate_ok(self, cand: str, row) -> tuple:
         """Prove a same-basename *cand* really IS *row*'s file (round-4 P1).
 
@@ -1900,7 +2560,7 @@ class Pipeline:
         Returns ``(ok, reason)``.  ``reason`` names why a candidate was refused
         so the caller can audit it (fail loud).
         """
-        recorded_size = row["size_bytes"]
+        recorded_size = _rowget(row, "size_bytes")
         if recorded_size is None:
             return False, "recorded size unknown (fail-closed)"
         try:
@@ -1910,8 +2570,8 @@ class Pipeline:
         if cand_size != recorded_size:
             return False, ("size mismatch: cand=%d recorded=%d"
                            % (cand_size, recorded_size))
-        mode = (row["hash_mode"] or "").upper()
-        if row["hash"] and mode == C.HASH_MODE.upper():
+        mode = (_rowget(row, "hash_mode") or "").upper()
+        if _rowget(row, "hash") and mode == C.HASH_MODE.upper():
             try:
                 cand_hash = hasher.compute_md5(cand)
             except OSError as exc:
@@ -1943,15 +2603,37 @@ class Pipeline:
         """
         db, cfg = self.db, self.cfg
         stored = row["path"]
-        # step 0 — the recorded path itself.  UNCHANGED: when the file really
-        # is where the DB says it is, we do not second-guess it.
-        if fsutil.exists(stored) and delete_allowed(cfg.src_dir, stored):
-            return stored
-        base = row["file_name"] or os.path.basename(stored)
         refused: List[str] = []
+        # step 0 — the recorded path itself.  v3.8.2 F2: this used to
+        # short-circuit EVERY identity check ("when the file really is where
+        # the DB says it is, we do not second-guess it"), so a DIFFERENT file
+        # that re-occupied the path — netdisk sync restore, manual put-back,
+        # re-extraction under the same name — was accepted as this row and
+        # deleted.  The reconcile branch was fixed first, but the live
+        # cascade / HOLD_SOURCE paths reach this function too, so the gate
+        # belongs here: prove identity before returning the recorded path.
+        if fsutil.exists(stored) and delete_allowed(cfg.src_dir, stored):
+            if _rowget(row, "id") is None:
+                # Synthesised row: an unregistered volume part caught by the
+                # disk-truth sibling scan (header.volume_info confirmed it
+                # belongs to this set, so the on-disk path IS trustworthy).
+                # It carries no DB identity to compare against (id is None),
+                # so refusing here would strand it forever and trusting the
+                # recorded path is the only viable behaviour.  Real DB rows
+                # (id is an integer) never take this branch and stay fully
+                # identity-gated below.  v3.8.2 F3/N2: previously keyed on
+                # ``size_bytes is None`` — dead code, because size_bytes is
+                # NOT NULL DEFAULT 0 and the synthesised row sets it to 0.
+                return stored
+            ok, why = self._resolve_candidate_ok(stored, row)
+            if ok:
+                return stored
+            refused.append("%s (%s)" % (stored, why))
+        base = _rowget(row, "file_name") or os.path.basename(stored)
         # 1) sibling in the recorded directory (stage may have moved it within
         #    the same folder) — still must be proven identical.
-        sib = os.path.join((row["dir_path"] or os.path.dirname(stored)), base)
+        sib = os.path.join(
+            (_rowget(row, "dir_path") or os.path.dirname(stored)), base)
         if sib != stored and fsutil.exists(sib) and delete_allowed(cfg.src_dir, sib):
             ok, why = self._resolve_candidate_ok(sib, row)
             if ok:
@@ -2160,10 +2842,23 @@ class Pipeline:
         explain why a source package survived.
         """
         db, cfg = self.db, self.cfg
+        # U4-a: transient per-deletion lists — never carry state across calls.
+        self._deletable_dirs = []
+        self._deletable_products = []
         # Re-fetch: callers may pass a snapshot taken before the row was
         # promoted to COMPLETE (check#7 reads status from the live row).
         row = db.get(fid) or row
         if row is None or cfg.dry_run:
+            return False
+        # v3.8.0: a PASSWORD_DEFERRED source must SURVIVE — the deferred pass2
+        # (or pass1 replay) still needs it.  Belt-and-braces: such a row is
+        # never COMPLETE, so check7-9 below would already refuse it, but keep
+        # the intent explicit and audited (never silently lose a source we
+        # still need).
+        if row["status"] == C.STATUS_PASSWORD_DEFERRED:
+            db.event(fid, C.ACTION_DELETE,
+                     "delete refused: row is PASSWORD_DEFERRED (source needed "
+                     "by the pass2 sweep)", level="WARN", batch=cfg.batch)
             return False
         # Idempotency (fix): a source ALREADY marked deleted must never re-enter
         # the delete path.  Re-entry (terminal backtracking / cascade / final
@@ -2203,13 +2898,25 @@ class Pipeline:
             #    was intentionally cleaned afterwards (dedup deletion / junk
             #    cleanup): that is a normal end state, not a reason to keep the
             #    source forever (LES-20260909-11 ②).
-            stat = stat or fsutil.scan_output(out_dir or "")
+            #    Defense in depth: an EMPTY out_dir must NEVER be scanned — an
+            #    empty path resolves to the process CWD (os.path.abspath/isdir
+            #    treat "" as the CWD), so scanning it would inject the CWD's
+            #    files into this output's statistics.  No output dir = no
+            #    content = zero stat.
+            stat = stat or (fsutil.scan_output(out_dir) if out_dir
+                            else fsutil.OutputStat())
             if out_dir and stat.non_archive < 1 and not digested:
                 reasons.append("check3: no non-archive content yet")
         # 4. no zero-byte residue (always checked — a corrupt extract must not
         #    be waved through even in cascade mode; ensures a stat exists for the
-        #    cascade path which may be called with stat=None).
-        stat = stat or fsutil.scan_output(out_dir or "")
+        #    cascade path which may be called with stat=None).  Same empty-path
+        #    guard as check#3: an empty path must never resolve to the process
+        #    CWD, or a zero-byte file living in the CWD would be read as this
+        #    output's residue and block the deletion non-deterministically.  A
+        #    real, non-empty out_dir WITH zero-byte residue is still refused
+        #    below (the guard is not relaxed — only the wrong object is fixed).
+        stat = stat or (fsutil.scan_output(out_dir) if out_dir
+                        else fsutil.OutputStat())
         if stat.zero_byte > 0:
             reasons.append("check4: %d zero-byte roots" % stat.zero_byte)
         kids = db.children_of(fid)
@@ -2270,6 +2977,22 @@ class Pipeline:
                 "SELECT * FROM files WHERE volume_group=? AND source_deleted=0"
                 " AND id<>?", (row["volume_group"], fid)).fetchall()
             for m in cur:
+                if m["status"] == C.STATUS_DELETED:
+                    # v3.8.3 (F1-intent): the member query above filters only
+                    # on volume_group + source_deleted, so a member the DB
+                    # merely *believes* was deleted (bookkeeping flip, no
+                    # deleted_at, no DELETED event) would ride along on the
+                    # PRIMARY's credentials — its own deletion was never
+                    # decided.  DELETED rows belong to reconcile's authority,
+                    # which re-proves identity AND intent before deleting;
+                    # leave every one of them to it (fail-closed, zero loss:
+                    # the reconcile query covers any origin).
+                    db.event(m["id"], C.ACTION_DELETE,
+                             "group delete skipped: member row is DELETED "
+                             "with source_deleted=0 — left for reconcile's "
+                             "identity+intent gates", level="WARN",
+                             batch=cfg.batch)
+                    continue
                 rp = self._resolve_delete_path(m)
                 if rp and rp not in paths and fsutil.exists(rp):
                     paths.append(rp)
@@ -2324,6 +3047,11 @@ class Pipeline:
                      "not fully extracted yet (P0 misdelete gate)",
                      batch=cfg.batch)
             return False
+        # U4-b boundary (fail-closed, no data loss): every collected machine
+        # artifact must be F1-provable BEFORE we delete anything, else abort the
+        # WHOLE deletion (source kept).  See _machine_artifacts_provable.
+        if not self._machine_artifacts_provable(fid, carved_paths):
+            return False
         for p in carved_paths:
             if p not in paths and fsutil.exists(p):
                 r = db.get_by_path(p)
@@ -2337,6 +3065,9 @@ class Pipeline:
         for p, r in zip(paths, rows):
             if not self._delete_one(p, r):
                 ok_all = False
+        # U4-a: best-effort cleanup of the machine artifacts' EXTRACTED products
+        # and their own output dirs (incl. non-empty residue).
+        self._cleanup_artifact_trees()
         return ok_all
 
     def _entry_registered(self, entry: str) -> bool:
@@ -2369,8 +3100,31 @@ class Pipeline:
         outdated) DB path — this closes the "path outside source root" false
         refusal after a stage move.  The resolved path is still subject to the
         ``_delete_allowed`` guard below, so the source root is never widened.
+
+        P0-B (v3.8.2): the source-row delete primitive had no dry-run gate at
+        all — 11 other delete sites in this file check ``cfg.dry_run``, this
+        one did not.  Result: ``--dry-run`` really deleted on the reconcile
+        path (measured: a 4500-byte file removed with mode=RECYCLE while
+        ``dry_run=True``).  The gate belongs on the PRIMITIVE, not in each
+        caller — correctness must never depend on every call site remembering
+        to check.
+
+        v3.8.3 honesty fix: this IS the only delete primitive for SOURCE rows
+        (reconcile / _maybe_delete_source / HOLD_SOURCE / volume members /
+        carved artifacts) — but it is NOT the only physical delete in the
+        file: the §6 junk router removes zero-risk junk files directly via
+        ``fsutil.delete_file`` (inline §6 and ``_flush_deferred_junk_deletes``),
+        each with its own ``cfg.dry_run`` + ``_delete_allowed`` + zero-risk-
+        rule checks at the call site.  The earlier "ONLY physical delete
+        primitive" claim was false (pitfalls #59: a safety claim in a comment
+        must match the code, or it will be trusted and it will be wrong).
         """
         db, cfg = self.db, self.cfg
+        if cfg.dry_run:
+            db.event(row["id"] if row is not None else None, C.ACTION_DELETE,
+                     "DRY-RUN: would delete %s (no-op)" % path,
+                     batch=cfg.batch)
+            return False
         # Idempotency (fix): never re-delete/re-count a row already marked
         # deleted.  This is the direct-call guard for callers that reach
         # _delete_one without going through _maybe_delete_source's entry check
@@ -2384,6 +3138,53 @@ class Pipeline:
             resolved = self._resolve_delete_path(row)
             if resolved is not None:
                 real = resolved
+            elif _rowget(row, "id") is not None:
+                # F3 (v3.8.2): a REAL DB row whose path could NOT be proven
+                # identical to the record.  The step0 identity gate only
+                # protected the _maybe_delete_source route; every DIRECT
+                # _delete_one call (on_terminal HOLD_SOURCE, volume members,
+                # carved artifacts) reached here with ``real = path`` and
+                # deleted the recorded path even when it had been re-occupied
+                # by a DIFFERENT file (netdisk restore / manual put-back).
+                # Fail-closed: refuse if the recorded path is still on disk.
+                # If the path is already gone the delete is a harmless no-op
+                # that just seals the row, so fall through to it.
+                if fsutil.exists(path):
+                    db.event(
+                        row["id"], C.ACTION_DELETE,
+                        "delete refused: row %s path %s present but NOT proven "
+                        "identical to the record (resolve returned None) — "
+                        "keeping source (fail-closed)" % (row["id"], path),
+                        level="ERROR", batch=cfg.batch)
+                    return False
+            # resolved is None AND row id is None (synthesised unregistered
+            # volume row): trust the recorded path.  step0 already returned it
+            # when it was in-root + on disk; otherwise _delete_allowed still
+            # guards the source root below and a gone path just seals.  (The old
+            # ``elif synthesised: pass`` branch was dead code — unreachable once
+            # step0's ``id is None`` exemption handled synth rows; M-F3d proved
+            # it, so it was removed.  See pitfalls #60.)
+        # F1 (v3.8.3): identity must be PROVEN, never assumed.  A real row
+        # without a whole-file digest (and not zero-byte — for a 0-byte file
+        # the size IS the entire content) had only a size match standing
+        # between it and the delete: a DIFFERENT same-size file re-occupying
+        # the resolved path passes ``_resolve_candidate_ok`` (its digest check
+        # only fires for FULL digests) and would be removed.  Refuse while the
+        # target is still on disk (fail-closed); an already-gone path stays
+        # the harmless no-op seal below.  Mirrors the reconcile caller's own
+        # no-digest refusal — defense in depth on the primitive itself.
+        if (row is not None and _rowget(row, "id") is not None
+                and not (_rowget(row, "hash")
+                         and (_rowget(row, "hash_mode") or "").upper()
+                         == C.HASH_MODE.upper())
+                and (_rowget(row, "size_bytes") or 0) != 0
+                and fsutil.exists(real)):
+            db.event(
+                row["id"], C.ACTION_DELETE,
+                "delete refused: row %s has no whole-file digest and size>0 "
+                "— size alone is not proof of identity (F1 fail-closed)"
+                % row["id"], level="ERROR", batch=cfg.batch)
+            return False
         if not self._delete_allowed(real):
             db.event(row["id"] if row is not None else None, C.ACTION_DELETE,
                      "delete refused: %s" % real, level="ERROR", batch=cfg.batch)
@@ -2418,7 +3219,7 @@ class Pipeline:
                       "(rc=%s, mode=%s)") % (rc, fsutil.last_delete_mode))
             if actually_deleted:
                 db.bump_batch(cfg.batch, "n_deleted",
-                              bytes_added=row["size_bytes"] or 0)
+                              bytes_added=_rowget(row, "size_bytes") or 0)
             return True
         # Windows rc 5 = access denied, 32 = locked by another process (§4.2).
         db.update_fields(row["id"], delete_rc=rc)
@@ -2540,6 +3341,8 @@ class Pipeline:
                                  "HOLD_SOURCE delete skipped: carved subtree "
                                  "not fully extracted — source + carved kept",
                                  batch=self.cfg.batch)
+                    elif not self._machine_artifacts_provable(cur_id, carve):
+                        pass     # U4-b: whole deletion aborted (source kept)
                     else:
                         if self._delete_allowed(p["path"]):
                             self._delete_one(p["path"], p)
@@ -2547,6 +3350,9 @@ class Pipeline:
                             crow = db.get_by_path(cp)
                             if crow is not None and self._delete_allowed(cp):
                                 self._delete_one(cp, crow)
+                        # U4-a: the artifacts' EXTRACTED products + their own
+                        # output dirs (incl. non-empty residue) go as well.
+                        self._cleanup_artifact_trees()
             cur_id = p["parent_id"]
 
     # ------------------------------------------------------------------
@@ -2589,6 +3395,57 @@ class Pipeline:
                      "empty dir kept (rc=%s): %s" % (rc, d), level="WARN",
                      batch=cfg.batch)
         return list(removed)
+
+    def _consistency_check_at_close(self) -> None:
+        """U4-c (v3.9.0): automatic DB<->disk consistency sweep at batch close.
+
+        Design §0.2: a change must hang off an AUTOMATICALLY triggered path — a
+        command nobody runs is worthless ("截面 11 摆设").  So the sweep runs
+        once at the end of every normal ``run`` and REPORTS every drift class it
+        finds; it writes NOTHING.
+
+        v3.9.1 (D5, "只报不改"): the sweep used to *adopt* the recomputed
+        derived columns of existing SOURCE rows when not a dry run (the
+        live-evidence class: a row whose ``volume_role`` was pinned NONE by an
+        earlier analyze and never recomputed after a manual rename).  Mutating
+        the user's authoritative ``archive.db`` as a side effect of batch
+        close-down contradicted the documented "report only" contract, so the
+        sweep is now strictly read-only.  Adopting the recomputed fields is a
+        deliberate, human-initiated act: ``pipeline.py consistency-check --apply``.
+
+        It is deliberately:
+          * cheap — the bounded re-derivation (32 KB) instead of
+            :func:`header.analyze` (up to ``CARVE_SCAN_LIMIT_BYTES`` per file),
+            so a large batch does not re-read every file to its carve limit;
+          * non-destructive — no deletion, no move, no DB write at all
+            (v3.9.1), and it does NOT register unregistered on-disk files (that
+            would turn extraction residue into DOWNLOAD rows and defeat U4-a's
+            F1-protected cleanup);
+          * never blocking — any failure is audited as a WARN and the batch
+            continues (the run must never fail because of a diagnostic).
+        """
+        try:
+            from . import consistency
+            # v3.9.1 (D5, "只报不改"): the batch-close sweep is REPORT-ONLY.
+            # Adopting the recomputed fields is a deliberate manual act
+            # (`pipeline.py consistency-check --apply`); an automatic path must
+            # never write the user's authoritative DB.
+            adopt = False
+            rep = consistency.check_consistency(
+                self.db, self.cfg.src_dir, apply=adopt, thorough=False,
+                register=False)
+            self.consistency_report = rep
+            self.db.event(None, C.ACTION_DB_CONSISTENCY, rep.summary(),
+                          level=("INFO" if rep.is_clean() else "WARN"),
+                          batch=self.cfg.batch)
+        except Exception as exc:  # noqa: BLE001 — never break a finished batch
+            self.consistency_report = None
+            try:
+                self.db.event(None, C.ACTION_DB_CONSISTENCY,
+                              "consistency-check skipped: %r" % exc,
+                              level="WARN", batch=self.cfg.batch)
+            except Exception:  # noqa: BLE001
+                pass
 
     def _finalize_and_report(self, aborted: bool) -> str:
         """Settle the batch row, THEN render the report (§8).

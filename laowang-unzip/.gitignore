@@ -5,8 +5,16 @@ __pycache__/
 passwords.local.txt
 # 自学习密码库：机器维护、随本机使用增长，绝不入库（v3.6.0）
 assets/passwords.learned.txt
+# 主库（v3.8.0 密码库合并）：按处理根隔离、含真实密码，绝不入库
+passwords.master.txt
 # 自学习垃圾库：含本机确认过的文件名/片段，随本机使用增长，绝不入库（v3.7.0）
 assets/junk.learned.txt
 references/.backup/
 # QA 变异测试前的原始文件快照（本机复核用，绝不入库）
 scripts/.qa-backup-*/
+# 陈旧快照目录：含"缺后续修复"的旧版本源码副本，被误当 pristine 会隐式回滚（LES-20260921-06）
+.qa-backup/
+.lead-gapfix-backup/
+# 变异测试/探针产物：旧驱动会把 res_*.txt / fault.txt 写进树根（v3.9.0 已改为写到树外 OUT_DIR）
+res_*.txt
+fault.txt

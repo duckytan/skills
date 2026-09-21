@@ -59,10 +59,21 @@
 | 删除失败 | `DeleteFileW` 返回 0，GetLastError 非 2/3 | `DELETE_FAILED` | 产物保留，源包进「待手动清理」 |
 | 删源包 Win32 错误码 | 2/3=已删（视为成功置 `source_deleted=1`）；5=拒绝访问；32=被占用；206=路径过长 | — | 见 design-v2.1 §4.2 |
 
+## 2b. v3.9.0 分卷失败**处置补充**（U1 判序 + U2 触发集）
+
+> `VOLUME_MISSING` / `VOLUME_FIRST_RENAMED` 已在 §1 枚举表（第 12/13 行）与 §2 主表中存在；
+> 下表补的是 **v3.9.0 起**的**处置变化**（分类判序 + 归一触发集），不重复枚举定义。
+
+| 失败 | v3.9.0 起处置 | 依据 |
+|---|---|---|
+| `VOLUME_MISSING` | ① **先于** `WRONG_PASSWORD` / `ENCRYPTED_HEADER` 判定（U1）：加密分卷缺卷时 7z 同吐 `Missing volume` 与 `Wrong password?`，取前者；② 进入**整组归一触发集**（U2-c.3，与 U1 绑死）：`FAIL_VOLUME_MISSING` 加入 `scheduler.py` 的改名触发集，缺卷名先整组 normalize 再试；③ 仍缺卷 → 标 incomplete、报用户补卷 | pitfalls #62 / #63；tests/test_classify_volume_missing.py；LES-20260921-03 |
+| `VOLUME_FIRST_RENAMED` | 「首卷名带『删』等后缀」→ 走既有 `needs_rename` 自动去尾重试；**同时**新增「整组 plan-then-apply 归一」覆盖更宽形态（首卷被改名 / 带伪装后缀的 `<base>.part<N>` 全体归一，或 SFX 内嵌首卷 `embedded_volume`）；整组改名**全有或全无** | pitfalls #65；`header.volume_set_rename_plan`；tests/test_volume_rename_v390.py；U2-c/U2-d |
+
 ## 3. 7z 输出原文 → 归类速查
 
 | 7z 输出关键词 | 归类 | 备注 |
 |---|---|---|
+| `Missing volume : <name>` | `VOLUME_MISSING` | **v3.9.0（U1）判序上移**：先于 `encrypted archive` / `Wrong password` 判定。加密分卷缺卷时该行与 `Data Error in encrypted file. Wrong password?` **同现**，取 `Missing volume`，**勿判密码问题**（假 WRONG_PASSWORD，见 pitfalls #62/#63） |
 | `Everything is Ok` | 成功 | **必须 rc==0 且含此串**才算成功 |
 | `Wrong password` | `WRONG_PASSWORD` | |
 | `Cannot open the file as archive` | 先查 7z 头结构：完好 → `ENCRYPTED_HEADER`；超出 → `ARCHIVE_CORRUPT` | 最容易误判的一行 |

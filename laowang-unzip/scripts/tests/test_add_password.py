@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """Unit tests for `add-password` (library append + --test retry linkage).
 
-The personal library path is patched to a temp file so the real
-``<skill>/assets/passwords.local.txt`` is NEVER touched by tests.
+The per-root master library path is patched to a temp file so the real
+``<root>/.pipeline/passwords.master.txt`` is NEVER touched by tests.
 The 7z wrapper is stubbed (no real 7z in unit tests).
 
 Run:  python -m unittest tests.test_add_password -v   (from scripts/)
@@ -21,6 +21,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import pipeline                                          # noqa: E402
 from pipeline_lib import config as C                     # noqa: E402
 from pipeline_lib import passwords as passwords_mod      # noqa: E402
+from pipeline_lib import pwstats as pwstats_mod          # noqa: E402
 from pipeline_lib.db import Database                     # noqa: E402
 from pipeline_lib.scheduler import PipelineConfig        # noqa: E402
 
@@ -55,9 +56,9 @@ class AddPasswordTests(unittest.TestCase):
         self.cfg = PipelineConfig(workdir=self.root, src_dir=self.src,
                                   fresh_sec=0)
         self.db = Database(self.cfg.db_path)
-        self.lib = os.path.join(self.dir, "lib", "passwords.local.txt")
-        patcher = mock.patch.object(passwords_mod, "LOCAL_SKILL_PASSWORDS",
-                                    self.lib)
+        self.lib = os.path.join(self.root, ".pipeline", "passwords.master.txt")
+        patcher = mock.patch.object(passwords_mod, "master_path",
+                                    return_value=self.lib)
         patcher.start()
         self.addCleanup(patcher.stop)
 
@@ -80,9 +81,14 @@ class AddPasswordTests(unittest.TestCase):
         self.assertTrue(os.path.isfile(self.lib))
         rc = pipeline.cmd_add_password(_mk_args(self.root, PW))
         self.assertEqual(rc, 0)
-        with open(self.lib, "r", encoding="utf-8") as fh:
-            lines = [ln.strip() for ln in fh if ln.strip()]
-        self.assertEqual(lines, [PW])           # exactly once, utf-8 kept
+        # v3.8.0: the master library is 4-field TAB (count/pw/date/sources);
+        # the second add must NOT duplicate the entry.
+        _h, entries, _f = pwstats_mod.parse_learned(self.lib)
+        data = [e for e in entries if e.password]
+        self.assertEqual(len(data), 1)          # exactly once
+        self.assertEqual(data[0].password, PW)  # utf-8 kept
+        self.assertEqual(data[0].count, 1)
+        self.assertIn("ADD_MANUAL", data[0].sources)
 
     def test_2_test_hit_requeues_with_audit(self):
         fid = self._seed_failed()

@@ -19,24 +19,29 @@
 
 ```
 scripts/
-├── pipeline.py            # CLI 入口：8 个子命令（§1）
+├── pipeline.py            # CLI 入口：19 个子命令（§1）
 ├── init_db.py             # 显式建库（run 也会自动建）
-└── pipeline_lib/          # 12 模块实现包（纯标准库，无第三方依赖）
+└── pipeline_lib/          # 17 模块实现包（+ __init__.py，共 18 个 .py；纯标准库，无第三方依赖）
     ├── config.py          # 常量与阈值（§2）
     ├── db.py              # Database 类 + SCHEMA + 批次表（§3）
     ├── fsutil.py          # ★ 平台适配层 + 真枚举 + 文件锁（§4）
     ├── hasher.py          # MD5 流式哈希（§5）
     ├── header.py          # 头分析 + 4 类修复产物（§6）
     ├── junk.py            # 垃圾规则（§7）
-    ├── passwords.py       # 密码库三层合并 + 抠码（§8）
+    ├── passwords.py       # 密码候选（两遍试密）+ 抠码（§8，v3.8.0）
     ├── sz.py              # 7z 封装 + 看门狗 + 失败归类（§9）
     ├── space.py           # 空间闸门（§10）
     ├── recycle.py         # 回收站盘点/清理（§11）
     ├── scheduler.py       # PipelineConfig + Pipeline 主循环（§12）
-    └── report.py          # 报告生成（§13）
+    ├── report.py          # 报告生成（§13）
+    ├── junklib.py         # ★ 垃圾自学习库（仅用户确认入库，v3.7.0）
+    ├── pwstats.py         # ★ 密码自学习层（count 降序 / rebuild / verify）
+    ├── migrate_passwords.py # ★ 主库迁移（旧库→<root>/.pipeline/passwords.master.txt，v3.8.0）
+    ├── evolve.py          # ★ 自进化引擎（health / lessons，§3.2）
+    └── audit.py           # ★ 全库体检（audit 子命令）
 ```
 
-## 1. pipeline.py —— CLI 入口（13 个子命令）
+## 1. pipeline.py —— CLI 入口（19 个子命令）
 
 ```
 python pipeline.py stage        [--workdir DIR] [--src DIR] [--date YYYY-MM-DD] [--dry-run]
@@ -52,6 +57,12 @@ python pipeline.py purge-recycle [--workdir DIR] [--dry-run]
 python pipeline.py retry-failed [--workdir DIR] [--batch B] [run options]
 python pipeline.py report       [--workdir DIR] [--batch B]
 python pipeline.py init-db      [--workdir DIR]
+python pipeline.py junk-stats   [--workdir DIR] [--top N] [--json] [--verify] [--forget KIND:VALUE]
+python pipeline.py junk-learn   <文件路径> [--namepart TEXT] [--dry-run] [--workdir DIR]
+python pipeline.py prune-empty  [--workdir DIR] [--apply] [--json]
+python pipeline.py evolve       [--workdir DIR] [--apply] [--check] [--json]
+python pipeline.py pw-stats     [--workdir DIR] [--rebuild] [--verify] [--top N] [--json]
+python pipeline.py migrate-passwords [--workdir DIR] [--apply] [--prune-unused]
 ```
 
 - 处理根参数：**`--root`（主名，工程师补齐中）**，`--workdir` 保留为别名；默认当前目录。
@@ -69,7 +80,7 @@ python pipeline.py init-db      [--workdir DIR]
   （carve 链已死可回收 / 假终结 / 未删源）⑤死账清单（FAILED 分组；密码死账提示
   add-password；CORRUPT_CARVED 提示 pitfalls #37 SFX 本体直解）。输出带 file_id 的清单
   到 stdout + `pipeline/reports/audit-<时间戳>.md`，不改任何状态、不删任何文件。
-- **`add-password`**：把密码追加到最高优先个人库 `<skill>/assets/passwords.local.txt`
+- **`add-password`**：把密码追加到**本处理根主库** `<root>/.pipeline/passwords.master.txt`
   （UTF-8、去重、无则创建）；`--test` 立即对全库 WRONG_PASSWORD / PASSWORD_NOT_FOUND
   行逐个 `7z t` 试新密码，命中行自动转 QUEUED 并写 events（action=PW_HIT_RETRY），
   未命中保持 FAILED；结尾提示 retry-failed / run。
@@ -98,12 +109,15 @@ DEFAULT_SRC_DIRNAME = "【new】"     # 默认处理根，--src 可覆盖
 LOCK_FILENAME = ".pipeline.lock"
 ```
 
-状态机（§2.8）：14 个 `STATUS_*`；`OPEN_STATES = {DISCOVERED, QUEUED}`、
+状态机（§2.8）：15 个 `STATUS_*`（v3.8.0 新增链外非终态 `PASSWORD_DEFERRED`）；`OPEN_STATES = {DISCOVERED, QUEUED}`、
 `TERMINAL_STATES = {COMPLETE, FAILED, SKIPPED, DELETED, LOST}`、
-`PENDING_USER_STATES = {DUPLICATE_PENDING, JUNK_PENDING}`。
-动作 `ACTION_*` 13 个（DISCOVER…CRASH_RECOVER）。
+`PENDING_USER_STATES = {DUPLICATE_PENDING, JUNK_PENDING}`、`DEFERRED_STATES = {PASSWORD_DEFERRED}`。
+动作 `ACTION_*` 25 个（v3.8.0 阶段 1/1.5/2 新增 `PW_HIT_RETRY` / `PW_LEARNED` / `PW_DEFERRED` /
+`PW_DEFERRED_RESUME` / `PW_DEFERRED_DOWNGRADE` / `PRUNE` / `ADOPT_SKIP`；阶段 4 新增
+`PW_STAT` / `PW_DECAY`，见 §12）。
 
-失败归因：25 个 `FAIL_*` 常量（含 `FAIL_VOLUME_4GB_SPLIT`，与设计稿 25 枚举一一对应；
+失败归因：28 个 `FAIL_*` 常量（含 `FAIL_VOLUME_4GB_SPLIT`；另有分类哨兵 `FAIL_INTERNAL`，不持久化为行 fail_reason；
+v3.8.0 起另有子集 `INTERNAL_FAIL_REASONS` / `PASSWORD_FAIL_REASONS` 供收尾 sweep 分流）。
 4 GB 切断经 `FOUR_GB_SPLIT_SIZE` 判定，命中可走拼接路径或落 `VOLUME_4GB_SPLIT` 枚举）。
 
 关键阈值（与 v2.1 设计一致，**不许拍脑袋改**）：
@@ -125,6 +139,15 @@ LOCK_FILENAME = ".pipeline.lock"
 | `NO_EXTRACT_EXTS` | `{".apk"}` | 合法安装包不拆 |
 | `JUNK_AUTO_RULES` / `JUNK_ASK_RULES` | 零风险档 / 需确认档 | 见 §7 |
 | `PASSWORD_HINT_WORDS` / `PASSWORD_FILE_BASENAME` | 解压码/密码/… / `password.txt` | 抠码关键词 / 密码文件保护例外 |
+| `TOP_K` / `RECENT_DAYS` / `DEFERRED_MAX_RETRY` | `10` / `7` / `2` | pass1 内库热源条数 / 近期新增窗口天数 / 跨 run 递延上限（v3.8.0；§8） |
+| `MASTER_PASSWORD_BASENAME` / `MASTER_PASSWORD_REL` | `passwords.master.txt` / `.pipeline/passwords.master.txt` | 每处理根唯一可写主库（v3.8.0；§8） |
+| `INTERNAL_FAIL_REASONS` / `PASSWORD_FAIL_REASONS` | 6+1 项 / 密码类 | 收尾 sweep 分流：内部失败重放 pass1、密码失败走 pass2（§12） |
+| `DECAY_ENABLED` / `DECAY_DAYS` / `DECAY_MIN_COUNT` | `True` / `90` / `3` | 防劣化总开关 / 「久」的天数阈值（**严格大于**）/「冷」的次数下限（**严格小于**），两条同时成立才降权（§8.1） |
+| `DECAY_EMPTY_LAST_DATE_DECAYS` | `False` | `last_date` 为空的老条目是否按劣化处理（默认**否**） |
+| `DECAY_FRACTION_ALARM` | `0.5` | 降权占比告警线（只提示） |
+| `PASS1_HIT_RATE_MIN` / `PASS1_HIT_RATE_MIN_SAMPLE` | `0.5` / `10` | pass1 命中率告警线 / 最小样本量 |
+| `LIBRARY_MONTH_GROWTH_MAX` / `LIBRARY_SIZE_MAX` | `50` / `200` | 主库月增上限 / 库量上限（只提示） |
+| `ACTION_PW_STAT` / `ACTION_PW_DECAY` | `PW_STAT` / `PW_DECAY` | 批次末密码库埋点（INFO / WARN，§12） |
 
 ## 3. pipeline_lib/db.py —— SQLite 状态机（design §2）
 
@@ -264,24 +287,29 @@ def match(file_path: str, real_type: str, size: int, content_head: bytes = b"") 
 ## 8. pipeline_lib/passwords.py —— 密码库合并口径（★ 本节为对齐后的正式口径，与 SKILL.md §5 一致）
 
 ```python
-# 模块级路径常量（代码实名核对）
+# 模块级路径常量（代码实名核对，v3.8.0 口径）
 SKILL_ROOT                                 # scripts/pipeline_lib/ 上溯三级 = skill 根
-BUILTIN_PASSWORDS      = <skill>/assets/passwords.txt            # 内置 20 条种子，只读发布物
-LOCAL_SKILL_PASSWORDS  = <skill>/assets/passwords.local.txt      # 个人库①（git-ignored，最高优先）
-LOCAL_ROOT_PASSWORDS   = ".pipeline/passwords.local.txt"         # 相对 root 的个人库②
-C.PASSWORD_FILE_BASENAME = "password.txt"                        # root 下随手库③
+BUILTIN_PASSWORDS      = <skill>/assets/passwords.txt            # 内置 20 条种子，只读发布物（永不写）
+C.MASTER_PASSWORD_BASENAME = "passwords.master.txt"              # 主库基名（v3.8.0）
+C.MASTER_PASSWORD_REL      = ".pipeline/passwords.master.txt"    # 相对 root 的唯一可写主库（每处理根一个）
+def master_path(root=None) -> str | None                         # 返回 <root>/.pipeline/passwords.master.txt
+# 旧库已废弃、运行期不再读取（改由 `migrate-passwords` 迁移进主库）：
+#   <skill>/assets/passwords.local.txt、<skill>/assets/passwords.learned.txt、<root>/password.txt
 
 def describe_sources(passwords_file=None, workdir=None, root=None) -> list[tuple]:
-    """返回 [(label, path)]，按合并优先级排序，供 `doctor` 第 6 项打印（含是否存在标注）。"""
+    """返回 [(label, path)]，按合并优先级排序，供 `doctor` 第 6 项打印（含是否存在标注）。
+    v3.8.0 三层口径：external(--passwords) → master(<root>/.pipeline/passwords.master.txt，可写)
+    → builtin(<skill>/assets/passwords.txt，只读种子)；旧 local/learned/password.txt 不再读取。"""
 
 def load_library(passwords_file: str | None = None, workdir: str | None = None,
-                 root: str | None = None) -> list[str]:
-    """按序合并（每处去重保序，越靠前越优先）：
-      1. `--passwords` 外部库（label=external，可再覆盖全部）
-      2. <skill>/assets/passwords.local.txt      （个人库①，git-ignored）
-      3. <root>/.pipeline/passwords.local.txt    （个人库②，按处理根隔离）
-      4. <root>/password.txt                     （个人库③，工作目录随手库）
-      5. <skill>/assets/passwords.txt            （内置种子，垫底）
+                 root: str | None = None, counts: dict[str, int] | None = None,
+                 prioritize_by_count: bool = True) -> list[str]:
+    """按序合并（每处去重保序，越靠前越优先）——v3.8.0 三层口径：
+      1. `--passwords` 外部库（label=external）
+      2. <root>/.pipeline/passwords.master.txt   （主库，可写、按处理根隔离、count 降序）
+         （root 为 None 时回退到 <skill>/assets/passwords.learned.txt，即迁移前的旧口径）
+      3. <skill>/assets/passwords.txt             （只读种子，垫底）
+    prioritize_by_count=True 时按成功解压次数降序重排（pwstats.prioritize）。
     读取用 utf-8-sig（容忍 BOM），空行与 # 注释忽略。"""
 
 def scrape_from_names(names: list[str], source_tag: str) -> list[tuple]:
@@ -289,15 +317,38 @@ def scrape_from_names(names: list[str], source_tag: str) -> list[tuple]:
     RE_PW_HINT（密码|解压码|提取码|解压密码 后取值，长度 3–40；命中后按首个括号切尾并修边）。
     长度 < 3 的候选丢弃。返回 [(pwd, source_tag)]。"""
 
-def candidates_for(row, parent_row, library: list[str]) -> list[tuple]:
-    """完整候选序列（去重保序），与 SKILL.md §5 同口径：
-    ① ("", "NONE") 空密码快速路径（stdin=DEVNULL 下安全，不挂死）
-    ② 父包命中密码（INHERITED）
-    ③ 文件名/父目录名末尾配对括号（TRAIL_BRACKET / DIR_NAME）
-    ④ 文件名抠码（FILE_NAME）→ ⑤ 目录名抠码（DIR_NAME）
-    ⑥ 密码库全部条目（LIBRARY，合并顺序见 load_library）。
+def read_plain_passwords(path: str | None) -> list[str]:
+    """读 `--passwords` 纯文本（v3.8.0 新增公开函数）：逐行取密码，`#` 注释 / BOM / 空行
+    语义与 `migrate_passwords._read_plain` 一致；返回去重保序的密码列表。
+    调度层据此作为 pass1 的 USER 来源（见 candidates_for 的 user_passwords）。"""
+
+def _recent_added(library: list[str], added_dates: dict[str, str] | None,
+                  days: int | None = None) -> list[str]:
+    """v3.8.0 阶段 3（A-enh）：added_date 在近 days 天内的库密码（days 默认 config.RECENT_DAYS）。
+    **added_date 为空的历史条目永不计入**（IS NOT NULL 规则，防“未知”污染“近期”）；
+    日期非法 / 库里没有日期 → 跳过或返回 []（对老 4 字段库完全退化成空窗）。
+    返回顺序跟随 library（已是 count 降序），从不抛（日期解析一律走 pwstats._coerce_date）。"""
+
+def candidates_for(row, parent_row, library: list[str],
+                   user_passwords: list[str] | None = None,
+                   added_dates: dict[str, str] | None = None) -> tuple[list, list]:
+    """返回**两遍**候选 `(pass1, pass2)`（v3.8.0），与 SKILL.md §5 同口径。
+    pass1（高优先 + 库热源，命中即停）：
+      ① ("", "NONE") 空密码快速路径（stdin=DEVNULL 下安全，不挂死）
+      ② USER —— 用户显式给的 --passwords（先于 INHERITED；见 read_plain_passwords）
+      ③ INHERITED —— 父包命中密码
+      ④ TRAIL_BRACKET / DIR_NAME —— 文件名/父目录名末尾配对括号
+      ⑤ FILE_NAME / DIR_NAME —— 文件名/目录名抠码
+      ⑥ LIBRARY top-K —— 库中按次数降序的前 config.TOP_K(=10) 条
+         （取的是经 `pwstats.decay_partition` 重排后的 library：被判劣化的条目**已挪出**头部 K 条，
+           但仍然留在 pass2 长尾里，见 §8.1）
+      ⑦ RECENT —— added_date 在 config.RECENT_DAYS 内的近期新增（v3.8.0 阶段 3；见 _recent_added）
+    pass2（库长尾）：库里**没进 pass1** 的其余条目，仍按次数降序（仅批次收尾 sweep 跑）。
+    pass1 ∪ pass2 覆盖每一个候选；seen 去重保留（pass1 出过的密码不再进 pass2）。
+    因 recentN ⊆ library 且走同一个 add()，加入 ⑦ 不会破坏覆盖不变式。
     命中即停；命中密码明文落库（password + password_source）。
-    注：以上全部未命中时，调度层再追加第 7 顺位 TXT_MINED（见 mine_txt_passwords）。"""
+    注：pass1 全部未命中时，调度层在 pass1 末尾追加 TXT_MINED（见 mine_txt_passwords，pass1-only）。
+    added_dates 由 Pipeline 在加载主库时经**同一次 parse_learned** 投影得到（不发第二次读盘）。"""
 
 def mine_txt_passwords(roots, max_files: int = 500,
                        max_bytes: int = 65536) -> list[tuple]:
@@ -308,6 +359,51 @@ def mine_txt_passwords(roots, max_files: int = 500,
     只读已落盘的 .txt（待解密包此刻读不了，是真兜底）；max_files/max_bytes 双上限
     卡住开销；返回 [(pwd, "TXT_MINED")]，跨文件按密码值去重。误命中无害。"""
 ```
+
+## 8.1 pipeline_lib/pwstats.py —— 密码自学习层（★ v3.8.0 阶段 3 / 4 的判据单一源）
+
+**依赖方向（改这个模块前必读）**：`pwstats.py` **零项目内 import**（只用标准库），而 `passwords.py`
+反过来 `from . import pwstats`。所以**所有日期与劣化判据都必须住在这里** —— 若把它们沉到
+`passwords`，`pwstats.library_metrics` 就不得不 lazy import 并用 `except` 兜住，会把真实异常
+吞成 `decayed=0`（**静默失真**）。测试 `StaticSingleSourceGuardTests` 静态盯着：
+`fromisoformat` 全模块**仅 1 处**、`is_decayed` / `is_suspicious` / `_coerce_date` 各定义 **1 处**、
+`pwstats.py` 内**不得**出现 `from . import passwords`。
+
+```python
+class Entry:                     # 一条库记录：count / password / added_date / last_date / sources
+    def line(self) -> str        # 落盘行：有 added_date -> 5 列（count / pw / added / last / sources，TAB 分隔）
+                                 #          否则        -> 4 列（count / pw / last / sources）
+
+def parse_learned(path) -> tuple[dict[str, int], list[Entry]]
+    # 唯一解析器：read_added_dates / passwords.load_library / library_metrics 全部复用它，不开第二套
+def read_added_dates(path) -> dict[str, str]      # {password: added_date}
+def verify(path) -> tuple[bool, str]              # 机械自检：只查列数（接受 1/3/4/5，拒绝 2 与 >=6）
+                                                  # **不校验日期**（已知缺口，pitfalls #58）
+
+def _coerce_date(value) -> str | None             # 唯一的日期合法性收敛点：空/非 ISO/垃圾 -> None，永不抛
+def is_decayed(count, last_date, today, cfg) -> bool
+    # 劣化判据单一源：距最近成功 > cfg.DECAY_DAYS(90) **且** count < cfg.DECAY_MIN_COUNT(3)
+    # fail-soft：日期不可解析时按 cfg.DECAY_EMPTY_LAST_DATE_DECAYS(False) 处理，绝不抛
+def is_suspicious(added_date, last_date) -> bool  # 两者皆合法 ISO 且 added > last（自相矛盾行）
+def decay_partition(lib, counts, last_dates, added_dates=None, today=None, cfg=None) -> dict
+    # -> {"ordered": [...], "decayed": [...], "suspicious": int}
+    # 稳定重分区：**先**算 suspicious（这些行**不参与降权**），再筛 decayed；ordered 保持原相对序。
+    # cfg.DECAY_ENABLED=False -> ordered == lib 原序、decayed == []，但 suspicious 仍照常统计。
+def library_metrics(path, conn=None, today=None) -> dict
+    # -> {"total", "month_new", "decayed", "empty_dates", "suspicious", "error"}
+    # **失败契约**：读不到 / 解析不了时返回**全 None + error**，**绝不返回 0**
+    # （0 会被下游误读成“没有劣化”，把数据不可得伪装成健康信号）
+def record_success(path, password, source, date=None) -> None
+    # 落库 +1；**last_date 单调不回退**（只有更大才覆盖），防止造出 added_date > last_date 的矛盾行
+```
+
+> **⚠️ 主库格式与列位置（pitfalls #57）**：4 列行第 3 列是 `last_date`，5 列行第 3 列是 `added_date`——
+> **含义随字段数变化**。`_parse_data_line` 按**字段数分支**，所以新旧两种行可以混排共存。
+> 已知缺口：手改时**行尾多一个 TAB** 会让 4 列行被当成 5 列解读，而 `verify()` 也放行——
+> 根因是**列数本质上不可判定**（合法的“5 列但来源为空”本身就是 TAB 结尾），两种排歧方案都实证会
+> 引入新 bug。**刻意不给 `verify()` 加日期硬闸**：那会把“手改坏一行”升级成“整批中止”，
+> 换算下来更糟（本项目被闸口误停过多次）。防线放在消费侧：`is_suspicious` 把矛盾行标出来让人看见，
+> **只观察、不判死、不改数据**。
 
 ## 9. pipeline_lib/sz.py —— 7z 封装（design §3.6 / §7.3）
 
@@ -411,6 +507,11 @@ class Pipeline:
     # _delete_one / _delete_allowed  底层删除 + 保护白名单（check#11，拒删记 ERROR）
     # _purge_recycle(phase)  四个阶段：start / finish / space-gate / space-floor
     # _confirm(question)     需确认档交互（sys_stdin_isatty() 判可交互）
+    # _emit_pw_stat()       批次末埋点（v3.8.0 阶段 4）：self._pw_stat 全程只累计，在收尾 sweep 之后
+    #                       落一条 ACTION_PW_STAT(INFO)；有降权或 pass1 命中率偏低时补一条
+    #                       ACTION_PW_DECAY(WARN)。消息内嵌稳定令牌 p1=<hit>/<att>、p2=...、
+    #                       month_new=...、decayed=... 供 evolve 健康项 11 反读（不靠翻日志猜）。
+    #                       **只读累计，绝不参与任何判定**；任何异常 try/except 兜住，不崩批次。
 ```
 
 **终结态回溯（两处触发点，缺一不可）——已实现并冒烟验证：**

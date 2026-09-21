@@ -25,6 +25,13 @@
      一次误判会自我强化、越学越错。
   §E **密码载体永久豁免**：任何名字/目录带「密码/解压码/提取码」的路径，
      即使库里命中也不适用（复用 ``junk.is_password_carrier``）。
+  §G **弱判据作用域闸门**（v3.9.2，2026-09-22 事故修复）：
+     ``name`` / ``namepart`` 是「按名字猜」，``hash`` 是「看内容认」。
+     手工规则 ``namepart  老王论坛`` 曾把真视频 ``老王论坛…(1).mp4``
+     当论坛广告删掉（9 个 / 16.29 GB，源分卷已删）。故弱判据必须过
+     ``name_rule_applies``：音视频媒体不适用、≥ ``JUNK_NAMERULE_MAX_BYTES``
+     的大文件不适用；``hash`` 强判据不受限。合成硬性质——大文件从此
+     不可能被自动判垃圾（叠加 ``JUNK_HASH_MAX_BYTES`` 后）。
   §F 文件格式（UTF-8, LF）::
 
         # 注释行以 '#' 开头；空行原样保留
@@ -289,6 +296,40 @@ def content_hash(path: str, size: Optional[int] = None,
         return None
 
 
+def name_rule_applies(file_path: str, size: Optional[int] = None) -> bool:
+    """名称类规则（``name`` / ``namepart``）的作用域闸门（v3.9.2，§G）。
+
+    这两类规则是**按名字猜**（"文件名里有这个词就是广告"），判据强度远低于
+    ``hash``（看内容认人）。2026-09-22 事故：手工 ``namepart  老王论坛`` 把
+    真视频 ``老王论坛3184065655 (1).mp4`` 当成论坛广告删了（9 个 / 16.29 GB，
+    源分卷已删、不可恢复）。故弱判据必须先过这道闸门：
+
+      * 音视频媒体 → 不适用（广告不会是几 GB 的视频，真视频却常带站名前缀）；
+      * ``size`` ≥ ``C.JUNK_NAMERULE_MAX_BYTES`` → 不适用（广告一律 KB 级）。
+
+    ``size`` 为 ``None`` 时退回 ``os.path.getsize``；取不到大小时按「不适用」
+    处理（fail-safe：拿不到证据就不判）。本函数**绝不抛**。
+    """
+    try:
+        from . import config as C
+        if not file_path:
+            return False
+        ext = os.path.splitext(file_path)[1].lower()
+        if ext in C.JUNK_NAMERULE_MEDIA_EXTS:
+            return False
+        real = size
+        if real is None:
+            try:
+                real = os.path.getsize(file_path)
+            except OSError:
+                return False
+        if real and real >= C.JUNK_NAMERULE_MAX_BYTES:
+            return False
+        return True
+    except Exception:  # noqa: BLE001 —— 闸门失效应失效在「不判」这一侧
+        return False
+
+
 def lookup(file_path: str, size: Optional[int] = None,
            digest: Optional[str] = None,
            path: Optional[str] = None) -> Optional[dict]:
@@ -333,8 +374,12 @@ def lookup(file_path: str, size: Optional[int] = None,
                     "rule": junk_mod.library_rule(e.kind),
                     "delete_when": e.delete_when}
 
+        # §G 闸门（v3.9.2）：name / namepart 是「按名字猜」的弱判据，
+        # 媒体文件与大文件一律不适用（只有上面的 hash 强判据能定罪）。
+        weak_ok = name_rule_applies(file_path, size=size)
+
         # ② 完整文件名（归一化后精确相等）。
-        e = by_name.get(name_n)
+        e = by_name.get(name_n) if weak_ok else None
         if e is not None:
             if carrier and e.delete_when != "after_extraction":
                 return None
@@ -344,10 +389,11 @@ def lookup(file_path: str, size: Optional[int] = None,
 
         # ③ 名称片段：取「最长命中」的那条（最具体的判据优先）。
         best: Optional[Entry] = None
-        for e in nameparts:
-            if e.value and e.value in name_n:
-                if best is None or len(e.value) > len(best.value):
-                    best = e
+        if weak_ok:
+            for e in nameparts:
+                if e.value and e.value in name_n:
+                    if best is None or len(e.value) > len(best.value):
+                        best = e
         if best is not None:
             if carrier and best.delete_when != "after_extraction":
                 return None

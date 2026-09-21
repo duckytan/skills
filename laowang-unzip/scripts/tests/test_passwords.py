@@ -54,7 +54,8 @@ class TrailingBracketTests(unittest.TestCase):
     def test_candidates_for_includes_trailing(self):
         row = {"file_name": "女生宿舍楼连续三位小嫩妹（sX8uRvp4Ld73）.tar",
                "dir_path": "/x", "password": ""}
-        cands = pw.candidates_for(row, None, [])
+        pass1, pass2 = pw.candidates_for(row, None, [])
+        cands = pass1 + pass2
         pairs = [(p, s) for p, s in cands]
         sources = [s for _, s in cands]
         self.assertIn("TRAIL_BRACKET", sources)
@@ -67,7 +68,8 @@ class TrailingBracketTests(unittest.TestCase):
         # 前面的走普通 FILE_NAME 抠码（低优先）
         row = {"file_name": "写真（123）合集（456）.7z",
                "dir_path": "/x", "password": ""}
-        cands = pw.candidates_for(row, None, [])
+        pass1, pass2 = pw.candidates_for(row, None, [])
+        cands = pass1 + pass2
         sources = [s for _, s in cands]
         self.assertIn("TRAIL_BRACKET", sources)
         self.assertIn("FILE_NAME", sources)
@@ -110,21 +112,24 @@ class TrailingBracketTests(unittest.TestCase):
         # 父目录名末尾的配对括号（含 【】）要走 DIR_NAME
         row = {"file_name": "a.7z",
                "dir_path": "/x/合集【abc123】", "password": ""}
-        cands = pw.candidates_for(row, None, [])
+        pass1, pass2 = pw.candidates_for(row, None, [])
+        cands = pass1 + pass2
         self.assertIn(("abc123", "DIR_NAME"), [(p, s) for p, s in cands])
 
     def test_dir_name_trailing_bracket_halfwidth_user_example(self):
         # 用户例子：父文件夹名末尾半角括号 = 密码（DIR_NAME）
         row = {"file_name": "abc.zip",
                "dir_path": r"D:\Downloads\美丽的姑娘(123)", "password": ""}
-        cands = pw.candidates_for(row, None, [])
+        pass1, pass2 = pw.candidates_for(row, None, [])
+        cands = pass1 + pass2
         self.assertIn(("123", "DIR_NAME"), [(p, s) for p, s in cands])
 
     def test_no_duplicate_trailing_via_file_name(self):
         # 末尾 （） 被 TRAIL_BRACKET 和 RE_BRACKET 都命中，不应出现两条相同密码
         row = {"file_name": "写真（sX8uRvp4Ld73）.7z",
                "dir_path": "/x", "password": ""}
-        cands = pw.candidates_for(row, None, [])
+        pass1, pass2 = pw.candidates_for(row, None, [])
+        cands = pass1 + pass2
         pwds = [p for p, s in cands]
         self.assertEqual(pwds.count("sX8uRvp4Ld73"), 1)
 
@@ -151,7 +156,8 @@ class KeywordHintTests(unittest.TestCase):
     def test_kouling_in_candidates(self):
         row = {"file_name": "合集口令：kLm42.mp4",
                "dir_path": "/x", "password": ""}
-        cands = pw.candidates_for(row, None, [])
+        pass1, pass2 = pw.candidates_for(row, None, [])
+        cands = pass1 + pass2
         self.assertIn(("kLm42", "FILE_NAME"), [(p, s) for p, s in cands])
 
     def test_pw_hint_strips_file_extension(self):

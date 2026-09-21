@@ -50,7 +50,7 @@ class HeaderInfo:
 
     __slots__ = ("real_type", "is_archive", "sig_offset", "volume_role",
                  "volume_group", "patch_from", "skip_reason", "fail_reason",
-                 "needs_rename")
+                 "needs_rename", "embedded_volume")
 
     def __init__(self) -> None:
         self.real_type: str = "UNKNOWN"
@@ -62,6 +62,13 @@ class HeaderInfo:
         self.needs_rename: bool = False     # 「删」-suffixed archive name
         self.skip_reason: str = ""
         self.fail_reason: str = ""
+        # U2-c.1 (v3.9.0): an SFX-shaped volume member — the head is NOT an
+        # archive (analyze keeps the CONTAINER type, e.g. EXE, in real_type and
+        # records the embedded archive only via sig_offset) but the name is a
+        # ``<base>.part<N>`` member of a RAR set that has a same-set sibling.
+        # Such a row is a genuine, 7z-openable FIRST volume and must be routed
+        # to the volume-set rename + extraction chain, never carved.
+        self.embedded_volume: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -146,6 +153,92 @@ def loose_volume_group(name: str) -> Optional[str]:
     return None
 
 
+def _canonical_part_stem(stem: str):
+    """Match :data:`RE_PART_STEM` on *stem* — as-is FIRST, then with trailing
+    dots stripped (U2-a, v3.9.0).
+
+    Bounded and non-looping ("as-is first, then one trailing-dot strip"), so a
+    compound volume stem such as ``movie.7z`` is never reduced to ``movie`` and
+    can never be mistaken for a ``<base>.part<N>`` member.  Handles the real
+    double-dot name ``七天.11.part2..rar`` (stem ``七天.11.part2.`` →
+    ``七天.11.part2``).
+
+    Returns the ``re.Match`` or ``None``.  Deliberately SEPARATE from
+    :func:`volume_info` / :func:`loose_volume_group`: those stay the single
+    source of truth (a double-dot name still reports ``NONE`` there, so the
+    analyze early-return and the canonical-volume guard keep their behaviour).
+    """
+    m = RE_PART_STEM.match(stem)
+    if m is not None:
+        return m
+    stripped = stem.rstrip(".")
+    if stripped != stem:
+        return RE_PART_STEM.match(stripped)
+    return None
+
+
+def tolerant_volume_group(name: str) -> Optional[str]:
+    """Volume group of *name*, tolerating BOTH a fake trailing extension AND
+    trailing dot(s) on the stem (U2-a/U2-d, v3.9.0).
+
+    Extends :func:`loose_volume_group` with the bounded trailing-dot strip used
+    for whole-set planning (the real double-dot member ``七天.11.part2..rar``
+    yields ``None`` from both ``volume_info`` and ``loose_volume_group``).
+    Used by the whole-set rename planner and the embedded-SFX detector; the
+    single source of truth is never polluted.
+    """
+    group = loose_volume_group(name)
+    if group:
+        return group
+    stem = os.path.splitext(name)[0]
+    m = _canonical_part_stem(stem)
+    if m:
+        return m.group("base").lower() + ".rarset"
+    return None
+
+
+# Typical SFX stub length is a few hundred KB (the real case is a 444 416-byte
+# MZ stub); the embedded-signature probe is bounded to this window.  A miss is a
+# conservative non-action (no rename), never a mis-rename.
+_EMBEDDED_SFX_SCAN_BYTES = 8 * 1024 * 1024
+
+# v3.9.1 (D1 EXE-branch): derived SUBSET (a view of the one source of truth —
+# never a copied literal table, cf. pitfalls #72).  ``.partN.rar`` is a
+# RAR-only form, so ONLY a RAR-family embedded archive makes an EXE shell a
+# renameable SFX volume; an MZ stub with an embedded PK/7Z is a genuine
+# executable (e.g. ``wininst-*.exe``, 7z self-extractors) and must NOT be
+# renamed to ``.rar``.  Kept as full ``(sig, rtype, ext)`` specs so it has the
+# SAME shape as :data:`config.ARCHIVE_SEARCH_SIGNATURES`.
+_RAR_EMBEDDED_SIGNATURES = tuple(
+    entry for entry in C.ARCHIVE_SEARCH_SIGNATURES
+    if entry[1] in ("RAR", "RAR5"))
+
+
+def _has_embedded_archive(path: str, signatures=None) -> bool:
+    """SFX probe: is an archive signature embedded at offset > 0? (bounded)
+
+    *signatures* defaults to the FULL :data:`config.ARCHIVE_SEARCH_SIGNATURES`
+    so every existing caller (incl. the carve path) is unchanged; callers that
+    need a narrower notion (the part-N rename judge) may pass a subset.
+    """
+    try:
+        size = fsutil.getsize(path)
+    except OSError:
+        return False
+    if size <= 0:
+        return False
+    cap = min(size, _EMBEDDED_SFX_SCAN_BYTES)
+    try:
+        with open(fsutil.to_extended(path), "rb") as fh:
+            data = fh.read(cap)
+    except OSError:
+        return False
+    for sig, _rtype, _ext in (signatures or C.ARCHIVE_SEARCH_SIGNATURES):
+        if data.find(sig, 1) > 0:
+            return True
+    return False
+
+
 def volume_member_rename(path: str, real_type: str) -> Optional[str]:
     """Canonical target path for a disguised volume-set member (or None).
 
@@ -169,10 +262,18 @@ def volume_member_rename(path: str, real_type: str) -> Optional[str]:
     src_dir = os.path.dirname(path)
     base = os.path.basename(path)
     stem, ext = os.path.splitext(base)
-    if ext.lower() in (".rar", ".zip", ".7z", ".gz", ".tar"):
-        return None                      # canonical archive extension already
+    # U2-b (v3.9.0): return early ONLY when the ORIGINAL name is already a
+    # recognised volume name.  The old test was just ``ext in canonical`` —
+    # which is exactly where ``七天.11.part2..rar`` died (its declared ext is
+    # ``.rar``), *before* any stem handling could run.  A genuine canonical
+    # member (``140889.part2.rar``) still short-circuits here.
+    if ext.lower() in CANONICAL_ARCHIVE_EXTS and volume_info(base)[0] != "NONE":
+        return None                      # already a recognised volume name
     target_name = None
-    m = RE_PART_STEM.match(stem)
+    # U2-a (v3.9.0): tolerate trailing dot(s) on the stem ("as-is first, then
+    # one bounded strip").  ``七天.11.part2.`` (from ``...part2..rar``) becomes
+    # ``七天.11.part2``; a compound stem such as ``movie.7z`` is never reduced.
+    m = _canonical_part_stem(stem)
     if m and real_type in ("RAR", "RAR5"):
         # .partN.rar is the ONLY standard part-N form 7z groups; a zip/7z
         # partN member has no canonical multi-part name (zip sets use
@@ -197,6 +298,110 @@ def volume_member_rename(path: str, real_type: str) -> Optional[str]:
                 return None              # never rename over an existing file
             return target
     return None
+
+
+def _is_renameable_volume_member(path: str) -> bool:
+    """整组改名规划的成员纳入判据（v3.9.1 D1/D13）—— **白名单式**。
+
+    能被归一到 ``<base>.partN.rar`` 的只有两类（``.partN.rar`` 只有 RAR 认识，
+    见 :func:`volume_member_rename` 的判据）：
+
+    * offset-0 就是 RAR/RAR5 内容 —— 真 RAR 分卷，无论扩展名伪装成什么；
+    * SFX 首卷 —— MZ 外壳 + 偏移 > 0 处内嵌 **RAR 系**归档（``.partN.rar``
+      只有 RAR 认识；``wininst-*.exe``、7z 自解压这类非 RAR 内嵌的 MZ 可执行
+      文件不纳入，D1 EXE 支收口）。
+
+    其余一切 head 一律 **不纳入**：
+
+    * 已知容器（MP4/PNG/JPEG/PDF/TXT）—— ``_has_embedded_archive`` 只在前 8 MiB
+      找"任意"归档签名，真视频里内嵌一个 ``PK`` 就成立（D1，已复现）；
+    * ``probe_magic_only`` 返回 ``UNKNOWN`` 的容器（MKV/AVI/无头…）—— 黑名单式
+      实现把 ``UNKNOWN`` 漏在名单外 → 照样被改名（D1 漏网，已复现 4 格）；
+    * ZIP/7Z/GZ/TAR 内容 —— 没有 ``.partN`` 规范形式，改成 ``.rar`` 反而破坏
+      7z 原生分卷分组（D13，与 :func:`volume_member_rename` 自相矛盾）。
+    """
+    head = probe_magic_only(path)
+    if head in ("RAR", "RAR5"):
+        return True
+    if head == "EXE" and _has_embedded_archive(path, _RAR_EMBEDDED_SIGNATURES):
+        return True
+    return False
+
+
+def volume_set_rename_plan(path: str) -> List[Tuple[str, str]]:
+    """Whole-set rename plan ``[(old_path, new_path), ...]`` — PURE, no writes.
+
+    U2-d (v3.9.0, "plan-then-apply"): for a disguised ``<base>.part<N>`` RAR set
+    this returns the rename plan for the WHOLE set (own + siblings), computed
+    from NAMES + CONTENT — **never** from :func:`loose_volume_group`, which
+    returns ``None`` for the double-dot member ``<base>.part2..rar`` and would
+    otherwise make the outcome depend on enumeration order (if ``part1`` is
+    renamed first its sibling provides no evidence; if ``part2`` is renamed
+    first it does).  The plan is deterministic (sorted) and order-independent.
+
+    Returns ``[]`` when *path* is not a ``<base>.part<N>`` member, when the set
+    has fewer than two members (a lone first volume is never renamed), or when
+    ANY target already exists (all-or-nothing — the whole set is abandoned).
+    """
+    base = os.path.basename(path)
+    stem, _ext = os.path.splitext(base)
+    own = _canonical_part_stem(stem)
+    if own is None:
+        return []
+    group = own.group("base").lower() + ".rarset"
+    src_dir = os.path.dirname(path)
+    members: List[Tuple[str, str]] = []          # (full_path, file_name)
+    for entry in fsutil.list_top_level(src_dir):
+        name = os.path.basename(entry)
+        m = _canonical_part_stem(os.path.splitext(name)[0])
+        if m is None or m.group("base").lower() + ".rarset" != group:
+            continue                              # different set / not a member
+        if not _is_renameable_volume_member(entry):
+            continue                              # not a renameable archive member
+        members.append((entry, name))
+    if len(members) < 2:
+        return []                                 # lone member => never rename
+    plan: List[Tuple[str, str]] = []
+    targets_seen = set()
+    for entry, name in members:
+        m = _canonical_part_stem(os.path.splitext(name)[0])
+        target_name = "%s.part%s.rar" % (m.group("base"), m.group("num"))
+        if target_name.lower() == name.lower():
+            continue                              # already canonical
+        target = os.path.join(src_dir, target_name)
+        if fsutil.exists(target):
+            return []                             # collision => whole set abandoned
+        low = target.lower()
+        if low in targets_seen:
+            return []                             # two members claim one target
+        targets_seen.add(low)
+        plan.append((entry, target))
+    plan.sort(key=lambda t: t[0].lower())         # deterministic / order-free
+    return plan
+
+
+def _detect_embedded_volume(info: "HeaderInfo", path: str) -> bool:
+    """U2-c.1: is *path* an embedded-SFX FIRST volume of a part-N RAR set?
+
+    Analyse keeps the CONTAINER type in ``real_type`` (e.g. ``EXE`` for an MZ
+    stub + embedded RAR — empirically confirmed) and records the embedded
+    archive only via ``sig_offset``.  So the discriminator is ``sig_offset>0``
+    plus: the stem is a ``<base>.part<N>`` member AND a same-set sibling exists
+    in the same directory (tolerant group match — the double-dot sibling counts).
+    """
+    base = os.path.basename(path)
+    stem, _ext = os.path.splitext(base)
+    m = _canonical_part_stem(stem)
+    if m is None:
+        return False
+    group = m.group("base").lower() + ".rarset"
+    for entry in fsutil.list_top_level(os.path.dirname(path)):
+        sib = os.path.basename(entry)
+        if sib.lower() == base.lower():
+            continue
+        if tolerant_volume_group(sib) == group:
+            return True
+    return False
 
 
 def check_volume_complete(path: str, file_name: str, group: str) -> tuple:
@@ -424,6 +629,12 @@ def analyze(path: str) -> HeaderInfo:
             if not ok:
                 info.fail_reason = C.FAIL_VOLUME_MISSING
                 info.skip_reason = "volume set incomplete"
+    elif info.sig_offset > 0:
+        # U2-c.1 (v3.9.0): SFX-shaped volume member (container head, embedded
+        # archive).  analyze keeps the CONTAINER type in real_type and only
+        # records the embedded archive via sig_offset — so the discriminator is
+        # sig_offset>0 + a part-N stem + a same-set sibling (see _detect...).
+        info.embedded_volume = _detect_embedded_volume(info, path)
     return info
 
 

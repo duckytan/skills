@@ -57,7 +57,8 @@ class CandidateSourcePrecedenceTests(unittest.TestCase):
 
             row = {"file_name": "女生宿舍楼（sX8uRvp4Ld73）合集.tar",
                    "dir_path": ""}
-            pairs = [(p, s) for p, s in pw_mod.candidates_for(row, None, lib)]
+            pass1, pass2 = pw_mod.candidates_for(row, None, lib)
+            pairs = [(p, s) for p, s in (pass1 + pass2)]
 
             # the mid-name bracket is scraped as a FILE_NAME candidate
             self.assertIn(("sX8uRvp4Ld73", "FILE_NAME"), pairs)
@@ -86,7 +87,8 @@ class CandidateSourcePrecedenceTests(unittest.TestCase):
 
             row = {"file_name": "女生宿舍楼（sX8uRvp4Ld73）合集.tar",
                    "dir_path": ""}
-            pairs = [(p, s) for p, s in pw_mod.candidates_for(row, None, lib)]
+            pass1, pass2 = pw_mod.candidates_for(row, None, lib)
+            pairs = [(p, s) for p, s in (pass1 + pass2)]
             lib_pws = [p for p, s in pairs if s == "LIBRARY"]
             seq = [counts.get(p, 0) for p in lib_pws]
             self.assertEqual(seq, sorted(seq, reverse=True),
@@ -97,7 +99,8 @@ class CandidateSourcePrecedenceTests(unittest.TestCase):
         row = {"file_name": "女生宿舍楼连续三位小嫩妹（sX8uRvp4Ld73）.tar",
                "dir_path": ""}
         lib = ["上老王论坛当老王"]          # count 188, first in the library
-        pairs = [(p, s) for p, s in pw_mod.candidates_for(row, None, lib)]
+        pass1, pass2 = pw_mod.candidates_for(row, None, lib)
+        pairs = [(p, s) for p, s in (pass1 + pass2)]
 
         name_idx = [i for i, (p, _s) in enumerate(pairs) if p == "sX8uRvp4Ld73"]
         lib_idx = [i for i, (_p, s) in enumerate(pairs) if s == "LIBRARY"]
@@ -125,8 +128,7 @@ class PwStatsVerifyOrderTests(unittest.TestCase):
         with open(tmp, "w", encoding="utf-8", newline="") as fh:
             fh.write("# h\n1\tlow\t2026-01-01\tA\n9\thigh\t2026-01-02\tB\n")
         buf = io.StringIO()
-        with mock.patch.object(P, "learned_path", return_value=tmp), \
-                mock.patch.object(pw_mod, "LEARNED_SKILL_PASSWORDS", tmp), \
+        with mock.patch.object(pw_mod, "master_path", return_value=tmp), \
                 contextlib.redirect_stdout(buf):
             rc = pipeline.main(["pw-stats", "--verify", "--root", self.root])
         self.assertEqual(rc, 1, "verify accepted an out-of-order learned file")

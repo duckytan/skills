@@ -625,5 +625,132 @@ class ParserTests(unittest.TestCase):
             ["prune-empty", "--apply", "--root", "R"]).apply)
 
 
+class WeakRuleScopeTests(unittest.TestCase):
+    """§G 弱判据作用域闸门（v3.9.2，2026-09-22 事故修复）。
+
+    事故原型：手工 ``namepart  老王论坛`` 把真视频
+    ``老王论坛3184065655 (1).mp4`` 当论坛广告删了（9 个 / 16.29 GB，
+    源分卷已删、不可恢复）。name / namepart 是「按名字猜」的弱判据，
+    绝不能作用于音视频媒体与大文件；hash 是强判据，不受限。
+    """
+
+    def _mkfile(self, d, name, content=b"x"):
+        p = os.path.join(d, name)
+        parent = os.path.dirname(p)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with open(p, "wb") as fh:
+            fh.write(content)
+        return p
+
+    def test_accident_regression_namepart_never_hits_video(self):
+        """事故本体：namepart「老王论坛」不得命中 .mp4 真视频。"""
+        with tempfile.TemporaryDirectory() as d:
+            lib = os.path.join(d, "lib.txt")
+            J.record("namepart", "老王论坛", path=lib)
+            f = self._mkfile(d, "老王论坛3184065655 (1).mp4")
+            self.assertIsNone(J.lookup_file(f, path=lib))
+
+    def test_name_never_hits_video(self):
+        with tempfile.TemporaryDirectory() as d:
+            lib = os.path.join(d, "lib.txt")
+            f = self._mkfile(d, "老王论坛3184065655 (2).mkv")
+            J.record("name", os.path.basename(f), path=lib)
+            self.assertIsNone(J.lookup_file(f, path=lib))
+
+    def test_name_never_hits_audio(self):
+        with tempfile.TemporaryDirectory() as d:
+            lib = os.path.join(d, "lib.txt")
+            f = self._mkfile(d, "广告.mp3")
+            J.record("name", "广告.mp3", path=lib)
+            self.assertIsNone(J.lookup_file(f, path=lib))
+
+    def test_namepart_never_hits_big_file(self):
+        """大文件（非媒体）同样不接受「按名字猜」——广告一律 KB 级。"""
+        with tempfile.TemporaryDirectory() as d:
+            lib = os.path.join(d, "lib.txt")
+            J.record("namepart", "广告", path=lib)
+            f = self._mkfile(d, "广告.dat")
+            self.assertIsNotNone(
+                J.lookup(f, size=1024, path=lib))          # 小文件照旧命中
+            self.assertIsNone(
+                J.lookup(f, size=C.JUNK_NAMERULE_MAX_BYTES, path=lib))
+
+    def test_namepart_never_hits_big_file_hard_threshold(self):
+        """变异盲区补测：阈值必须**硬编码**，不能拿常量自己当入参。
+
+        否则把 ``JUNK_NAMERULE_MAX_BYTES`` 调大，测试会跟着一起放行，
+        闸门形同虚设而测试全绿（第二方变异测试实测到的等价变异）。
+        """
+        with tempfile.TemporaryDirectory() as d:
+            lib = os.path.join(d, "lib.txt")
+            J.record("namepart", "广告", path=lib)
+            f = self._mkfile(d, "广告.dat")
+            for big in (9 * 1024 * 1024, 64 * 1024 * 1024, 1024 ** 3):
+                self.assertIsNone(J.lookup(f, size=big, path=lib))
+            self.assertIsNotNone(J.lookup(f, size=1024, path=lib))
+
+    def test_threshold_constant_is_in_sane_range(self):
+        """常量取值本身也要锁：太小会误伤真素材，太大等于没闸门。"""
+        self.assertGreaterEqual(C.JUNK_NAMERULE_MAX_BYTES, 1024 * 1024)
+        self.assertLessEqual(C.JUNK_NAMERULE_MAX_BYTES, 64 * 1024 * 1024)
+
+    def test_namepart_never_hits_big_file_hard_size(self):
+        """M2 盲区补测：阈值必须写**死数值**，不能拿常量自己当入参。
+
+        否则把 ``JUNK_NAMERULE_MAX_BYTES`` 调大，测试会跟着一起放行
+        （第二方变异测试实测出的等价变异：改到 100GiB 仍全绿）。
+        """
+        with tempfile.TemporaryDirectory() as d:
+            lib = os.path.join(d, "lib.txt")
+            J.record("namepart", "广告", path=lib)
+            f = self._mkfile(d, "广告.dat")
+            self.assertIsNone(J.lookup(f, size=9 * 1024 * 1024, path=lib))
+            self.assertIsNone(J.lookup(f, size=64 * 1024 * 1024, path=lib))
+            self.assertIsNotNone(J.lookup(f, size=1024, path=lib))
+
+    def test_gate_constants_sane(self):
+        """M2 盲区补测：常量取值本身也要锁（太小误伤真素材，太大等于没闸门）。"""
+        self.assertGreaterEqual(C.JUNK_NAMERULE_MAX_BYTES, 1024 * 1024)
+        self.assertLessEqual(C.JUNK_NAMERULE_MAX_BYTES, 64 * 1024 * 1024)
+        self.assertTrue(C.JUNK_NAMERULE_MEDIA_EXTS)
+        for ext in (".mp4", ".mkv", ".mov", ".mp3", ".flac"):
+            self.assertIn(ext, C.JUNK_NAMERULE_MEDIA_EXTS)
+
+    def test_strong_hash_evidence_still_hits_media(self):
+        """hash 是「看内容认人」的强判据，不受 §G 闸门限制。"""
+        with tempfile.TemporaryDirectory() as d:
+            lib = os.path.join(d, "lib.txt")
+            f = self._mkfile(d, "老王论坛3184065655 (1).mp4", b"ad bytes")
+            digest = J.content_hash(f)
+            self.assertTrue(digest)
+            J.record("hash", digest, path=lib)
+            hit = J.lookup(f, digest=digest, path=lib)
+            self.assertIsNotNone(hit)
+            self.assertEqual(hit["kind"], "hash")
+
+    def test_small_non_media_still_hits(self):
+        """闸门不能把正常清广告的能力一起关掉。"""
+        with tempfile.TemporaryDirectory() as d:
+            lib = os.path.join(d, "lib.txt")
+            J.record("namepart", "最新地址", path=lib)
+            f = self._mkfile(d, "xxx最新地址yyy.txt")
+            self.assertIsNotNone(J.lookup_file(f, path=lib))
+
+    def test_gate_helper_media_and_size(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.assertFalse(J.name_rule_applies(
+                os.path.join(d, "a.mp4"), size=10))
+            self.assertFalse(J.name_rule_applies(
+                os.path.join(d, "a.txt"), size=C.JUNK_NAMERULE_MAX_BYTES))
+            self.assertTrue(J.name_rule_applies(
+                os.path.join(d, "a.txt"), size=10))
+            # size 未知 → 退回 getsize；小文件仍适用
+            small = self._mkfile(d, "small.txt")
+            self.assertTrue(J.name_rule_applies(small))
+            # 文件不存在 → fail-safe「不适用」
+            self.assertFalse(J.name_rule_applies(os.path.join(d, "nope.mp4")))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -82,7 +82,7 @@ class PreflightGateAndRcTests(unittest.TestCase):
         with mock.patch.object(pipeline, "_preflight_learned_libs",
                                return_value=["bad"]), \
                 mock.patch.object(pipeline, "build_config",
-                                  return_value=None), \
+                                  return_value=mock.MagicMock()), \
                 mock.patch.object(pipeline, "Pipeline", _DummyPipeline):
             rc = pipeline.cmd_run(_args())
         self.assertEqual(rc, 2, "broken lib must abort cmd_run with rc=2")

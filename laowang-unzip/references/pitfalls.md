@@ -288,11 +288,11 @@ carve 对 SFX 是纯多余步骤且会把数据切坏（首部签名偏移未必
 关联：LES-20260911-04；#41（PowerShell 复核幻影）；pitfalls 沙箱视图。
 
 
-**#46. 自学习密码库（learned）是 TAB 4 列格式，别当"逐行密码"读（v3.6.0）**
-`assets/passwords.learned.txt` 的数据行是 `<count>\t<pw>\t<last_date>\t<sources>`；
+**#46. 自学习密码库（learned）是 TAB 4 列格式，别当"逐行密码"读（v3.6.0；v3.8.0 起迁至主库）**
+`<root>/.pipeline/passwords.master.txt`（v3.8.0 起的主库；此前为 `assets/passwords.learned.txt`）的数据行是 `<count>\t<pw>\t<last_date>\t<sources>`；
 任何按"一行一个密码"的朴素读法都会把整行（含次数/日期/来源）当成密码候选——试解必全灭。
-正确做法：`passwords._load_file_into` 对 `label=="learned"` 走 `pwstats.parse_learned`；
-`describe_sources` 的 `learned` 层必须这样读，其余层才按行读。
+正确做法：`passwords._load_file_into` 对 `label ∈ {"learned", "master"}` 走 `pwstats.parse_learned`；
+`describe_sources` 的 `learned`/`master` 层必须这样读，其余层才按行读。
 关联：pwstats.py / passwords.py `_load_file_into`；SKILL.md §5.1。
 
 **#47. 库内排序 ≠ 来源排序：改候选来源顺序会让流行密码"盖过"文件名显式密码（v3.6.0）**
@@ -474,3 +474,324 @@ check2 / check3 / check6 兜住，**登记为 P2 待加固**（刻意不加 `if 
 指向外部的目录软链接（junction），守卫可被绕过。已核对：原始 `delete_allowed` 与 2026-09-15 基线
 **逐字节一致**，从未被削弱；利用它需要先在磁盘建软链接 + 伪造 `batches.root_dir`。加固路径解析
 需单独评估风险面，本版登记不改。
+
+## J. v3.8.0 密码库（5 字段 `added_date`）
+
+**#57. 「4 字段行 + 尾随 TAB」会被误判成 5 字段，且 `verify()` 放行**
+`_parse_data_line` 与 `verify()` 都用 `split("\t")` 后的**裸元素个数**判 4/5 字段。但
+**合法的「5 字段 + sources 为空」行本身就以 TAB 结尾**（`Entry.line()` 的 5 字段渲染
+就是 `count\tpw\tadded\tlast\t`）。于是「尾随 TAB」既是合法 5 字段的标记，又是 4 字段行被
+污染后的样子——**两者无法用字段数区分**。
+
+实测（v3.8.0 阶段 3 复验）：
+- `1\tpw\t2026-01-01\tSRC\t` → `verify()` 返回 `(True, [])`（**放行**）；解析成
+  `added_date='2026-01-01'`、`last_date='SRC'` → **「最后成功日期」被静默降级成来源标签**。
+
+两条看起来显然的修法**都不成立，别试**：
+- **剥掉尾部空列** → 会把**合法**的 `count\tpw\tD1\tD2\t`（5 字段空来源）反判成 4 字段，
+  把 `added` 当 `last` 用 —— **比原问题更危险**。
+- **用「日期形状」消歧** → 来源标签本身可能是日期串（`sources` 无格式约束），不可判定。
+
+**生产可达性：不可达。** `Entry.line()` 只产出规范 4/5 字段；真实主库（28 行）全 4 字段、
+无尾 TAB；文件头部标注「机器维护勿手改」。仅**手工编辑**可触发。
+
+**后果：不丢数据**（round-trip 逐字节稳定、不损他行、不扩散），仅该行语义错位。
+
+**防线（Phase 4）**：衰减判据必须 **fail-soft** —— `last_date` 非 ISO 日期（如 `SRC`）或为空
+→ 视为**无证据 → 不衰减**。（`RECENT` 侧已天然安全：`_recent_added` 用
+`date.fromisoformat` + `except ValueError: continue`。）
+
+**为什么不加 `verify()` 硬闸**：那会把「手工损坏」升级为**整批拒跑**，而本项目已被
+「闸门误停」烧过多次（空间闸门连续误停 ×7）。此项既不可达又不丢数据，**不配获得阻断权**。
+登记为已知限制，改动需单独评估。
+
+**#58. `verify()` 不校验 `added_date ≤ last_date`**
+写入侧已由 `record_success` 的**单调守卫**钉死（`added_date` 只在首次入库写一次，`last_date`
+此后只增不减，见 `pwstats.py:372-376`）；读取侧无校验。实测
+`1\tpw\t2026-09-01\t2026-05-05\tA` → `verify()` 返回 `(True, [])`。
+
+**防线（Phase 4）**：两日期皆非空且 `added > last` → 视为可疑行 → **不衰减 + 非阻断告警**。
+同样**不做** `verify()` 硬闸，理由同上（#57 末段）。
+
+**通用教训**：**合法性判据不能只看列数**。当某个特征既是「合法格式的标记」又是「污染后的样子」
+时（此处的尾随 TAB），列数就失去了判真伪的能力——此时要么找语义判据（且要确认该判据无歧义），
+要么承认不可判、把防线放在**消费端**（fail-soft）而不是**闸门端**（fail-loud）。
+
+**#59. 注释里的「安全承诺」不是证据（三司会审 sansi-20260920-001 实测）**
+
+`_reconcile_disk_db` 的 docstring 与 `_delete_one` 的注释都白纸黑字写着「dry-run 下是 no-op」，
+而代码在 `dry_run=True` 时**真的删了文件**（4500 字节，`mode=RECYCLE`）。同一个文件里 11 处删除点
+都判了 `cfg.dry_run`，唯独这个**唯一的物理删除原语**没有 —— 正确性不该依赖每个调用点自觉。
+
+**为什么危险**：承诺越具体，越容易被当成事实采信。破妄司正是信了这句注释，才给出「先干跑预检」
+的建议（而这个建议在当时是**致命**的）。更坏的是这类注释会让**评审和测试一起被骗过去**：
+评审看注释签字，测试测的是判据层而非「谁在什么条件下调删除原语」。
+
+**防线（v3.8.2）**：
+
+1. 凡 `no-op` / `never` / `已保证` / `不会删除` 类的声明性表述，注释只算**主张**不算证据，必须回代码实证；
+2. 安全闸门放在**原语**上（`_delete_one` 开头判 `dry_run`），而不是散在每个调用点；
+3. 项目早有正确范式可抄：`fsutil.prune_empty_dirs` 有**真干跑**且带预览清单
+   （注释明写 "would-be removals are listed"）——说明团队**会造**真干跑，只是没给删除造。
+
+**通用教训**：**越是关于安全的声明，越要用代码证明，而不是用注释声明。**
+
+**#60. 区分「真实 DB 行」与「合成字典行」的判据只有 `id is None`（N2 死代码教训）**
+
+`_resolve_delete_path` / `_delete_one` 会收到两类行：① 真实 sqlite 行（自带整数 `id`、完整字段）；
+② **磁盘真相扫描**造出来的**合成字典行**（如 §fix(b) 分卷次卷，只有 `path/file_name/size_bytes` 几个键，
+`id=None`）。需要「这是不是合成行」时，**唯一可靠判据是 `id is None`**，不是 `size_bytes`、
+不是 `dir_path` 缺失、也不是 `hash` 缺失。
+
+**翻车现场**：N2 的 step0 豁免最初写成 `if _rowget(row, "size_bytes") is None: return stored`——
+**永不触发**，因为 `files.size_bytes` 是 `NOT NULL DEFAULT 0`，唯一的合成行也显式给了 `0`。
+→ 这段豁免是**死代码**：零覆盖、零收益，还让人误以为「合成行已被豁免」。
+
+**正确写法**：`if _rowget(row, "id") is None: return stored`。`sqlite3.Row` 与 dict 都支持
+`_rowget` 安全取值；真实行的 `id` 是整数永不为 None，合成行 `id=None` 才会进分支。
+
+**连带教训（F3 高危）**：身份闸（`_resolve_candidate_ok`）只护住了 `_maybe_delete_source` 一条路由；
+**凡直接调 `_delete_one` 的路径**（HOLD_SOURCE、分卷次卷、合成行）此前**零保护**——
+`_resolve_delete_path` 返回 None 时 `real` 仍回退到传入的 `path`，把被异文件重占的路径照删不误。
+**修复落点必须是删除原语本身**（`_delete_one` 内 fail-closed：真实行解析不出身份且路径仍盘上存在 → 拒绝），
+而不是再给每个调用点补闸。
+
+**通用教训**：**「合成行 vs 真实行」的判别哨要落在真正互斥的字段上；凡依赖 `NOT NULL DEFAULT` 列做
+「缺失」判断的，都是把默认值当成了哨兵，必成死代码。**
+
+**#61. 不可达的死分支本身就是变异测试的漏洞（M-F3d 实证）**
+
+`_delete_one` 里那段 `elif synthesised: pass` 在 step0 的 N2 豁免（`id is None` → 直接返回路径）生效后
+**永远走不到**——合成行只要盘上且在源根内，step0 已返回其路径，`_delete_one` 走的是 `if resolved is not None`
+分支。第三轮变异测试里「删掉这个 elif」**存活（633/638 仍全绿）**：改坏它全量无感知。
+
+**教训**：变异测试杀不动的「存活变异」要分两类——（a）真缺口（用例没钉住），（b）**死代码**（删了也不影响行为）。
+（b）类不该靠加用例去「盖住」，而该**直接删掉死代码**（见 #59/#60「不留死代码」）。删完后该变异无可作用对象，
+漏洞自然消失。判别法：把分支删掉后若所有测试仍全绿且行为不变，它就是死代码，删。
+
+**通用教训**：**变异测试发现的「存活」先问「这是真缺口还是死代码」，死代码一律删，别用测试去供奉它。**
+
+**#62. 假 WRONG_PASSWORD 的**新形态**：加密分卷**缺卷**时 7z 同吐 `Missing volume` 与 `Wrong password?`（v3.9.0 U1）**
+
+7z 对「加密 + 分卷 + **缺卷**」会**同时**打印两行：
+```
+ERROR: Missing volume : <name>
+Data Error in encrypted file. Wrong password? : <name>
+```
+旧判序先命中 `Wrong password`（`sz.py::classify_extract_fail` 里 `Wrong password` 判据位于 `Missing volume` 之前）
+→ 整组被判 `WRONG_PASSWORD` = **假密码问题**：无论试多少密码都解不开（缺的是**卷**，不是密码）。
+铁律：**收到含 `Missing volume` 的失败，先判缺卷，绝不先判密码**；`Missing volume` 是**无歧义**证据，
+必须提在 `encrypted archive` / `Wrong password` 之前（v3.9.0 U1 已修，见 #63）。
+（与 #34「媒体后缀伪装成员」、#38「加密无密码判 ARCHIVE_CORRUPT」同族——本条是**加密 + 缺卷**的第三种形态。）
+关联：U1；LES-20260921-03；`tests/test_classify_volume_missing.py`（真 stderr 回放 fixture，非手拼字符串）。
+
+**#63. 失败归类的**判序**：`Missing volume` 必须早于加密/密码分支（v3.9.0 U1）**
+
+`sz.py::classify_extract_fail` 的判序决定一切：
+```
+if res.killed: ...
+if "Missing volume" in text: return FAIL_VOLUME_MISSING   # ← v3.9.0 上移到此处
+if "encrypted archive" in text.lower(): return FAIL_ENCRYPTED_HEADER
+if "Wrong password" in text: return FAIL_WRONG_PASSWORD
+...
+if "Cannot find" in text: return FAIL_VOLUME_MISSING      # ← 宽网，留原位（do NOT move）
+```
+教训：**多信号同现取更具体者**（缺卷 ⊃ 密码错）；宽的 `Cannot find` 网**不得**一并上提（会吞掉不该吞的）。
+**改判序必须同批改触发集**，否则把"误判但会改名"退化成"正确判缺卷但永久 FAILED"（见 #65 / U1零）。
+兼容性：`config.INTERNAL_FAIL_REASONS` 与 `config.PASSWORD_FAIL_REASONS` **均不含** `FAIL_VOLUME_MISSING`
+→ 不进 pass1 重放、不走 pass2。
+关联：U1；LES-20260921-03；`tests/test_classify_volume_missing.py`。
+
+**#64. `analyze` 对 SFX 保留**外壳**类型：判据只能用 `sig_offset>0`，不能用 `real_type`（v3.9.0 U2-b）**
+
+真 SFX（444 416 字节 MZ 外壳 + 内嵌 RAR）实测 `analyze` 得
+`real_type=EXE / is_archive=False / sig_offset=2048`（首卷 150 MB 级时 `sig_offset` 为壳长）。
+即 **`real_type` 记的是外壳（容器）类型，不是内嵌档案类型**。所以：
+- ❌ 不要据 `real_type ∈ {RAR,RAR5,ZIP,7Z}` 判"是不是卷组成员"（SFX 会落 `EXE`，必漏）；
+- ✅ 判据用 **`sig_offset>0`（是否内嵌档案）** + 词干命中 `<base>.part<N>` + 同目录有同组兄弟
+  （v3.9.0 `header._detect_embedded_volume` → `HeaderInfo.embedded_volume`）。
+- 注意 `CARVE_MIN_PAYLOAD_BYTES = 16 KiB`（`config.py`）：内嵌档案起点后负载须 ≥16 KiB 才置 `sig_offset`
+  （实测边界：16383 不识别 / 16384 识别）→ **测试 fixture 必须显式绑该常量**，否则静态变红。
+- **不得把 DB 的 `real_type` 当真相**：曾据一条陈旧 DB 行判「`real_type` 是 RAR」并据此设计修法 → 被实测推翻。
+关联：U2-b/U2-c.1；LES-20260921-04；#37（SFX 本体直解）。
+
+**#65. "改名逻辑写好却**无触发点**" = 最危险的伪完成（v3.9.0 U2-c）**
+
+全码改名触发点仅三处；而 SFX 首卷 `is_archive=False` → **三处皆不命中** → `_handle_repair_or_skip`
+的"非归档早退"直接 `return` → 归一识别结果**无处消费**。函数写好了、单测也过了，对本案却**零作用**——
+因为它**看起来已经做完**。
+判据（SKILL.md §0.2 硬约束 4）：**每一处改动必须挂到"会被自动触发"的路径上**；凡"写了不会被调用"
+的一律视为**未完成**。v3.9.0 补四处触发点（`embedded_volume` 字段 + 门控放宽 + 触发集扩展 + 首卷整组归名）。
+⚠️ 测试**必须走非归档路径**（用 `partN.mp4`（`is_archive=True`）会绿却漏覆盖本案）；
+E2E fixture 必须**真造 MZ 外壳**，不可只把 `.rar` 改名成 `.exe`（否则 `is_archive` 仍为 1，测试假绿）。
+关联：U2-c；LES-20260921-02；`tests/test_volume_rename_v390.py`。
+
+**#66. 级联清理的**血缘边界**：只按 `parent_id`，严禁按"名字含 `_ext`"泛删（v3.9.0 U4-a）**
+
+删机器产物时须连带删 ① 该产物**自己的 `_ext` 输出目录**（含非空残留须 `rmdir`）与 ② 其 **EXTRACTED 子孙**，
+且**严格按 `parent_id` 血缘**。**没有**"名字含 `_ext`"的规则——因为合法无扩展名包的解出内容**就在 `_ext` 里**
+（无扩展名派生的输出目录机制）。
+边界（**fail-closed，故意如此**）：机器产物行**缺 FULL 摘要** → F1 闸拒 → `_collect_deletable_tree` 返回 None
+→ **整删中止、源也保留**。所有删除仍走 `_delete_one`（F1 闸 / check#11 / check#12 仍生效）。
+关联：U4-a/U4-b；`config.ACTION_RMDIR`；`pipeline_lib/consistency.py`。
+
+**#67. dry-run 闸的**不对称**：闸必须下沉到**原语**，不能散在每个调用点（v3.9.0 U2-e）**
+
+三处改名原语（`_normalize_volume_siblings` / `_rename_volume_member` / `_rename_sibling_row`）**均无**
+`cfg.dry_run` 闸，而 analyze 阶段改名**有** → 干跑会真的落盘改名。同一文件**另有一组**改名调用点**已有**闸
+→ 证明"逐点补闸"必然漏。
+铁律（沿用 #59）：**安全闸门放在原语上**（`_delete_one` 前例；既有注释
+"the gate belongs on the PRIMITIVE, not in each call site"）；v3.9.0 把 dry-run 闸下沉到三个改名原语。
+关联：U2-e；#59；LES-20260915-01。
+
+**#68. 空路径被解析成**进程 CWD**：`isdir("")==True` → 删除判定**扫错对象**（v3.9.0 U0-a）**
+
+`fsutil.isdir("")` 返回 True、`list_top_level("")` **列出当前工作目录**、`scan_output("")` 统计的是 CWD
+（本机 `non_archive=117, zero_byte=2`）。于是 `extract_output_dir` 为 NULL 的行做 cascade 删除时，
+check#4 扫的是 **CWD**：只要 CWD 里恰有 ≥1 个零字节文件，该行**永久删不掉**（fail-closed 过度拒绝），
+且**结果依赖进程启动目录 = 非确定性**。
+修法（根因）：空/None 路径 → `isdir` 恒 False、`list_top_level` 返回 `[]`（**绝不回落 CWD**）、
+`scan_output` 返回全零 stat；调用方补 `if out_dir:` 防御。**闸门语义不变**（真实 out_dir 的零字节残留仍拒绝）。
+衍生：**环境洁净度是本项目的正确性因素**（`scripts/` 里 2 个零字节调试文件正是 6 连红的直接成因）。
+关联：U0-a；LES-20260921-05；`实查记录-20260921.md` §G。
+
+**#69. 默认 `status='DISCOVERED'` ∈ `OPEN_STATES`：登记盘面文件 = 静默把它推进处理/删除路径（v3.9.0 U4-c）**
+
+`consistency-check` 的 class-(b)（盘上有文件、DB 无行）**默认只报不登记**；登记必须显式 `--register`
+（且需 `--apply`）。原因：新行默认 `status='DISCOVERED'`，它**在 `OPEN_STATES` 里** → `_resweep()` 会把它当
+**源包**入队，随后被去重（`DUPLICATE_PENDING`）、垃圾规则（`JUNK_PENDING`，**可删**）或"解压后再删"路径捕获。
+真实批次里这些"未登记文件"恰恰是**用户自己的成品** → 静默登记会把用户文件推进**删除路径**。
+铁律：**任何"自动补登记盘面文件"的功能默认必须关闭**；且"登记"若把行置于 `OPEN_STATES`，则登记 = **隐式入队**，
+其后果必须在输出里**不可错过**地警示。
+关联：U4-c；`config.OPEN_STATES`；`tests/test_cleanup_closure.py`。
+
+**#70. 无版本控制下「从兄弟 `.bak` 还原再回写生产文件」= 隐式回滚（v3.9.0 U0-d）**
+
+本目录**非 git 仓库**（`fatal: not a git repository`）→ 没有 `git revert` 这条退路。于是把「同目录隐式
+`<file>.bak`」当 pristine 基线，等于让**一次工具运行静默回退真实的安全修复**——更坏的是回退后测试
+**仍可能"全绿"**（被抹掉的是安全闸，恰好没人测「闸在不在」），错误**不可观测**。
+
+**事实**：3 个脚本（`run_mutation.py` / `mutate_tmp.py` / `diag_cascade.py`）都写着 `BAK = SCHED + ".bak"`，
+流程是「读 `.bak`(pristine) → 施加变异 → 跑测试 → 用 `.bak` 覆盖回 `scheduler.py`」。而那份 `.bak` 是
+**3024 行**，比现役 `scheduler.py`（**3562 行**）**少 538 行**——缺 v3.8.3 的 F1-intent 安全闸与 U0-a 修复。
+
+**这不是"一个坏文件"，是一类**：收尾排查在 skill **树根**又发现同型快照
+（`.lead-gapfix-backup/scheduler.py.bak`：同样 3024 行 / 少 538 行 / **零引用**）。故判据必须按**模式**写，
+不能按文件写——凡树内出现 `<name>.py.bak` 与 `<name>.py` **并存**，一律视为可疑并处置（**移出树**，
+不要就地留着）。
+
+**铁律**：
+
+1. **禁止**任何脚本用「同目录隐式 `<file>.bak` 还原再回写生产文件」（变异 / 诊断 / 回滚脚本一律适用）；
+2. 变异 / 基线类工具的正确形态：pristine **取运行时现役文件** → 变异施加在**整棵树的显式副本**
+   （`tempfile.mkdtemp()` 工作区，且整树复制才能保证 `SKILL_ROOT` 相对读写的文件也不外泄）→ 产物写
+   **树外** OUT_DIR（默认临时目录；**显式拒绝**落在树内的路径）→ 跑完用哈希自证**现役文件逐字节未变**；
+3. **锚点缺失 = 硬错**（非零退出 + 指名缺失锚点），不得静默"零改动也算通过"——一个不修改任何东西却
+   报「测试通过」的变异驱动，比没有变异驱动**更糟**；
+4. **环境洁净度是正确性因素**（同 #68 衍生条）：树根残留 41 项（15 个调试产物：`res_*.txt` ×7、
+   `fault.txt`(0 B)、`dbg.txt`、`diag*.txt`、`find_tests.txt`、`full_err.txt`、`restore_chk.txt`、
+   `validate_p0.txt`；`.qa-backup/` 20 文件；`.lead-gapfix-backup/` 6 文件）已移出 →
+   `backups/laowang-unzip-rootlitter-20260921-201740/`（**移动非删除**，可回退）；`.gitignore` 补
+   `.qa-backup/` / `.lead-gapfix-backup/` / `res_*.txt` / `fault.txt` 四条——此前只挡了
+   `scripts/.qa-backup-*/`，树根两个快照目录会被**一起提交**。
+
+**关联**：U0-d；LES-20260921-06（本条目落地 → resolved）；`scripts/run_mutation.py`；SKILL.md §3.2 硬约束③。
+
+**#71. 黑名单式排除不可能穷尽：判据的输出域含「未知」时必然漏网（v3.9.1 D1）**
+
+判据 `probe_magic_only` 的**输出域含一个 `UNKNOWN`**（MKV / AVI / 无头文件 / 任何未登记格式都返回它）。
+D1 第一轮用**黑名单**修（`NON_ARCHIVE_CONTAINER_TYPES = {MP4, MOV, M4V, WEBP, PNG, JPEG, PDF, TXT}`），把"已知坏值"排掉——
+可 `UNKNOWN` 不在名单里，于是 MKV / AVI / 无头真媒体**照样**通过 `_has_embedded_archive`（前 8 MiB 找**任意**归档签名）
+→ 仍被规划改名成 `.rar`。30 格穷举矩阵把黑名单版打出 **4 格漏网**：**同一事故形态，换了个容器**。
+结构性原因：只要输出域里存在一个开放式取值（`UNKNOWN` / 其它 / `None`），"排除已知坏值"就**永远**列不完——补一条、漏一条。
+
+旁证（**名单与实现脱节**的信号）：黑名单里 3 条（MOV / M4V / WEBP）是**死条目**——`_match_magic` 对任何
+`ftyp`@4 一律返回 `MP4`，根本没有这三个签名。名单是**照文档抄的**，不是照代码写的——"以文档为真相"再犯一次。
+
+**铁律**：
+
+1. 判据的**输出域包含"未知 / 其它 / None"**时，排除式（黑名单）在**结构上**不可能闭合 → **必须写成白名单**
+   （只放行已由实测确证的**好值**，其余**默认拒绝**，fail-closed）；
+2. 白名单每一项都须**对得上实现**（`_match_magic` 真会产出它），不得照文档凭空臆造——出现**死条目**
+   即视为"名单与实现脱节"的告警；
+3. 判据类修复的**验收 = 穷举输出域**（全枚举 + 未登记样本），不是"手头几个样本通过"。
+
+**关联**：pitfalls #34（假 WRONG_PASSWORD）/ #35（签名噪声）；D1 / D13；`header._is_renameable_volume_member`；
+`F:\BaiduNetdiskDownload\pipeline\upgrade-20260921\verify_v391_d1b.py`（30 格矩阵）；LES-20260921-07。
+
+**#72. 同一文件内两条路径对同一问题给出相反判据：整组改名 vs 单文件改名（v3.9.1 D13）**
+
+`header.py` 里同一个判据概念有**两份手写副本**：
+
+- `volume_member_rename`（**单文件**，~:226）——注释白纸黑字写明「`.partN.rar` 是 7z 唯一认识的 part-N 形式；
+  zip/7z 的 partN 成员**没有**规范多卷名（zip 用 `.zip`/`.z01`，7z 用 `.7z.NNN`）——**无可归一**」，
+  故**只对 `real_type ∈ (RAR, RAR5)`** 产出 part-N 目标；
+- `volume_set_rename_plan`（**整组**）——**无条件**把任何归档头成员改成 `%s.partN.rar`。
+
+两路对"`movie.part1.7z` 该不该改成 `.part1.rar`"给出**相反**答案：单文件说"不"，整组说"改"。危害：真 ZIP / 7Z /
+GZ / TAR 内容命名为 `.part1.mp4` → 整组路径改成 `.rar`，单文件路径不改；把 `movie.part1.7z` 改成
+`movie.part1.rar` 会**破坏 7z 原生分卷分组**（改完找不齐分卷）——**修 bug 修出新事故**。
+
+**"同一判据出现第二份手写副本" = 漂移点**：副本一旦存在就会各自演化、迟早相反。发现两路相反时，以
+**注释 / 文档里写明的规则**反推哪条错（本例：注释对、整组路径错），根治办法是让整组路径**复用**单文件判据
+（白名单收口后两路一致），并**加用例显式断言"两路一致"**，把漂移钉死在测试里。
+
+**铁律**：
+
+1. 同一判据概念**只许有一处真相源**；出现第二份手写副本即**漂移点**，须合并或加一致性护栏；
+2. 两路判据**相反**时，先据**注释 / 文档**判定哪条是错的再改（别改对的）；
+3. 判据合并后**必须**补一条"两路一致"的回归断言。
+
+**关联**：pitfalls #34；D13；`header.volume_member_rename` / `header.volume_set_rename_plan`；
+`F:\BaiduNetdiskDownload\pipeline\upgrade-20260921\probe_d13_two_paths.py`；`test_volume_rename_v390.py`（T9/T10）。
+
+
+
+**#73. `namepart` 弱判据 + 自动删 = 静默删真数据（v3.9.2 P0 事故，43 个 mp4 / 38.23 GB）**
+
+垃圾自学习库里的一条**手工**条目 `namepart  老王论坛`（2026-09-18 入册，原意是清理论坛广告 `txt` / `apk`），
+把文件名带「老王论坛」前缀的 **43 个真视频 mp4（合计 38.23 GB）静默删除**，波及
+`2026-09-20` 的 **5 个子批 / 8 个组**（`b2` / `b3` / `b6` / `b7` / `b8`）。
+`namepart` 只是「**按名字猜**」——不读内容，对"同名真文件"毫无分辨能力；它却被直接接上
+`junk.is_auto_rule()` 的「**发现即删**」全自动链路（`LIBRARY:*` 命中一律视为零风险），
+删完还连源分卷与父压缩包一起删，**不可逆**（DB 比对：被删 43 个中**有同名同大小副本残留的为 0 个**）。
+
+**为什么没人发现**：`extract_rc=0`、DB 记 `DELETED`、事件链**一路 INFO**，三层记账**全部"成功"**——
+每一层只验证"自己这一步做完了"，**没有任何一层验证"做完了之后盘上还剩什么"**。
+是**盘上校验**才把空洞暴露出来的。
+
+**损失为何被放大（二次根因）**：发现误删后第一次 kill **没杀干净**（只杀了主 PID，
+**另一个实例继续跑到 00:52**），误以为已停手就去改代码，结果**又多删了 34 个**（9 → 43）。
+**改代码对已在跑的进程无效**——Python 早把旧模块加载进内存了。
+数据事故里，"**停下来**"和"**修好**"是两个独立动作，必须先确认前者真的生效。
+
+**结构性原因**：三类判据强度悬殊——`hash`（**内容指纹**，改多少遍名字都认得出＝强）、
+`name`（完整文件名＝弱）、`namepart`（名称片段＝最弱）。而危险度一侧**没有**「判据强度 → 允许的危险动作」
+对照表，`is_auto_rule()` 用**一个布尔值**把三类判据**压平**成同一档危险度。
+**弱判据（猜）× 不可逆自动删（最高危险度）= 错配。**
+
+**误差伤只限于 mp4**：其余被 junk 规则删的都是 KB 级广告文件（`txt` / `url` / `zip` / `exe` / 0 字节），无价值。
+
+**修复（v3.9.2）**：不动强判据，只给弱判据装闸门——`junklib.name_rule_applies(path, size)`：
+媒体扩展名（`JUNK_NAMERULE_MEDIA_EXTS`，30 个）→ **不适用**；≥ `JUNK_NAMERULE_MAX_BYTES`（8 MiB）→ **不适用**；
+否则适用；**绝不抛异常**。`lookup()` 的 `name` / `namepart` 分支**前置**该闸门，`hash` 分支**不受限**。
+叠加既有 `JUNK_HASH_MAX_BYTES = 1 MiB` 后得**硬性质**：**≥ 8 MiB 的文件不可能被自动判为垃圾**，
+要删只能走人工确认。
+
+**铁律**：
+
+1. **判据强度必须与危险度匹配**——「按名字猜」的弱判据（`name` / `namepart`）**不得**接全自动删除，
+   只能提示 / 走人工确认；只有「看内容认」的强判据（`hash`）才可以自动删；
+2. 凡**不可逆动作**（删源分卷 / 删父包）上游的判据，**必须写明其强度档位**，
+   禁止用「命中即零风险」这种压平式布尔判据；
+3. **记账全绿 ≠ 盘上没事**：`extract_rc=0` + `DELETED` + 全 INFO 可以和数据丢失**同时成立**。
+   删除类动作**必须**配盘上校验（声明数 vs 盘上实存数），否则事故只能靠运气发现；
+4. **数据事故先止损、再修代码**：kill 后必须**验证进程真的归零**（进程数 / 盘上文件数不再变化），
+   **改代码不构成止损**——已在跑的进程用的是内存里的旧模块；
+5. 判据函数的**失败模式必须是"不适用"（fail-closed），且绝不抛异常**——抛异常会让上层走未定义分支。
+
+**关联**：LES-20260922-01；`junklib.name_rule_applies` / `junklib.lookup` / `junk.is_auto_rule`；
+`config.JUNK_NAMERULE_MEDIA_EXTS` / `JUNK_NAMERULE_MAX_BYTES` / `JUNK_HASH_MAX_BYTES`；
+`tests/test_junklib.py::WeakRuleScopeTests`（含 `test_accident_regression_namepart_never_hits_video`）；
+`junklib.py` docstring §G（与 §E 密码载体永久豁免并列）；
+事故报告 `F:\BaiduNetdiskDownload\pipeline\reports\09-22-P0-垃圾库误删视频-事故报告.md`；pitfalls #71（判据输出域穷举）。

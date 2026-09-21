@@ -36,6 +36,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from pipeline_lib import config as C
+from pipeline_lib import hasher
 from pipeline_lib.scheduler import Pipeline, PipelineConfig
 from pipeline_lib.db import Database
 
@@ -71,6 +72,17 @@ class VolumeSecondaryDeleteTests(unittest.TestCase):
         pipe.cfg = self.cfg
         return pipe
 
+    def _stamp_digest(self, fid, path):
+        """Give a real DB row the genuine whole-file MD5 of its on-disk file.
+
+        v3.8.3 F1: every real, non-empty row the deletion path removes needs a
+        FULL digest (size alone is not proof of identity).  It must be the hash
+        of the actual bytes — ``_resolve_candidate_ok`` re-reads the file and
+        compares it during stale-path / group-member resolution.
+        """
+        self.db.update_fields(fid, hash=hasher.compute_md5(path),
+                              hash_mode=C.HASH_MODE)
+
     def _seed_first_volume(self, rel="demo.7z.001", group="demo.7z"):
         """Seed the FIRST volume row as an extracted, grouped volume member."""
         p = self._put(rel)
@@ -78,6 +90,7 @@ class VolumeSecondaryDeleteTests(unittest.TestCase):
         self.db.update_fields(
             fid, is_archive=1, extract_rc=0, status=C.STATUS_EXTRACTED,
             volume_group=group, volume_role="FIRST")
+        self._stamp_digest(fid, p)
         return fid, p
 
     def _seed_leaf(self, parent_id, rel, content=b"real content" * 100):
@@ -97,6 +110,7 @@ class VolumeSecondaryDeleteTests(unittest.TestCase):
         self.db.update_fields(
             cid, is_archive=1, volume_group=group, volume_role="CONTINUE",
             status=C.STATUS_SKIPPED)
+        self._stamp_digest(cid, p)
         return cid, p
 
     # ==================================================================

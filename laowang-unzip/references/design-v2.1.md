@@ -396,6 +396,8 @@ MTIME_FRESH_SEC      = 60           # mtime 距今小于此值视为「可能还
 
 #### 2.8.1 状态枚举（14 个，完整清单）
 
+> **v3.8.0 变更（本节为 v2.1 历史口径）**：新增**链外非终态** `PASSWORD_DEFERRED`（pass1 全灭但库还有 pass2 长尾时挂起；批次收尾 sweep 统一跑 pass2；**绝不删源包**），状态总数 15。密码候选改为**两遍试密**（`passwords.candidates_for()` → `(pass1, pass2)`），运行期密码库归一为**每处理根主库** `<root>/.pipeline/passwords.master.txt`。**现行权威口径见 `SKILL.md` §5.1 / §7。**
+
 | 状态 | 含义 | 是否终结态 | 是否可被主循环重新拾起 |
 |---|---|---|---|
 | `DISCOVERED` | 已枚举到、已 upsert 入库，尚未分析文件头 | 否 | ✅ |

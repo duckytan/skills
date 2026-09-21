@@ -21,7 +21,7 @@ Usage (all paths derive from the working ROOT):
     python pipeline.py retry-failed [--root DIR] [--batch B] [run options]
     python pipeline.py report [--root DIR] [--batch B]
     python pipeline.py evolve [--root DIR] [--apply] [--check] [--json]
-    python pipeline.py pw-stats [--root DIR] [--rebuild] [--verify] [--top N] [--json]
+    python pipeline.py pw-stats [--root DIR] [--rebuild] [--verify] [--top N] [--recent-days [N]] [--json]
 
 Root resolution priority (SKILL.md §4.1):
     --root (alias --workdir)  >  $DAE_ROOT  >  config.local.json  >  interactive
@@ -45,7 +45,7 @@ import os
 import re
 import shutil
 import sys
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -54,12 +54,14 @@ SKILL_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 from pipeline_lib import config as C                       # noqa: E402
 from pipeline_lib import audit as audit_mod                # noqa: E402
+from pipeline_lib import consistency as consistency_mod    # noqa: E402
 from pipeline_lib import evolve as evolve_mod              # noqa: E402
 from pipeline_lib import fsutil                            # noqa: E402
 from pipeline_lib import junk as junk_mod                  # noqa: E402
 from pipeline_lib import junklib as junklib_mod            # noqa: E402
 from pipeline_lib import passwords as passwords_mod        # noqa: E402
 from pipeline_lib import pwstats as pwstats_mod            # noqa: E402
+from pipeline_lib import migrate_passwords as migrate_mod  # noqa: E402
 from pipeline_lib import recycle as recycle_mod            # noqa: E402
 from pipeline_lib import scheduler as scheduler_mod        # noqa: E402
 from pipeline_lib import sz as sz_mod                      # noqa: E402
@@ -267,6 +269,25 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--batch", default=None, help="limit to a batch")
     p.set_defaults(func=cmd_status)
 
+    p = sub.add_parser("consistency-check",
+                       help="compare the source tree on disk with the DB "
+                            "(paths + recomputed derived fields); --apply adopts")
+    add_common(p)
+    p.add_argument("--src", default=None,
+                   help="source tree to check. Default: <root>/【new】")
+    p.add_argument("--apply", action="store_true",
+                   help="adopt the recomputed derived fields of existing rows "
+                        "(class c). Does NOT register new rows "
+                        "(default: report only)")
+    p.add_argument("--register", action="store_true",
+                   help="ALSO register on-disk files that have no DB row "
+                        "(class b) as origin=DOWNLOAD source packages — they "
+                        "enter the batch's processing/DELETION scope. Off by "
+                        "default; requires --apply. Use only if these really "
+                        "are pending source packages, NOT your own finished or "
+                        "hand-named files")
+    p.set_defaults(func=cmd_consistency_check)
+
     p = sub.add_parser("resolve-dup", help="decide a DUPLICATE_PENDING file")
     add_common(p)
     p.add_argument("file_id", type=int, help="id of the DUPLICATE_PENDING row")
@@ -399,15 +420,32 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--rebuild", action="store_true",
                    help="reconcile learned counts with the DB's successful "
                         "extractions (counts only ever go UP); writes ONLY "
-                        "assets/passwords.learned.txt — never the DB")
+                        "<root>/.pipeline/passwords.master.txt — never the DB")
     p.add_argument("--verify", action="store_true",
                    help="mechanical self-check of the learned library "
                         "(exit 0 = OK, 1 = problem)")
     p.add_argument("--top", type=int, default=0,
                    help="show only the top N entries (0 = all)")
+    p.add_argument("--recent-days", nargs="?", type=int, const=C.RECENT_DAYS,
+                   default=None,
+                   help="only list passwords whose added_date is within N days "
+                        "(bare flag = config.RECENT_DAYS=%d). Entries with an "
+                        "empty added_date are NEVER counted (§5)." % C.RECENT_DAYS)
     p.add_argument("--json", action="store_true",
                    help="emit a machine-readable JSON blob")
     p.set_defaults(func=cmd_pw_stats)
+
+    # v3.8.0: fold the scattered old password sources into the per-root master.
+    p = sub.add_parser("migrate-passwords",
+                       help="merge old password sources into <root>/.pipeline/"
+                            "passwords.master.txt (v3.8.0; dry-run by default)")
+    add_common(p)
+    p.add_argument("--prune-unused", action="store_true",
+                   help="drop passwords with count==0 and no DB success record "
+                        "(default: keep all, safer)")
+    p.add_argument("--apply", action="store_true",
+                   help="actually write the master library (default: dry-run)")
+    p.set_defaults(func=cmd_migrate_passwords)
     return ap
 
 
@@ -535,39 +573,34 @@ def cmd_audit(args) -> int:
 
 
 def cmd_add_password(args) -> int:
-    """Append a password to the personal library (highest merge priority).
+    """Add a password to the per-root MASTER library (highest merge priority).
 
-    Library file: ``<skill>/assets/passwords.local.txt`` (created on demand,
-    UTF-8, one password per line, deduplicated).  ``--test`` additionally
-    runs ``7z t`` with the new password against every FAILED row whose
-    fail_reason is password-related; a hit requeues the row (audited as
-    PW_HIT_RETRY) so the next run/retry-failed extracts it.
+    Library file: ``<root>/.pipeline/passwords.master.txt`` (created on demand,
+    4-field TAB format shared with the self-learning layer; count starts at 1,
+    source tagged ``ADD_MANUAL``).  ``--test`` additionally runs ``7z t`` with
+    the new password against every FAILED row whose fail_reason is
+    password-related; a hit requeues the row (audited as PW_HIT_RETRY) so the
+    next run/retry-failed extracts it.
     """
     cfg = build_config(args)
-    lib_path = passwords_mod.LOCAL_SKILL_PASSWORDS
+    lib_path = passwords_mod.master_path(cfg.workdir)
+    if not lib_path:
+        print("add-password needs a --root (could not resolve master path).")
+        return 2
     os.makedirs(os.path.dirname(lib_path), exist_ok=True)
-    existing = []
-    if os.path.isfile(lib_path):
-        with open(lib_path, "r", encoding="utf-8-sig", errors="ignore") as fh:
-            existing = [ln.strip() for ln in fh if ln.strip()]
+    # 主库为 TAB 格式（与自学习层同构：4 字段 or v3.8.0 A-enh 5 字段）；
+    # 统一走 record_success：不存在→count=1 新增（来源 ADD_MANUAL，且
+    # added_date=当天），已存在→count+1 合并来源（added_date 保持原值不动）。
+    existing = pwstats_mod.read_counts(lib_path)
     if args.password in existing:
         print("password already in %s — not duplicated." % lib_path)
     else:
-        # one password per line; if the file was hand-edited without a
-        # trailing newline, add one first so lines never merge
-        needs_newline = False
-        if os.path.isfile(lib_path) and os.path.getsize(lib_path) > 0:
-            with open(lib_path, "rb") as fh:
-                fh.seek(-1, os.SEEK_END)
-                needs_newline = fh.read(1) != b"\n"
-        # v3.7.8 (P1-②)：加 newline=""，杜绝 Windows 文本模式把 \n 写成
-        # \r\n（与 v3.7.5 事故同源；虽是 passwords.local.txt 非 learned 库，
-        # 同源坑一并堵）。
-        with open(lib_path, "a", encoding="utf-8", newline="") as fh:
-            if needs_newline:
-                fh.write("\n")
-            fh.write(args.password + "\n")
-        print("added to %s" % lib_path)
+        res = pwstats_mod.record_success(lib_path, args.password, "ADD_MANUAL")
+        if res.get("written"):
+            print("added to %s" % lib_path)
+        else:
+            print("⚠ 写入主库失败：%s" % (res.get("detail") or "unknown"))
+            return 1
     if not args.test:
         print("next: python pipeline.py retry-failed --root %s" % cfg.workdir)
         return 0
@@ -606,6 +639,47 @@ def cmd_add_password(args) -> int:
         return 0
     finally:
         db.close()
+
+
+def cmd_migrate_passwords(args) -> int:
+    """Fold the scattered old password sources into the per-root master (v3.8.0).
+
+    Default is a dry-run: it prints the merge report (counts, pruned list, target
+    path) without touching disk.  ``--apply`` writes ``<root>/.pipeline/
+    passwords.master.txt`` (backing up any existing master first).
+    """
+    root = None
+    try:
+        root, _local = resolve_root(args)
+    except ValueError:
+        root = None
+    if not root:
+        print("migrate-passwords needs --root (cannot resolve a processing root).")
+        return 2
+
+    passwords_file = getattr(args, "passwords", None)
+    prune_unused = getattr(args, "prune_unused", False)
+    apply = getattr(args, "apply", False)
+
+    report = migrate_mod.migrate(root, passwords_file, prune_unused, apply)
+    master = report.get("master")
+    print("migrate-passwords -> %s" % (master or "(unknown path)"))
+    print("  sources scanned: %d" % len(report.get("sources", [])))
+    print("  merged entries : %d" % report.get("total", 0))
+    pruned = report.get("pruned") or []
+    if prune_unused:
+        print("  pruned (unused): %d" % len(pruned))
+        for pw in pruned:
+            print("    - %s" % pw)
+    if apply:
+        if report.get("applied"):
+            print("  APPLIED: master written (backup=%s)" % report.get("backup", "none"))
+        else:
+            print("  NOT written: %s" % report.get("error", "unknown error"))
+            return 1
+    else:
+        print("  (dry-run: nothing written; rerun with --apply to commit)")
+    return 0
 
 
 def cmd_collect(args) -> int:
@@ -751,11 +825,14 @@ def cmd_collect(args) -> int:
         db.close()
 
 
-def _preflight_learned_libs(which: Tuple[str, ...] = ("junk", "pw")) -> List[str]:
-    """v3.7.6 fail-loud 硬闸（v3.7.8 按库参数化）：校验 ``which`` 点名的自学习库。
+def _preflight_learned_libs(which: Tuple[str, ...] = ("junk", "pw"),
+                            root: Optional[str] = None) -> List[str]:
+    """v3.7.6 fail-loud 硬闸（v3.7.8 按库参数化；v3.8.0 密码库定位到 per-root 主库）。
 
-    ``which`` 取 ``"junk"`` / ``"pw"`` 的子集（默认两库都查）。返回非空 list = 有
-    损坏，调用方应中止并提示修复。绝不抛。
+    ``which`` 取 ``"junk"`` / ``"pw"`` 的子集（默认两库都查）。``root`` 用于定位
+    per-root 主密码库 ``<root>/.pipeline/passwords.master.txt``（v3.8.0 起唯一可写
+    密码库）；缺省回退到 skill 级旧文件（迁移尚未跑时的兼容路径）。返回非空 list =
+    有损坏，调用方应中止并提示修复。绝不抛。
     """
     problems: List[str] = []
     if "junk" in which:
@@ -766,33 +843,39 @@ def _preflight_learned_libs(which: Tuple[str, ...] = ("junk", "pw")) -> List[str
         if not ok_j:
             problems.append("[junk.learned.txt] " + ("; ".join(pj) or "结构异常"))
     if "pw" in which:
+        master = passwords_mod.master_path(root)
+        label = os.path.basename(master) if master else "passwords.master.txt"
         try:
-            ok_p, pp = pwstats_mod.verify()
+            ok_p, pp = pwstats_mod.verify(master)
         except Exception as exc:  # noqa: BLE001
-            ok_p, pp = False, ["passwords.learned.txt 自检异常: %r" % exc]
+            ok_p, pp = False, ["%s 自检异常: %r" % (label, exc)]
         if not ok_p:
-            problems.append("[passwords.learned.txt] " + ("; ".join(pp) or "结构异常"))
+            problems.append("[%s] " % label + ("; ".join(pp) or "结构异常"))
     return problems
 
 
-def _preflight_gate_and_rc(which: Tuple[str, ...] = ("junk", "pw")) -> int:
+def _preflight_gate_and_rc(which: Tuple[str, ...] = ("junk", "pw"),
+                           root: Optional[str] = None) -> int:
     """v3.7.6 fail-loud 硬闸（v3.7.7 单入口；v3.7.8 按库参数化）。
 
     返回 ``0``=通过，``2``=中止。只校验 ``which`` 点名的库，修复指引也**只打印相关
     库**那几行。调用方（``cmd_run`` / ``cmd_clean_junk`` / ``cmd_retry_failed`` /
     ``cmd_pw_stats --rebuild`` / ``cmd_junk_stats --forget`` / ``cmd_junk_learn``）
     据此拒跑——避免静默把数据学到坏文件里 / 静默丢数据。
+    ``root``（v3.8.0）用于定位 per-root 主密码库，缺省回退 skill 级旧文件。
     """
-    probs = _preflight_learned_libs(which)
+    probs = _preflight_learned_libs(which, root)
     if not probs:
         return 0
     warn("⚠ 自学习库自检未通过，本次操作中止（fail loud，不静默跑）：")
     for gp in probs:
         warn("   - %s" % gp)
     if "pw" in which:
+        master = passwords_mod.master_path(root)
         warn("⚠ 修复密码库：结构损坏（字段数异常/合并/截断）请手动编辑 "
-             "assets/passwords.learned.txt 删除/拆分坏行，或备份后删除该文件让下次 "
-             "run 重建；`pw-stats --rebuild` 仅按 DB 单调校正 count，不修结构损坏。")
+             "%s 删除/拆分坏行，或备份后删除该文件让下次 "
+             "run 重建；`pw-stats --rebuild` 仅按 DB 单调校正 count，不修结构损坏。"
+             % (master or "<root>/.pipeline/passwords.master.txt"))
     if "junk" in which:
         warn("⚠ 修复垃圾库：junk-stats --verify 仅报告不修复；请手动编辑 "
              "assets/junk.learned.txt 删除坏行，或 junk-learn --dry-run 复核；"
@@ -805,8 +888,8 @@ def cmd_run(args) -> int:
     pipe = Pipeline(cfg)
     # v3.7.7 · fail-loud 硬闸（v3.7.6 抽成单入口 _preflight_gate_and_rc）：跑批前
     # 先校验两个自学习库结构完整，损坏即中止并提示修复，避免静默把数据学到坏文件
-    # 里 / 静默丢数据。
-    rc = _preflight_gate_and_rc()
+    # 里 / 静默丢数据。v3.8.0：密码库已落到 per-root 主库，闸口须按本批 root 定位。
+    rc = _preflight_gate_and_rc(root=cfg.workdir)
     if rc:
         return rc
     summary = pipe.run()
@@ -976,6 +1059,17 @@ def cmd_status(args) -> int:
                 " GROUP BY junk_rule" % ("WHERE batch=?" if args.batch else "WHERE 1=1"),
                 params):
             print("  %-18s %6d" % (r["junk_rule"], r["n"]))
+        # v3.8.0 (§4.3): PASSWORD_DEFERRED is non-terminal — list it separately
+        # from failures so an interrupted pass2 sweep is visible, never miscounted.
+        print("\n== password deferred (pending pass2, not failed) ==")
+        def_rows = db.conn.execute(
+            "SELECT id, path FROM files %s AND status='PASSWORD_DEFERRED'"
+            " ORDER BY id" % ("WHERE batch=?" if args.batch else "WHERE 1=1"),
+            params).fetchall()
+        for r in def_rows:
+            print("  #%d %s" % (r["id"], r["path"]))
+        if not def_rows:
+            print("  (none)")
         print("\n== recent batches ==")
         for r in db.conn.execute(
                 "SELECT batch, started_at, finished_at, status, n_extracted,"
@@ -986,6 +1080,77 @@ def cmd_status(args) -> int:
     finally:
         db.close()
     return 0
+
+
+def cmd_consistency_check(args) -> int:
+    """U4-c: DB<->disk consistency report.
+
+    Flags: ``--apply`` adopts recomputed derived fields (class c);
+    ``--register`` (requires ``--apply``) additionally inserts the class-(b)
+    rows — off by default because an unregistered on-disk file is not
+    necessarily a pending source package.
+
+    Three drift classes are reported separately:
+
+      (a) rows whose ``path``/``file_name`` is no longer on disk (REPORT ONLY —
+          a check must never delete or move files),
+      (b) files on disk with no DB row,
+      (c) rows whose recomputed derived fields (``real_type / is_archive /
+          volume_role / volume_group / normalized_path``) differ from the
+          stored ones — the live-evidence class (a stale ``volume_role`` that
+          an earlier ``analyze`` pinned from the then-current name).
+
+    Always returns 0 (a diagnostic must never fail a caller); drift is printed.
+    """
+    cfg, db = _open_db(args)
+    try:
+        rep = consistency_mod.check_consistency(db, cfg.src_dir,
+                                                apply=args.apply,
+                                                register=args.register)
+        print("consistency-check  root: %s" % cfg.src_dir)
+        _modes = []
+        if args.apply:
+            _modes.append("adopt recomputed derived fields (class c)")
+        if args.register:
+            _modes.append("register unregistered files (class b)")
+        print("  mode: %s" % (" + ".join(_modes) if _modes
+                              else "report only (no DB change)"))
+        # --register is the ONLY path that inserts rows; make its consequence
+        # unmissable (v3.9.0 review): a wrongly registered row is a user file
+        # pulled into the processing/deletion scope.
+        if args.register and not args.apply:
+            print("  !! --register has NO effect without --apply "
+                  "(nothing is inserted) — pass --apply --register together")
+        elif args.register:
+            print("  !! --register: on-disk files with no DB row are inserted as")
+            print("     origin=DOWNLOAD SOURCE packages and WILL enter this batch's")
+            print("     processing/deletion scope. Use ONLY if these are pending")
+            print("     source packages to process — NOT your own finished or")
+            print("     hand-renamed files (they would become collatable for")
+            print("     dedup / junk rules / source deletion).")
+        print("  rows under root: %d" % rep.checked_rows)
+        print("  (a) rows whose file is missing on disk : %d"
+              % len(rep.missing_on_disk))
+        for r in rep.missing_on_disk[:20]:
+            print("      #%d %s" % (r["id"], r["path"]))
+        print("  (b) files on disk with no DB row      : %d"
+              % len(rep.unregistered))
+        for p in rep.unregistered[:20]:
+            print("      %s" % p)
+        print("  (c) rows with stale derived fields    : %d"
+              % len(rep.stale_derived))
+        for r in rep.stale_derived[:20]:
+            print("      #%d %s" % (r["id"], r["path"]))
+            for key, (stored, want) in sorted(r["diffs"].items()):
+                print("          %s: %r -> %r" % (key, stored, want))
+        if rep.is_clean():
+            print("  OK: DB and disk are consistent")
+        elif not args.apply:
+            print("  hint: re-run with --apply to adopt the recomputed values "
+                  "(class c); add --register to also insert the class-(b) rows")
+        return 0
+    finally:
+        db.close()
 
 
 def cmd_resolve_dup(args) -> int:
@@ -1039,7 +1204,8 @@ def cmd_clean_junk(args) -> int:
     learned = 0
     # v3.7.7 · fail-loud 硬闸（单入口）：清垃圾也会写 junk.learned.txt
     # （learn_this），库损坏则中止并提示修复，避免静默把脏数据学到坏文件里。
-    rc = _preflight_gate_and_rc()
+    # v3.8.0：连带密码库也按本批 root 定位主库。
+    rc = _preflight_gate_and_rc(root=cfg.workdir)
     if rc:
         return rc
     try:
@@ -1365,12 +1531,13 @@ def cmd_prune_empty(args) -> int:
 
 
 def cmd_retry_failed(args) -> int:
+    cfg = build_config(args)
     # v3.7.8 fail-loud 硬闸（E）：retry-failed 是跑批变体，会经 pipe.run() 调
     # record_success 写密码库；写前先校验密码库结构，损坏即中止（绝不静默丢数据）。
-    rc = _preflight_gate_and_rc(("pw",))
+    # v3.8.0：密码库已落到 per-root 主库，须先 build_config 拿到本批 root 再定位。
+    rc = _preflight_gate_and_rc(("pw",), root=cfg.workdir)
     if rc:
         return rc
-    cfg = build_config(args)
     db = Database(cfg.db_path)
     try:
         where = "WHERE status='FAILED'" + \
@@ -1432,6 +1599,7 @@ _EVOLVE_CHECK_LABELS = {
     "changelog_vs_code": "改码未记版本",
     "archive_file": "无 archive",
     "密码库": "密码库欠账",
+    "密码库防劣化": "密码库劣化",
 }
 
 
@@ -1548,10 +1716,10 @@ def cmd_evolve(args) -> int:
 # ---------------------------------------------------------------------------
 
 def _passwords_in_file(path: str, label: str) -> list:
-    """提取某个库文件的密码列表（learned 走 TAB 格式解析，其余按行）。"""
+    """提取某个库文件的密码列表（learned/master 走 TAB 格式解析，其余按行）。"""
     if not path or not os.path.isfile(path):
         return []
-    if label == "learned":
+    if label in ("learned", "master"):
         try:
             _h, entries, _f = pwstats_mod.parse_learned(path)
             return [e.password for e in entries if e.password]
@@ -1598,10 +1766,26 @@ def _readonly_db_counts(root) -> dict:
             pass
 
 
+def _iso_within_days(date_str, days: int) -> bool:
+    """True iff ``date_str`` (YYYY-MM-DD) is within the last ``days`` days.
+
+    v3.8.0 A-enh helper for ``pw-stats --recent-days``.  An empty / unparseable
+    date returns False (the ``IS NOT NULL`` rule — unknowns are never "recent").
+    """
+    if not date_str:
+        return False
+    import datetime as _dt
+    try:
+        d = _dt.date.fromisoformat(str(date_str).strip())
+    except ValueError:
+        return False
+    return d >= (_dt.date.today() - _dt.timedelta(days=days))
+
+
 def _pwstats_rows(passwords_file, workdir, root):
     """合并库（已按优先级排序）+ 每条的 count/source 标签。"""
     lib = passwords_mod.load_library(passwords_file, workdir=workdir, root=root)
-    counts = dict(pwstats_mod.read_counts(pwstats_mod.learned_path()))
+    counts = dict(pwstats_mod.read_counts(passwords_mod.master_path(root)))
     db_counts = _readonly_db_counts(root)
     for k, v in db_counts.items():
         counts[k] = max(counts.get(k, 0), int(v))
@@ -1624,8 +1808,8 @@ def _pwstats_verify(root) -> tuple:
     （fail-loud 硬闸，能抓字段数异常/合并记录/计数非整数）；合并库不丢密码这步保留。
     """
     msgs = []
-    # ① learned 文件结构自检（字段数 / 合并 / 计数 / 重复 / 降序）全交给 pwstats.verify。
-    ok_l, probs_l = pwstats_mod.verify()
+    # ① master 文件结构自检（字段数 / 合并 / 计数 / 重复 / 降序）全交给 pwstats.verify。
+    ok_l, probs_l = pwstats_mod.verify(passwords_mod.master_path(root))
     if not ok_l:
         return False, ["① learned 结构自检失败："] + probs_l
     msgs.append("① learned 可解析且结构健康")
@@ -1650,6 +1834,9 @@ def cmd_pw_stats(args) -> int:
 
     * 无参数：打印合并后按优先级排序的库 + 统计 + learned 路径；
     * ``--top N``：只显示前 N 条；
+    * ``--recent-days [N]``：只显示 ``added_date`` 在 N 天内者（裸标志用
+      ``config.RECENT_DAYS``）；``added_date`` 为空的历史密码**永不计入**
+      （§5）；库含日期时表格自动多一列「添加时间」。
     * ``--rebuild``：``counts_from_db`` + ``rebuild_counts``（**只写 learned 文件**）；
     * ``--verify``：机械自检（rc 0/1）；
     * ``--json``：机器可读输出。
@@ -1659,19 +1846,19 @@ def cmd_pw_stats(args) -> int:
         root, _local = resolve_root(args)
     except ValueError:
         root = None
-    learned = pwstats_mod.learned_path()
+    master = passwords_mod.master_path(root)
     pw_file = getattr(args, "passwords", None)
 
     rebuild_result = None
     if getattr(args, "rebuild", False):
         # v3.7.8 fail-loud 硬闸（E）：--rebuild 会写密码库；写前校验结构，损坏即中止。
         # **只读路径（--verify / 默认 / 无 --rebuild 的 --json）一律不接闸**——坏库上
-        # `--verify` 必须仍能跑出诊断。
-        rc = _preflight_gate_and_rc(("pw",))
+        # `--verify` 必须仍能跑出诊断。v3.8.0：按本命令的 root 定位 per-root 主库。
+        rc = _preflight_gate_and_rc(("pw",), root=root)
         if rc:
             return rc
         db_counts = _readonly_db_counts(root)
-        rebuild_result = pwstats_mod.rebuild_counts(learned, db_counts)
+        rebuild_result = pwstats_mod.rebuild_counts(master, db_counts)
         if not getattr(args, "json", False) and not getattr(args, "verify", False):
             print("pw-stats --rebuild: before_total=%d after_total=%d "
                   "updated=%d added=%d written=%s"
@@ -1687,16 +1874,43 @@ def cmd_pw_stats(args) -> int:
         return 0 if ok else 1
 
     rows, counts, db_counts = _pwstats_rows(pw_file, root, root)
-    learned_entries = pwstats_mod.parse_learned(learned)[1]
+    # v3.8.0 A-enh: attach the master's added_date to each row (empty = unknown).
+    # Read-only; a legacy 4-field master yields all-empty → display degrades to
+    # the old 4-column table (backward compatible).
+    added_dates = pwstats_mod.read_added_dates(master)
+    for r in rows:
+        r["added_date"] = added_dates.get(r["password"], "")
+    learned_entries = pwstats_mod.parse_learned(master)[1]
     learned_total = len([e for e in learned_entries if e.password])
     db_success_total = len(db_counts)
 
+    # v3.8.0 phase 4（决定6）：显式呈现 last_date + decayed（降权纯运行期、盘上
+    # 零痕迹，必须看得见）。**复用同一** ``passwords._is_decayed`` 判据（禁止另写
+    # 一套），count 用与排序同源的 merged 口径（row["count"]）。
+    import datetime as _dt
+    today = _dt.date.today()
+    last_dates = {e.password: e.last_date
+                  for e in learned_entries if e.password}
+    for r in rows:
+        r["last_date"] = last_dates.get(r["password"], "")
+        r["decayed"] = bool(passwords_mod._is_decayed(
+            r["count"], r["last_date"], today, C))
+
+    # --recent-days: opt-in "近 N 天新增" query (§5).  Only entries with a
+    # NON-EMPTY added_date can match (IS NOT NULL — else the legacy unknowns
+    # would pollute the result).
+    recent_days = getattr(args, "recent_days", None)
+    if recent_days is not None:
+        rows = [r for r in rows
+                if _iso_within_days(r.get("added_date", ""), recent_days)]
+
     if getattr(args, "json", False):
         payload = {
-            "learned_path": learned,
+            "learned_path": master,
             "total": len(rows),
             "learned_total": learned_total,
             "db_success_total": db_success_total,
+            "recent_days": recent_days,
             "rebuild": rebuild_result,
             "entries": rows,
         }
@@ -1706,11 +1920,28 @@ def cmd_pw_stats(args) -> int:
     shown = rows
     if getattr(args, "top", 0) and args.top > 0:
         shown = rows[:args.top]
+    show_added = any(r.get("added_date") for r in shown)
+    show_last = any(r.get("last_date") for r in shown)
     for i, r in enumerate(shown, 1):
-        print("%4d  %7d  %-10s  %s" % (i, r["count"], r["source"], r["password"]))
+        cols = ["%4d" % i, "%7d" % r["count"]]
+        if show_added:
+            cols.append("%-10s" % (r.get("added_date") or "-"))
+        if show_last:
+            cols.append("%-10s" % (r.get("last_date") or "-"))
+        cols.append("%-4s" % ("降权" if r.get("decayed") else ""))
+        cols.append("%-10s" % r["source"])
+        cols.append(r["password"])
+        print("  ".join(cols))
+    if recent_days is not None:
+        print("近 %d 天新增：%d 条（added_date 非空才计入）"
+              % (recent_days, len(rows)))
+    ndecay = sum(1 for r in rows if r.get("decayed"))
+    if ndecay:
+        print("其中 %d 条被降权（纯运行期重排，不入库；DECAY_ENABLED=False 即回退）"
+              % ndecay)
     print("共 %d 条（自学习 %d 条 / DB 已验证成功 %d 条）"
           % (len(rows), learned_total, db_success_total))
-    print("learned: %s" % learned)
+    print("learned: %s" % (master or "(no root)"))
     return 0
 
 
@@ -1767,8 +1998,14 @@ def cmd_doctor(args) -> int:
     #      大量条目。解析器现已归一化（不再吞数据），此处仅作**早发现**哨兵——
     #      发现即计入 problems，提示用 `python pipeline.py pw-stats --rebuild` 重写归一。
     print("6.5) learned libs (CRLF 自检):")
-    for lib_name in ("passwords.learned.txt", "junk.learned.txt"):
-        lp = os.path.join(SKILL_DIR, "assets", lib_name)
+    # v3.8.0：密码库改由 per-root 主库承载（<root>/.pipeline/passwords.master.txt），
+    # 垃圾库仍在 skill assets 下；两项分别定位，不再假定都在 SKILL_DIR/assets。
+    _lib_specs = [("junk.learned.txt",
+                   os.path.join(SKILL_DIR, "assets", "junk.learned.txt"))]
+    _master = passwords_mod.master_path(root)
+    if _master:
+        _lib_specs.insert(0, (os.path.basename(_master), _master))
+    for lib_name, lp in _lib_specs:
         if not os.path.isfile(lp):
             print("   - %-20s (absent — skip)" % lib_name)
             continue
@@ -1793,7 +2030,7 @@ def cmd_doctor(args) -> int:
     #      提示用 `pw-stats --rebuild` / `junk-stats --verify` 修复。与 6.5 不重复：
     #      6.5 只查「含 CRLF 否」，6.6 查「结构是否真的损坏」（更硬的一闸）。
     print("6.6) learned libs 结构自检 (fail-loud 硬闸):")
-    _plib_probs = _preflight_learned_libs()
+    _plib_probs = _preflight_learned_libs(root=root)
     if _plib_probs:
         for prob in _plib_probs:
             problems.append(prob)

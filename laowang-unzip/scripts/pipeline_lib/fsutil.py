@@ -107,7 +107,17 @@ def to_extended(path: str) -> str:
 
     Non-Windows platforms return the path unchanged.  Relative paths are made
     absolute first because ``\\\\?\\`` only works with absolute paths.
+
+    Fail-closed on an empty/falsy path (fix 2026-09-21): ``os.path.abspath("")``
+    resolves to the process CWD, so an empty path silently pointed at the
+    current working directory — a caller that meant "no path" would then probe,
+    scan or even delete whatever directory the process happened to run in, with
+    results that change with the CWD (non-deterministic).  An empty path is never
+    a real target: return ``""`` so every downstream ``os`` call (exists / isdir
+    / getsize / scandir) fails its existence test instead of falling back to CWD.
     """
+    if not path:
+        return ""
     p = os.path.abspath(path)
     if not IS_WINDOWS:
         return p
@@ -124,6 +134,11 @@ def exists(path: str) -> bool:
 
 
 def isdir(path: str) -> bool:
+    # An empty/falsy path must NEVER be treated as a directory: os.path.isdir of
+    # the extended form would otherwise resolve "" to the process CWD (verified:
+    # isdir("") returned True in this sandbox).  Fail closed.
+    if not path:
+        return False
     return os.path.isdir(to_extended(path))
 
 
@@ -195,6 +210,11 @@ def real_list_files(root: str) -> list:
 
 def list_top_level(dir_path: str) -> list:
     """Direct (non-recursive) entries of *dir_path* — files and dirs."""
+    # Fail closed on an empty path: os.scandir("") / the extended form would
+    # enumerate the process CWD ("."), leaking unrelated real entries into a
+    # caller that meant "no directory".  An empty path has no entries.
+    if not dir_path:
+        return []
     try:
         it = os.scandir(to_extended(dir_path))
     except OSError:
@@ -251,7 +271,12 @@ def scan_output(dir_path: str) -> OutputStat:
     fully unpacked yet (v1 pitfall 15 — output may contain only inner archives).
     """
     stat = OutputStat()
-    if not isdir(dir_path):
+    # Never scan an empty path: it resolves to the process CWD, so scanning it
+    # would report the CWD's files (including any zero-byte files that happen to
+    # live there) as THIS output's residue — the non-deterministic "phantom
+    # zero-byte root" bug that silently refused every source deletion.  An empty
+    # path is not a real output: report an all-zero stat.
+    if not dir_path or not isdir(dir_path):
         return stat
     for f in real_list_files(dir_path):
         stat.total_files += 1

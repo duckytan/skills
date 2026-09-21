@@ -312,6 +312,18 @@ def classify_extract_fail(res: Result, archive_path: str) -> str:
     text = res.text
     if res.killed:
         return C.FAIL_TIMEOUT if res.reason == "TIMEOUT" else C.FAIL_HANG_KILLED
+    # U1 (v3.9.0): the *unambiguous* "Missing volume" evidence MUST be judged
+    # before the encryption/password branches.  An encrypted volume set with a
+    # MISSING volume makes 7z emit BOTH lines at once:
+    #     ERROR: Missing volume : <name>
+    #     Data Error in encrypted file. Wrong password? : <name>
+    # so the old order (encrypted/Wrong-password first) misclassified the whole
+    # set as WRONG_PASSWORD — a FAKE password problem that 7z cannot solve no
+    # matter which password is tried.  Only the *unambiguous* "Missing volume"
+    # phrase moves up here; the wider "Cannot find" net stays at its original
+    # site below (do NOT move it — it would swallow cases it should not).
+    if "Missing volume" in text:
+        return C.FAIL_VOLUME_MISSING
     # pitfall #38: 7z says "Cannot open encrypted archive. Wrong password?"
     # when no/wrong password was supplied.  It fell through to the "Cannot
     # open" branch below and, because a disguised file's extension is never
@@ -332,7 +344,10 @@ def classify_extract_fail(res: Result, archive_path: str) -> str:
         # 即报此错（rc=2）。已知机械形态，绝非 UNCLASSIFIED；调度侧已用
         # <stem>_ext 输出目录预防，此处映射保证存量行 retry-failed 后语义正确。
         return C.FAIL_OUTPUT_DIR_CONFLICT
-    if "Missing volume" in text or "Cannot find" in text:
+    if "Cannot find" in text:
+        # Wider net — kept at its original site (U1 moved only the unambiguous
+        # "Missing volume" phrase up; "Cannot find" is broad and must not be
+        # hoisted before the encryption branches).
         return C.FAIL_VOLUME_MISSING
     if "Unexpected end of archive" in text or "Unexpected end of data" in text:
         return C.FAIL_ARCHIVE_CORRUPT
