@@ -7,8 +7,8 @@
 set -e
 
 COOKIE_FILE="/home/node/.config/quark-backup/cookie.txt"
-ACCOUNT="code"
-TARGET="qqbot:c2c:REMOVED_FOR_PRIVACY"
+ACCOUNT="${QUARK_ACCOUNT:-code}"
+TARGET="${QUARK_QQ_TARGET:-qqbot:c2c:YOUR_OPENID_HERE}"
 
 # 检查现有 cookie —— 如果有效就不需要重新登录
 check_cookie_quick() {

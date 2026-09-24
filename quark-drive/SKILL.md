@@ -108,6 +108,8 @@ quark-drive/                         ← 本 skill 目录
 | `QUARK_WEBDAV_URL` | `http://127.0.0.1:8080` | WebDAV 跑在远程 |
 | `QUARK_WEBDAV_USER` | `admin` | WebDAV 鉴权账号 |
 | `QUARK_WEBDAV_PASS` | `admin` | WebDAV 鉴权密码 |
+| `QUARK_ACCOUNT` | `code` | openclaw account 名（用于发 QR 到 QQ）|
+| `QUARK_QQ_TARGET` | `YOUR_OPENID_HERE` ⚠️ 占位 | QQ openid（如 `qqbot:c2c:CF...`）|
 
 ## 📦 依赖
 

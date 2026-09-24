@@ -94,6 +94,8 @@ quark doctor           # 健康检查（首选 debug）
 | `QUARK_WEBDAV_URL` | `http://127.0.0.1:8080` | WebDAV 地址 |
 | `QUARK_WEBDAV_USER` | `admin` | WebDAV 用户 |
 | `QUARK_WEBDAV_PASS` | `admin` | WebDAV 密码 |
+| `QUARK_ACCOUNT` | `code` | openclaw account 名 |
+| `QUARK_QQ_TARGET` | 占位（必设） | QQ openid：`qqbot:c2c:YOUR_OPENID_HERE` |
 
 ## 🔒 安全特性（v3.4+）
 
