@@ -33,7 +33,7 @@ type = webdav
 url = http://127.0.0.1:8080
 vendor = other
 user = admin
-pass = ZAW8tKUwBLaM0H2jZDbB6aUTLYGn
+pass = <rclone-obscure 后的密码>
 ```
 
 **注意**：`pass` 是 rclone obscure 后的密码，不是原始 `admin`。

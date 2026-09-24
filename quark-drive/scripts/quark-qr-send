@@ -6,7 +6,8 @@
 
 set -e
 
-COOKIE_FILE="/home/node/.config/quark-backup/cookie.txt"
+COOKIE_FILE="${QUARK_COOKIE:-${HOME}/.config/quark-backup/cookie.txt}"
+# [v3.4 安全加固] ACCOUNT / TARGET 走 env，不再写死（保护隐私 + 跨用户可用）
 ACCOUNT="${QUARK_ACCOUNT:-code}"
 TARGET="${QUARK_QQ_TARGET:-qqbot:c2c:YOUR_OPENID_HERE}"
 

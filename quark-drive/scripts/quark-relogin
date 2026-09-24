@@ -9,13 +9,13 @@
 #   quark-relogin "<cookie字符串>"  # 直接注入 cookie
 #
 # 文件:
-#   - cookie:   /home/node/.config/quark-backup/cookie.txt
+#   - cookie:   ${HOME}/.config/quark-backup/cookie.txt   (用户主目录下)
 #   - qr.png:   /tmp/quark-qr.png  (二维码图片)
 #   - qr.txt:   /tmp/quark-qr.txt  (qr_url + token)
 
 set -e
 
-COOKIE_FILE="/home/node/.config/quark-backup/cookie.txt"
+COOKIE_FILE="${QUARK_COOKIE:-${HOME}/.config/quark-backup/cookie.txt}"
 QR_PNG="/tmp/quark-qr.png"
 QR_TXT="/tmp/quark-qr.txt"
 

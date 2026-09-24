@@ -1,6 +1,6 @@
 #!/bin/bash
 set -e
-COOKIE_FILE="/home/node/.config/quark-backup/cookie.txt"
+COOKIE_FILE="${QUARK_COOKIE:-${HOME}/.config/quark-backup/cookie.txt}"
 if [ ! -f "$COOKIE_FILE" ]; then
   echo "❌ Cookie 文件不存在: $COOKIE_FILE"
   exit 1
@@ -28,10 +28,12 @@ if [ -f "$PIDFILE" ]; then
 fi
 
 # 启动（二进制从 env 读 cookie / auth，不再走 flag）
+# [v3.4] 二进制路径走 QUARK_WEBDAV_BIN（默认本机路径）
+WEBDAV_BIN="${QUARK_WEBDAV_BIN:-/home/node/tools/bin/quarkdrive-webdav}"
 nohup env QUARK_COOKIE="$COOKIE" \
     WEBDAV_AUTH_USER="admin" \
     WEBDAV_AUTH_PASSWORD="admin" \
-    /home/node/tools/bin/quarkdrive-webdav \
+    "$WEBDAV_BIN" \
     --host 127.0.0.1 -p 8080 \
     > /tmp/quarkdrive-webdav.log 2>&1 &
 
