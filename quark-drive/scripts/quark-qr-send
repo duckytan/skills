@@ -1,0 +1,84 @@
+#!/bin/bash
+# quark-qr-send - 生成 + 上传 + 发送二维码到用户 QQ（一站式）
+# 用法:
+#   quark-qr-send         # 生成新 + 发
+#   quark-qr-send --url-only  # 只生成，不发（调试用）
+
+set -e
+
+COOKIE_FILE="/home/node/.config/quark-backup/cookie.txt"
+ACCOUNT="code"
+TARGET="qqbot:c2c:REMOVED_FOR_PRIVACY"
+
+# 检查现有 cookie —— 如果有效就不需要重新登录
+check_cookie_quick() {
+    if [ ! -f "$COOKIE_FILE" ]; then
+        return 1
+    fi
+    local HTTP_CODE=$(curl -s --max-time 5 -G \
+        -H "Cookie: $(cat "$COOKIE_FILE")" \
+        -o /dev/null \
+        -w "%{http_code}" \
+        'https://drive-pc.quark.cn/1/clouddrive/file/sort' \
+        --data-urlencode "pr=ucpro" --data-urlencode "fr=pc" --data-urlencode "pdir_fid=0" --data-urlencode "_size=1" 2>&1)
+    [ "$HTTP_CODE" = "200" ]
+}
+
+# === 1. 检查现有 cookie ===
+if check_cookie_quick; then
+    echo "✅ Cookie 仍然有效，不用重新登录"
+    quark-relogin --check
+    exit 0
+fi
+
+echo "⚠️ Cookie 无效，生成新的..."
+
+# === 2. 杀掉旧的 qr 进程（避免冲突）===
+pkill -f "quark-relogin --qr-only" 2>/dev/null || true
+sleep 1
+
+# === 3. 生成新二维码 ===
+rm -f /tmp/quark-qr.png /tmp/quark-qr.txt
+quark-relogin --qr-only > /tmp/qr-gen.log 2>&1
+
+if [ ! -f /tmp/quark-qr.png ]; then
+    echo "❌ 生成失败"
+    cat /tmp/qr-gen.log
+    exit 1
+fi
+
+TOKEN=$(head -1 /tmp/quark-qr.txt)
+
+# === 4. 上传到 catbox（30秒超时）===
+CATBOX_URL=$(curl -L -s --max-time 30 -F"reqtype=fileupload" -F"time=1h" \
+    -F"fileToUpload=@/tmp/quark-qr.png" \
+    https://litterbox.catbox.moe/resources/internals/api.php 2>&1)
+
+if [[ "$CATBOX_URL" != https* ]]; then
+    echo "❌ 上传失败: $CATBOX_URL"
+    exit 1
+fi
+
+echo "✅ 二维码已生成:"
+echo "   Token: $TOKEN"
+echo "   Catbox: $CATBOX_URL"
+
+# === 5. 发到 QQ ===
+if [ "${1:-}" != "--url-only" ]; then
+    openclaw message send \
+        --account "$ACCOUNT" \
+        --target "$TARGET" \
+        --channel qqbot \
+        --media "/tmp/quark-qr.png" \
+        --message "📱 夸克扫码登录（token: $TOKEN, 3分钟有效）→ $CATBOX_URL"
+    
+    if [ $? -eq 0 ]; then
+        echo "✅ 已发到你 QQ"
+    else
+        echo "❌ 发送失败"
+    fi
+fi
+
+echo ""
+echo "💡 扫完后告诉我「扫了」，我跑："
+echo "   quark-relogin --wait-token $TOKEN 180"

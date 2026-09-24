@@ -1,0 +1,43 @@
+#!/bin/bash
+# quark-download - 从夸克网盘下载文件/目录
+# 用法: quark-download <夸克网盘路径> [本地路径]
+# 示例:
+#   quark-download /夸克上传文件/file.pdf
+#   quark-download /夸克上传文件/Downloads ~/Downloads/
+
+set -e
+
+# 自动启动 WebDAV 服务
+if ! curl -s --max-time 3 -u admin:admin -X PROPFIND -H "Depth: 0" http://127.0.0.1:8080/ >/dev/null 2>&1; then
+  echo "🔄 quarkdrive-webdav 未运行，正在启动..."
+  bash /home/node/tools/bin/start-quark-webdav.sh || exit 1
+fi
+
+# 检查参数
+if [ $# -lt 1 ]; then
+  echo "用法: quark-download <夸克网盘路径> [本地路径]"
+  echo ""
+  echo "示例:"
+  echo "  quark-download /夸克上传文件/file.pdf          # 下载到当前目录"
+  echo "  quark-download /夸克上传文件/file.pdf ~/Downloads/"
+  echo "  quark-download /whokup-downloads ~/Downloads/    # 下载整个目录"
+  echo ""
+  echo "列出夸克文件:"
+  echo "  rclone ls quark-webdav:/"
+  exit 1
+fi
+
+QUARK_PATH="$1"
+LOCAL_PATH="${2:-.}"
+
+# 显示信息
+echo "📥 下载: quark-webdav:$QUARK_PATH"
+echo "📍 目标: $LOCAL_PATH"
+echo ""
+
+# 下载
+rclone copy "quark-webdav:$QUARK_PATH" "$LOCAL_PATH" --progress -v
+
+echo ""
+echo "✅ 下载完成"
+echo "📂 查看: ls -la '$LOCAL_PATH'"

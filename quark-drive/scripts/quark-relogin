@@ -1,0 +1,257 @@
+#!/bin/bash
+# quark-relogin - 重新登录夸克网盘
+#
+# 用法:
+#   quark-relogin              # 扫码重新登录（默认 3 分钟超时）
+#   quark-relogin --qr-only    # 只生成二维码 + URL（不等待扫描）
+#   quark-relogin --wait <token>  # 用之前生成的 token 等扫码
+#   quark-relogin --check      # 检查 cookie 状态
+#   quark-relogin "<cookie字符串>"  # 直接注入 cookie
+#
+# 文件:
+#   - cookie:   /home/node/.config/quark-backup/cookie.txt
+#   - qr.png:   /tmp/quark-qr.png  (二维码图片)
+#   - qr.txt:   /tmp/quark-qr.txt  (qr_url + token)
+
+set -e
+
+COOKIE_FILE="/home/node/.config/quark-backup/cookie.txt"
+QR_PNG="/tmp/quark-qr.png"
+QR_TXT="/tmp/quark-qr.txt"
+
+# === check_cookie 函数 ===
+check_cookie() {
+    if [ ! -f "$COOKIE_FILE" ]; then
+        echo "❌ Cookie 文件不存在: $COOKIE_FILE"
+        return 1
+    fi
+    
+    local COOKIE=$(cat "$COOKIE_FILE")
+    local HTTP_CODE
+    
+    HTTP_CODE=$(curl -s --max-time 8 -G \
+        -H "Cookie: $COOKIE" \
+        -H "User-Agent: Mozilla/5.0" \
+        -o /dev/null \
+        -w "%{http_code}" \
+        'https://drive-pc.quark.cn/1/clouddrive/file/sort' \
+        --data-urlencode "pr=ucpro" \
+        --data-urlencode "fr=pc" \
+        --data-urlencode "uc_param_str=" \
+        --data-urlencode "pdir_fid=0" \
+        --data-urlencode "_page=1" \
+        --data-urlencode "_size=1" \
+        --data-urlencode "_fetch_total=1" 2>&1)
+    
+    if [ "$HTTP_CODE" = "200" ]; then
+        local NICKNAME=$(curl -s --max-time 5 -G \
+            -H "Cookie: $COOKIE" \
+            -H "User-Agent: Mozilla/5.0" \
+            -H "Accept: application/json" \
+            'https://pan.quark.cn/account/info' 2>&1 | python3 -c "
+import json, sys
+try:
+    d = json.load(sys.stdin)
+    if d.get('success'):
+        print(d.get('data', {}).get('nickname', '?'))
+    else:
+        print('?')
+except:
+    print('?')
+" 2>&1)
+        echo "✅ Cookie 有效"
+        echo "👤 用户: $NICKNAME"
+        
+        local FILE_AGE=$(( ($(date +%s) - $(stat -c %Y "$COOKIE_FILE")) / 86400 ))
+        local DAYS_LEFT=$(( 30 - FILE_AGE ))
+        echo "📅 文件年龄: ${FILE_AGE} 天（${DAYS_LEFT} 天后过期估算）"
+        return 0
+    else
+        echo "❌ Cookie 已失效 (HTTP=$HTTP_CODE)"
+        return 1
+    fi
+}
+
+# === 生成二维码（独立步骤）===
+# [v3.4] env var 传参，不再字符串插值 PATH
+gen_qr_only() {
+    echo "⏳ 生成二维码中..."
+    QUARK_QR_TXT="$QR_TXT" QUARK_QR_PNG="$QR_PNG" python3 << 'PYEOF'
+import sys, os
+from pathlib import Path
+from quark_client.auth.api_login import APILogin
+
+QR_TXT = os.environ['QUARK_QR_TXT']
+QR_PNG = os.environ['QUARK_QR_PNG']
+
+try:
+    login = APILogin(timeout=300)
+    qr_token, qr_url = login.get_qr_code()
+    
+    # 保存到文件
+    Path(QR_TXT).write_text(f'{qr_token}\n{qr_url}\n')
+    
+    # 生成 PNG 图片（如果 qrcode 可用）
+    try:
+        import qrcode
+        from qrcode.image.pil import PilImage
+        img = qrcode.make(qr_url)
+        img.save(QR_PNG)
+        print(f'✅ 二维码图片: {QR_PNG}')
+    except Exception as e:
+        print(f'⚠️  PNG 生成失败（仅用终端 ASCII）: {e}')
+    
+    # 终端 ASCII 二维码
+    from quark_client.utils.qr_code import print_ascii_qr
+    print('--- ASCII QR (扫这个也可以) ---')
+    print_ascii_qr(qr_url)
+    
+    print(f'\n📲 用夸克 APP 扫上面 ASCII 或 PNG: {QR_PNG}')
+    print(f'🔗 或浏览器打开: {qr_url}')
+except Exception as e:
+    print(f'❌ 生成失败: {e}', file=sys.stderr)
+    sys.exit(1)
+PYEOF
+
+    if [ -f "$QR_TXT" ]; then
+        local TOKEN=$(head -1 "$QR_TXT")
+        echo ""
+        echo "💡 扫码完成后，告诉我「扫了」，我跑："
+        echo "   quark-relogin --wait-token $TOKEN 180"
+    fi
+}
+
+# === 等扫码 + 保存 cookie ===
+# [v3.4] env var 传参 + stdin 传 timeout
+wait_and_save() {
+    local TIMEOUT="${1:-180}"
+    echo "⏳ 等待扫码（最多 ${TIMEOUT} 秒）..."
+    # 通过 stdin 传 timeout、env 传 cookie file 路径
+    printf '%s' "$TIMEOUT" | QUARK_COOKIE_FILE="$COOKIE_FILE" python3 << 'PYEOF'
+import sys, os
+from pathlib import Path
+from quark_client.auth.api_login import APILogin
+
+TIMEOUT = int(sys.stdin.read().rstrip('\n') or '180')
+COOKIE_FILE = os.environ['QUARK_COOKIE_FILE']
+
+try:
+    login = APILogin(timeout=TIMEOUT)
+    cookie_string = login.login()
+    
+    # 保存
+    cookie_file = Path(COOKIE_FILE)
+    cookie_file.parent.mkdir(parents=True, exist_ok=True)
+    cookie_file.write_text(cookie_string)
+    os.chmod(cookie_file, 0o600)
+    
+    print(f'✅ Cookie 已保存: {cookie_file}')
+    print(f'✅ Cookie 字符数: {len(cookie_string)}')
+except Exception as e:
+    print(f'❌ 等待登录失败: {e}', file=sys.stderr)
+    sys.exit(1)
+PYEOF
+
+    echo ""
+    echo "步骤 2/2: 验证 Cookie"
+    check_cookie || return 1
+    echo ""
+    echo "步骤 3/3: 重启 WebDAV 服务"
+    bash /home/node/tools/bin/start-quark-webdav.sh
+}
+
+# === 主流程 ===
+case "${1:-}" in
+    --check)
+        check_cookie
+        ;;
+    --qr-only)
+        gen_qr_only
+        ;;
+    --wait)
+        shift
+        wait_and_save "${1:-180}"
+        ;;
+    --wait-token)
+        # 等指定 token 扫码（用于手动流程：--qr-only + --wait-token）
+        shift
+        QR_TOKEN="$1"
+        TIMEOUT="${2:-180}"
+        echo "⏳ 等待扫码（token=${#QR_TOKEN} 字符，最多 ${TIMEOUT} 秒）..."
+        # [v3.4] token 走 stdin（不拼字符串避免注入），timeout + cookie path 走 env
+        printf '%s' "$QR_TOKEN" | QUARK_WEBDAV_TIMEOUT="$TIMEOUT" QUARK_COOKIE_FILE="$COOKIE_FILE" python3 << 'PYEOF'
+import sys, os, time
+from pathlib import Path
+from quark_client.auth.api_login import APILogin
+
+QR_TOKEN = sys.stdin.read().rstrip('\n')
+TIMEOUT = int(os.environ['QUARK_WEBDAV_TIMEOUT'])
+COOKIE_FILE = os.environ['QUARK_COOKIE_FILE']
+try:
+    login = APILogin(timeout=TIMEOUT)
+    qr_token = QR_TOKEN
+    start = time.time()
+    check_count = 0
+    while time.time() - start < TIMEOUT:
+        check_count += 1
+        result = login.check_login_status(qr_token)
+        elapsed = int(time.time() - start)
+        if result is not None and result.get('status') == 200:
+            cookies = []
+            for cookie in login.client.cookies.jar:
+                if cookie.domain and 'quark.cn' in cookie.domain:
+                    cookies.append(f'{cookie.name}={cookie.value}')
+            cookie_string = '; '.join(cookies)
+            cookie_file = Path(COOKIE_FILE)
+            cookie_file.parent.mkdir(parents=True, exist_ok=True)
+            cookie_file.write_text(cookie_string)
+            os.chmod(cookie_file, 0o600)
+            print(f'✅ Cookie 已保存: {cookie_file}')
+            print(f'✅ Cookie 字符数: {len(cookie_string)}')
+            sys.exit(0)
+        else:
+            print(f'⏳ 等待中... ({elapsed}s, 第{check_count}次检查)')
+            time.sleep(2)
+    print('❌ 超时未扫码', file=sys.stderr)
+    sys.exit(1)
+except Exception as e:
+    print(f'❌ 等待登录失败: {e}', file=sys.stderr)
+    sys.exit(1)
+PYEOF
+        if [ $? -ne 0 ]; then return 1; fi
+        echo ""
+        echo "步骤 2/2: 验证 Cookie"
+        check_cookie || return 1
+        echo ""
+        echo "步骤 3/3: 重启 WebDAV 服务"
+        bash /home/node/tools/bin/start-quark-webdav.sh
+        ;;
+    --help|-h)
+        echo "用法:"
+        echo "  quark-relogin              # 扫码重新登录（默认 3 分钟）"
+        echo "  quark-relogin --qr-only    # 只生成二维码 + URL（手动模式）"
+        echo "  quark-relogin --wait <秒>  # 等扫码（生成后用）"
+        echo "  quark-relogin --check      # 检查 cookie"
+        echo "  quark-relogin <cookie>     # 直接注入 cookie"
+        ;;
+    "")
+        # 默认：生成二维码 + 等待扫码
+        gen_qr_only
+        echo ""
+        echo "现在等待扫码..."
+        echo ""
+        wait_and_save 180
+        ;;
+    *)
+        # 直接传 cookie
+        echo "📝 直接写入 Cookie..."
+        echo "$1" > "$COOKIE_FILE"
+        chmod 600 "$COOKIE_FILE"
+        echo "✅ Cookie 保存到: $COOKIE_FILE"
+        echo ""
+        check_cookie || return 1
+        echo ""
+        echo "重启 WebDAV 服务"
+        bash /home/node/tools/bin/start-quark-webdav.sh
+        ;;
+esac

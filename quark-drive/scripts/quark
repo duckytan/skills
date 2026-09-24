@@ -1,0 +1,296 @@
+#!/usr/bin/env python3
+"""
+quark - 夸克网盘 CLI 一站式入口
+- 调用现有 N 个底层 bash 脚本（默认 7 个）
+- 不重写逻辑，只是路由收口
+
+可移植性（v3.3 • 9-24）：
+- 所有路径常量化、可 env 覆盖
+- TOOLS_BIN 自动探测（PATH → /home/node/tools/bin → /usr/local/bin）
+- 首次跑会提示（让别机用户知道怎么适配）
+"""
+
+import argparse
+import sys
+import os
+import subprocess
+import time
+import urllib.request
+import urllib.error
+import base64
+import datetime
+
+
+def _auto_find_tools_bin():
+    """探测底层脚本所在目录。
+
+    优先顺序：
+    1. PATH 里 quark-upload 所在目录（同目录表示它在那）
+    2. 环境默认 /home/node/tools/bin（本机常见路径）
+    3. /usr/local/bin（系统常规）
+    任何一步找到一个含 quark-upload 的目录就返回；都找不到就返默认值 + 跑时会报错。
+    """
+    # 1. 从 PATH 里找 quark-upload 所在目录
+    for path_dir in os.environ.get("PATH", "").split(":"):
+        candidate = os.path.join(path_dir, "quark-upload")
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return path_dir
+    # 2. 默认本机路径
+    if os.path.isdir("/home/node/tools/bin"):
+        return "/home/node/tools/bin"
+    # 3. 系统常规
+    return "/usr/local/bin"
+
+# 现有脚本所在目录（源唯一）
+# 可被 env 覆盖 → 全新环境可指定自己的工具目录
+# 默认值按 "PATH 第一个能起作用的" 自动探测；退化后用 /usr/local/bin
+TOOLS_BIN = os.environ.get(
+    "QUARK_TOOLS_BIN",
+    _auto_find_tools_bin(),
+)
+
+# Cookie 路径
+COOKIE_PATH = os.path.expanduser(
+    os.environ.get(
+        "QUARK_COOKIE",
+        "~/.config/quark-backup/cookie.txt",
+    )
+)
+
+# WebDAV 端口
+WEBDAV_URL = os.environ.get("QUARK_WEBDAV_URL", "http://127.0.0.1:8080")
+
+# Admin 凭据（本地非网络暴露，可弱）也可 env 覆盖
+WEBDAV_AUTH = (
+    os.environ.get("QUARK_WEBDAV_USER", "admin"),
+    os.environ.get("QUARK_WEBDAV_PASS", "admin"),
+)
+
+
+def run_script(cmd_list, cwd=None):
+    """调用现有 bash 脚本，捕获 exit code
+
+    cwd 默认用 os.getcwd()（用户当前目录），不用 TOOLS_BIN，
+    否则 download/upload 的「当前目录」会指向工具目录，文件"找不到"。
+    """
+    if cwd is None:
+        cwd = os.getcwd()
+    full_cmd = [os.path.join(TOOLS_BIN, cmd_list[0])] + cmd_list[1:]
+    result = subprocess.run(full_cmd, cwd=cwd)
+    return result.returncode
+
+
+def cmd_default(args):
+    """默认：列根目录"""
+    return run_script(["qr-ls"])
+
+
+def cmd_login(args):
+    """扫码登录"""
+    if args.check:
+        return run_script(["quark-relogin", "--check"])
+    elif args.qr_only:
+        return run_script(["quark-qr-send", "--url-only"])
+    else:
+        return run_script(["quark-qr-send"])
+
+
+def cmd_upload(args):
+    """上传文件"""
+    # 本地路径自动展开 ~（argparse 不展开）
+    local = os.path.expanduser(args.local)
+    cmd = ["quark-upload", local]
+    if args.remote:
+        cmd.append(args.remote)
+    # [v3.4 安全加固] 透传 --sync / --dry-run
+    if args.sync:
+        cmd.append("--sync")
+    if args.dry_run:
+        cmd.append("--dry-run")
+    return run_script(cmd)
+
+
+def cmd_download(args):
+    """下载文件"""
+    cmd = ["quark-download", args.remote]
+    if args.local:
+        # 本地路径自动展开 ~，不存在则提示清晰报错
+        local = os.path.expanduser(args.local)
+        if not os.path.isdir(os.path.dirname(local) or "."):
+            print(f"❌ 本地目录不存在：{os.path.dirname(local)}", file=sys.stderr)
+            return 1
+        cmd.append(local)
+    else:
+        # 不传 local 时，下载到当前目录，提示用户
+        print(f"💡 未指定本地路径，将下载到当前目录：{os.getcwd()}")
+    return run_script(cmd)
+
+
+def cmd_start(args):
+    """启动 WebDAV 服务"""
+    return run_script(["start-quark-webdav.sh"])
+
+
+def cmd_stop(args):
+    """停止 WebDAV 服务
+    [v3.4 安全加固]
+    - 主路径：PID file 准杀（不是 pkill -f 模糊匹配）
+    - fallback：pgrep -x 精确匹配 quarkdrive-webdav 二进制名
+    - 不杀其他 shell / grep / 监控脚本（不只看命令行含 quarkdrive-webdav 字符串的进程）
+    """
+    pidfile = "/tmp/quarkdrive-webdav.pid"
+    killed = False
+
+    # 主路径：PID file
+    if os.path.exists(pidfile):
+        try:
+            pid = int(open(pidfile).read().strip())
+            # 检查是不是我们那个进程（按可执行名）
+            comm_path = f"/proc/{pid}/comm"
+            if os.path.exists(comm_path):
+                comm = open(comm_path).read().strip()
+                if comm == "quarkdrive-webdav":
+                    # SIGTERM → 1s 后检查 → SIGKILL fallback
+                    try:
+                        os.kill(pid, 15)  # SIGTERM
+                        for _ in range(10):
+                            time.sleep(0.2)
+                            try:
+                                os.kill(pid, 0)
+                            except ProcessLookupError:
+                                killed = True
+                                break
+                        if not killed:
+                            os.kill(pid, 9)  # SIGKILL
+                            killed = True
+                    except ProcessLookupError:
+                        killed = True  # 早已退出
+                else:
+                    # PID file 揣的不是 quarkdrive-webdav（被别人占用了）
+                    print(f"⚠️  PID {pid} 不是 quarkdrive-webdav（comm={comm}）")
+            else:
+                # 进程不在，清理 stale PID file
+                os.unlink(pidfile)
+        except (ValueError, OSError):
+            # PID file 损坏，也清理
+            try:
+                os.unlink(pidfile)
+            except OSError:
+                pass
+
+    if not killed:
+        # fallback：pgrep -x 精确查找可执行名
+        result = subprocess.run(
+            ["pgrep", "-x", "quarkdrive-webdav"],
+            capture_output=True, text=True,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            for pid_str in result.stdout.strip().split("\n"):
+                try:
+                    pid = int(pid_str)
+                    os.kill(pid, 15)
+                    killed = True
+                except (ProcessLookupError, ValueError):
+                    pass
+
+    if killed:
+        print("✅ WebDAV 服务已停止")
+    else:
+        print("⚠️  未发现运行中的 quarkdrive-webdav 进程")
+    return 0
+
+
+def cmd_doctor(args):
+    """健康检查"""
+    print("🔍 quark doctor · 夸克网盘健康检查")
+    print()
+
+    # 1. Cookie 存在性 + 时间
+    if os.path.exists(COOKIE_PATH):
+        size = os.path.getsize(COOKIE_PATH)
+        mtime = os.path.getmtime(COOKIE_PATH)
+        ago = (datetime.datetime.now() - datetime.datetime.fromtimestamp(mtime)).days
+        status = "✅" if ago < 30 else "⚠️"
+        print(f"{status} Cookie: {COOKIE_PATH} ({size}B · {ago}天前)")
+    else:
+        print(f"❌ Cookie 文件不存在：{COOKIE_PATH}")
+        print("   解决：quark login")
+        return 1
+
+    # 2. WebDAV 探活
+    try:
+        req = urllib.request.Request(
+            f"{WEBDAV_URL}/",
+            method="PROPFIND",
+            headers={
+                "Depth": "0",
+                "Authorization": "Basic " + base64.b64encode(
+                    f"{WEBDAV_AUTH[0]}:{WEBDAV_AUTH[1]}".encode()
+                ).decode(),
+            },
+        )
+        urllib.request.urlopen(req, timeout=5)
+        print(f"✅ WebDAV: {WEBDAV_URL}（健康）")
+    except urllib.error.URLError as e:
+        print(f"❌ WebDAV: 不可达（{e}）")
+        print("   解决：quark start（3 秒起）")
+        return 1
+    except Exception as e:
+        print(f"❌ WebDAV: 错误（{e}）")
+        return 1
+
+    print()
+    print("✅ 全部健康")
+    return 0
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="quark",
+        description="夸克网盘 CLI · 一站式入口（扫码 / 上传 / 下载 / 启停 / 健康检查）",
+        epilog="示例: quark doctor",
+    )
+    sub = parser.add_subparsers(dest="cmd", title="子命令")
+
+    # 默认：无子命令 = 列根目录
+    parser.set_defaults(func=cmd_default)
+
+    # login
+    p_login = sub.add_parser("login", help="扫码登录（一站式，自动发 QR 到 QQ）")
+    p_login.add_argument("--qr-only", action="store_true", help="只生成 QR 不发 QQ")
+    p_login.add_argument("--check", action="store_true", help="验证 cookie 是否有效")
+    p_login.set_defaults(func=cmd_login)
+
+    # upload
+    p_up = sub.add_parser("upload", help="上传文件到网盘")
+    p_up.add_argument("local", help="本地文件路径")
+    p_up.add_argument("remote", nargs="?", default=None, help="远端路径（可选）")
+    p_up.add_argument("--sync", action="store_true",
+                      help="⚠️ 单向 sync：会删除网盘上多余的且本地没有的文件")
+    p_up.add_argument("--dry-run", action="store_true",
+                      help="[安全] 只预演会发生什么（默认 sync 模式自动接 dry-run）")
+    p_up.set_defaults(func=cmd_upload)
+
+    # download
+    p_dl = sub.add_parser("download", help="从网盘下载文件")
+    p_dl.add_argument("remote", help="远端路径")
+    p_dl.add_argument("local", nargs="?", default=None, help="本地路径（可选）")
+    p_dl.set_defaults(func=cmd_download)
+
+    # start / stop
+    p_start = sub.add_parser("start", help="启动 WebDAV 服务（3 秒）")
+    p_start.set_defaults(func=cmd_start)
+
+    p_stop = sub.add_parser("stop", help="停止 WebDAV 服务")
+    p_stop.set_defaults(func=cmd_stop)
+
+    # doctor
+    p_doc = sub.add_parser("doctor", help="健康检查（首选 debug 入口）")
+    p_doc.set_defaults(func=cmd_doctor)
+
+    args = parser.parse_args()
+    sys.exit(args.func(args))
+
+
+if __name__ == "__main__":
+    main()

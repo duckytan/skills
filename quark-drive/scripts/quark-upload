@@ -1,0 +1,98 @@
+#!/bin/bash
+# quark-upload - 快速上传到夸克网盘
+# 用法: quark-upload <本地文件/目录> [夸克网盘目录] [--dry-run]
+# 示例:
+#   quark-upload ~/Downloads/file.pdf
+#   quark-upload ~/Downloads/file.pdf /whokup-downloads
+#   quark-upload ~/Documents/project/         # 单向 sync（会删网盘多余文件·会确认）
+#   quark-upload ~/Documents/project/ /dst --dry-run   # 只看不做
+
+set -e
+
+# 自动启动 WebDAV 服务（如果没跑）
+if ! curl -s --max-time 3 -u admin:admin -X PROPFIND -H "Depth: 0" http://127.0.0.1:8080/ >/dev/null 2>&1; then
+  echo "🔄 quarkdrive-webdav 未运行，正在启动..."
+  bash /home/node/tools/bin/start-quark-webdav.sh || exit 1
+fi
+
+# 解析参数（3 个：local remote flags）
+DRY_RUN=""
+SYNC_MODE=""
+case "${3:-}" in
+    --dry-run) DRY_RUN="--dry-run" ;;
+    --sync) SYNC_MODE="sync" ;;
+esac
+
+# 检查参数（至少 1 个）
+if [ $# -lt 1 ]; then
+  echo "用法: quark-upload <本地文件/目录> [夸克网盘目录] [--dry-run|--sync]"
+  echo ""
+  echo "示例:"
+  echo "  quark-upload ~/Downloads/file.pdf                       # 单文件 copy（默认）"
+  echo "  quark-upload ~/Documents/project/                        # 目录默认 copy（不删网盘多余文件）"
+  echo "  quark-upload ~/Documents/project/ /dst --sync           # 单向 sync（会删网盘多余文件·会确认）"
+  echo "  quark-upload ~/Documents/project/ /dst --dry-run         # dry-run：只显示会做什么，不实际执行"
+  echo ""
+  echo "⚠️  --sync 是单向镜像：网盘上多余文件会被删除，且不可恢复"
+  exit 1
+fi
+
+LOCAL_PATH="$1"
+QUARK_PATH="${2:-/whokup-backup-test}"
+
+# 本地路径处理
+if [ ! -e "$LOCAL_PATH" ]; then
+  echo "❌ 本地路径不存在: $LOCAL_PATH"
+  exit 1
+fi
+
+# 显示信息
+LOCAL_SIZE=$(du -sh "$LOCAL_PATH" 2>/dev/null | awk '{print $1}')
+echo "📤 上传: $LOCAL_PATH ($LOCAL_SIZE)"
+echo "📍 目标: quark-webdav:$QUARK_PATH/"
+echo ""
+
+# 路径保护：避免夸克路劲里出现 ../ 误伤
+case "$QUARK_PATH" in
+    *..*) echo "❌ 远端路径不能含 '..'"; exit 1 ;;
+esac
+
+# 上传逻辑
+if [ -d "$LOCAL_PATH" ]; then
+    if [ "$SYNC_MODE" = "sync" ]; then
+        # [v3.4] sync 模式：双向防护（dry-run + 必须确认）
+        echo "⚠️  WARNING: --sync 是单向镜像！网盘上多余文件会被删除！"
+        echo ""
+        # 默认先 dry-run 预演
+        if [ -z "$DRY_RUN" ]; then
+            echo "📋 [1/2] dry-run 预演（看看会发生什么）："
+            rclone sync "$LOCAL_PATH" "quark-webdav:$QUARK_PATH/" --dry-run
+            echo ""
+            read -p "确认执行 sync? 网盘多余文件将被删除，输入 'yes' 继续: " CONFIRM
+            [ "$CONFIRM" = "yes" ] || { echo "已取消"; exit 1; }
+            rclone sync "$LOCAL_PATH" "quark-webdav:$QUARK_PATH/" --progress -v
+        else
+            echo "[dry-run]"
+            rclone sync "$LOCAL_PATH" "quark-webdav:$QUARK_PATH/" --dry-run
+        fi
+    elif [ -n "$DRY_RUN" ]; then
+        # 目录 + dry-run + 非 sync：模拟 copy
+        echo "[dry-run]"
+        rclone copy "$LOCAL_PATH" "quark-webdav:$QUARK_PATH/" --dry-run
+    else
+        # 默认：目录用 copy（不删网盘多余文件）
+        rclone copy "$LOCAL_PATH" "quark-webdav:$QUARK_PATH/" --progress -v
+    fi
+else
+    # 单文件：直接 copy
+    if [ -n "$DRY_RUN" ]; then
+        echo "[dry-run]"
+        rclone copy "$LOCAL_PATH" "quark-webdav:$QUARK_PATH/" --dry-run
+    else
+        rclone copy "$LOCAL_PATH" "quark-webdav:$QUARK_PATH/" --progress -v
+    fi
+fi
+
+echo ""
+echo "✅ 上传完成"
+echo "🔗 查看: rclone ls 'quark-webdav:$QUARK_PATH/'"

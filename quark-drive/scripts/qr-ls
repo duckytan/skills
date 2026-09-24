@@ -1,0 +1,72 @@
+#!/bin/bash
+# qr-ls - 直接用 WebDAV PROPFIND 列出夸克网盘内容（避开 rclone 二进制跟踪）
+# 用法:
+#   qr-ls              # 列出根目录
+#   qr-ls /folder/     # 列出指定目录
+
+set -e
+
+DAV_URL="http://127.0.0.1:8080"
+AUTH="admin:admin"
+
+# 自动启动
+if ! curl -s --max-time 2 -u "$AUTH" -X PROPFIND -H "Depth: 0" "$DAV_URL/" >/dev/null 2>&1; then
+    bash /home/node/tools/bin/start-quark-webdav.sh >/dev/null 2>&1 || {
+        echo "❌ WebDAV 服务未启动且自动启动失败"
+        exit 1
+    }
+fi
+
+# 列目录函数
+list_dir() {
+    local path="$1"
+    if [ -z "$path" ]; then path="/"; fi
+    if [[ "$path" != /* ]]; then path="/$path"; fi
+    
+    # PROPFIND 请求
+    local XML=$(curl -s --max-time 10 -u "$AUTH" -X PROPFIND \
+        -H "Depth: 1" \
+        -H "Content-Type: application/xml" \
+        -d '<?xml version="1.0"?><d:propfind xmlns:d="DAV:"><d:allprop/></d:propfind>' \
+        "${DAV_URL}${path}")
+    
+    # 解析 XML：提取 href 和 getcontentlength
+    echo "$XML" | QRPATH="$path" python3 -c "
+import sys, re, os
+xml = sys.stdin.read()
+path = os.environ['QRPATH']
+from urllib.parse import unquote
+# 提取 href 和对应的 getcontentlength
+pattern = re.compile(r'<D:response>.*?<D:href>([^<]+)</D:href>(.*?)</D:response>', re.DOTALL)
+for m in pattern.finditer(xml):
+    href = m.group(1)
+    body = m.group(2)
+    # 是否是目录（<D:collection></D:collection> 或 <D:collection/>）
+    is_dir = '<D:collection>' in body or '<D:collection/>' in body
+    # 文件大小
+    size_m = re.search(r'<D:getcontentlength>(\d+)</D:getcontentlength>', body)
+    size = size_m.group(1) if size_m else ('-' if is_dir else '?')
+    # 跳过当前目录
+    if href.rstrip('/') == path.rstrip('/'):
+        continue
+    if is_dir:
+        print(f'[DIR]   {unquote(href)}')
+    else:
+        name = unquote(href.rsplit('/', 1)[-1])
+        print(f'{size:>8}  {name}')
+" 2>&1
+}
+
+case "${1:-}" in
+    "")
+        list_dir "/"
+        ;;
+    --help|-h)
+        echo "用法: qr-ls [path]"
+        echo "  qr-ls            # 列出根目录"
+        echo "  qr-ls /folder/   # 列出指定目录"
+        ;;
+    *)
+        list_dir "$1"
+        ;;
+esac
